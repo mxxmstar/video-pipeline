@@ -254,6 +254,17 @@ void FFmpegEncoder::Close() {
     next_pts_ = 0;
 }
 
+std::vector<std::uint8_t> FFmpegEncoder::GetExtraData() const {
+    if (!codec_ctx_ || !codec_ctx_->extradata || codec_ctx_->extradata_size <= 0) {
+        return {};
+    }
+
+    const auto* begin = codec_ctx_->extradata;
+    return std::vector<std::uint8_t>(
+        begin,
+        begin + static_cast<size_t>(codec_ctx_->extradata_size));
+}
+
 // 从编码器循环取包，包装为 MediaPacket 后追加到输出列表
 bool FFmpegEncoder::ReceivePackets(std::vector<PacketPtr>& packets) {
     if (!codec_ctx_) {

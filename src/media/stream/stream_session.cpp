@@ -1,6 +1,6 @@
 #include "media/stream/stream_session.h"
 
-#include <asio/post.hpp>
+#include <boost/asio/post.hpp>
 #include "common/log/logger.h"
 
 // ── 辅助 ───────────────────────────────────────────────────────────
@@ -19,7 +19,7 @@ inline static const char* StateNameImpl(MediaStreamSession::State s) {
 
 // ── ctor / dtor ────────────────────────────────────────────────────
 
-MediaStreamSession::MediaStreamSession(asio::io_context& io)
+MediaStreamSession::MediaStreamSession(boost::asio::io_context& io)
     : io_(io)
     , reconnect_timer_(io)
     , watchdog_timer_(io)
@@ -115,7 +115,7 @@ bool MediaStreamSession::Start() {
     MultiStreamInfo info = puller_->GetStreamInfo();
     if (streaminfo_cb_) {
         streaminfo_cb_(info);
-    }        
+    }
 
     // 标记运行状态
     running_ = true;
@@ -129,7 +129,7 @@ bool MediaStreamSession::Start() {
     setState(State::KCONNECTED);
 
     // 通过 post 调度读循环到 io_context（由外部线程池驱动）
-    asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+    boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
 
     // 启动 Watchdog
     if (watchdog_interval_ms_ > 0) {
@@ -146,7 +146,7 @@ bool MediaStreamSession::Start() {
 void MediaStreamSession::Stop() {
     State expected = state_.load();
     // 只有 CONNECTED / RECONNECTING / ERROR 需要真正停止
-    if (expected != State::KCONNECTED && expected != State::KRECONNECTING && expected != State::KERROR) {        
+    if (expected != State::KCONNECTED && expected != State::KRECONNECTING && expected != State::KERROR) {
         return;
     }
 
@@ -154,7 +154,7 @@ void MediaStreamSession::Stop() {
     running_ = false;
 
     // 取消定时器
-    asio::error_code ec;
+    boost::system::error_code ec;
     reconnect_timer_.cancel();
     watchdog_timer_.cancel();
     decoder_timer_.cancel();
@@ -190,17 +190,17 @@ void MediaStreamSession::connect() {
 
     // 重新 post 读循环（io_context 线程池仍在运行）
     running_ = true;
-    asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+    boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
 
     // 重启 Watchdog
     if (watchdog_interval_ms_ > 0) {
-        asio::error_code ec;
+        boost::system::error_code ec;
         watchdog_timer_.cancel();
         startWatchdog();
     }
     if (jitter_buffer_interval_ms_ > 0) {
         startDecoderDriveTimer();
-    }        
+    }
 }
 
 // ── 内部：读循环（通过 io_context::post 调度，单次执行） ───────
@@ -222,7 +222,7 @@ void MediaStreamSession::readLoop() {
     if (ok) {
         // 空 packet = 非目标流跳过，继续下一轮
         if (!packet) {
-            asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+            boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
             return;
         }
 
@@ -237,7 +237,7 @@ void MediaStreamSession::readLoop() {
             dispatchPacket(std::move(packet));
 
         // 继续下一轮
-        asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+        boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
 
     } else {
         // 读取失败：EOF 或错误
@@ -252,12 +252,12 @@ void MediaStreamSession::startDecoderDriveTimer() {
 
     decoder_timer_.expires_after(std::chrono::milliseconds(jitter_buffer_interval_ms_));
     decoder_timer_.async_wait(
-        [self = shared_from_this()](asio::error_code ec) {
+        [self = shared_from_this()](boost::system::error_code ec) {
             self->onDecoderDriveTimer(ec);
         });
 }
 
-void MediaStreamSession::onDecoderDriveTimer(const asio::error_code& ec) {
+void MediaStreamSession::onDecoderDriveTimer(const boost::system::error_code& ec) {
     if (ec || !running_ || jitter_buffer_interval_ms_ <= 0)
         return;
 
@@ -280,7 +280,7 @@ void MediaStreamSession::enqueuePacket(std::shared_ptr<MediaPacket> packet) {
 
     if (jitter_buffer_ && !jitter_buffer_->Push(std::move(packet))) {
         LOG_DEBUG("Jitter buffer full, dropping incoming packet");
-    }        
+    }
 }
 
 void MediaStreamSession::dispatchPacket(std::shared_ptr<MediaPacket> packet) {
@@ -328,7 +328,7 @@ void MediaStreamSession::doReconnect() {
     // 异步等待后重试
     reconnect_timer_.expires_after(std::chrono::milliseconds(reconnect_interval_ms_));
     reconnect_timer_.async_wait(
-        [self = shared_from_this()](asio::error_code ec) {
+        [self = shared_from_this()](boost::system::error_code ec) {
             if (ec || !self->running_)
                 return;
             self->connect();
@@ -340,12 +340,12 @@ void MediaStreamSession::doReconnect() {
 void MediaStreamSession::startWatchdog() {
     watchdog_timer_.expires_after(std::chrono::milliseconds(watchdog_interval_ms_));
     watchdog_timer_.async_wait(
-        [self = shared_from_this()](asio::error_code ec) {
+        [self = shared_from_this()](boost::system::error_code ec) {
             self->onWatchdog(ec);
         });
 }
 
-void MediaStreamSession::onWatchdog(const asio::error_code& ec) {
+void MediaStreamSession::onWatchdog(const boost::system::error_code& ec) {
     if (ec || !running_)
         return;
 

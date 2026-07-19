@@ -22,6 +22,8 @@ public:
     bool Encode(FramePtr frame, std::vector<PacketPtr>& packets) override;
     void Close() override;
 
+    std::vector<std::uint8_t> GetExtraData() const;
+
     // 编码类型与 FFmpeg 类型之间的转换函数
     static AVCodecID MapCodecType(CodecType type);
     static AVPixelFormat MapPixelFormat(PixelFormat fmt);

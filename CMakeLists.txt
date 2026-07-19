@@ -8,14 +8,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-option(BUILD_TESTS "Build test programs" OFF)
+option(BUILD_TESTS "Build test programs" ON)
 option(ENABLE_PCAP "Build pcap/Npcap ethernet capture support" ON)
 set(VIDEO_PIPELINE_PROFILE "tauri" CACHE STRING "Build profile: tauri, native, all, or custom")
 set_property(CACHE VIDEO_PIPELINE_PROFILE PROPERTY STRINGS tauri native all custom)
 option(VIDEO_PIPELINE_BUILD_CLI "Build standalone C++ CLI/demo executable" ON)
 option(VIDEO_PIPELINE_BUILD_TAURI_MODULE "Build embeddable Tauri C ABI module when src/c_api sources exist" OFF)
 option(VIDEO_PIPELINE_BUILD_NATIVE_PLAYER "Build Boost based native player/web service app" OFF)
-set(VIDEO_PIPELINE_BOOST_MIN_VERSION "1.88" CACHE STRING "Minimum Boost version for native player/web service app")
+set(VIDEO_PIPELINE_BOOST_MIN_VERSION "1.91" CACHE STRING "Minimum Boost version for project Boost components")
+set(VIDEO_PIPELINE_DEFAULT_DEPS_ROOT "C:/vcpkg_env/vcpkg_installed/x64-windows")
+set(VIDEO_PIPELINE_DEPS_ROOT "${VIDEO_PIPELINE_DEFAULT_DEPS_ROOT}" CACHE PATH "vcpkg installed prefix for Boost, spdlog, and runtime DLLs")
+set(VIDEO_PIPELINE_BOOST_ROOT "" CACHE PATH "Deprecated alias for VIDEO_PIPELINE_DEPS_ROOT")
+option(VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST "Build manual ZLMediaKit process smoke test" ON)
 
 set(VIDEO_PIPELINE_VALID_PROFILES tauri native all custom)
 if(NOT VIDEO_PIPELINE_PROFILE IN_LIST VIDEO_PIPELINE_VALID_PROFILES)
@@ -29,6 +33,19 @@ elseif(VIDEO_PIPELINE_PROFILE STREQUAL "all")
     set(VIDEO_PIPELINE_BUILD_TAURI_MODULE ON)
 endif()
 
+set(VIDEO_PIPELINE_BUILD_COMMON_PROCESS ${VIDEO_PIPELINE_BUILD_NATIVE_PLAYER})
+if(BUILD_TESTS AND VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST)
+    set(VIDEO_PIPELINE_BUILD_COMMON_PROCESS ON)
+endif()
+
+if(VIDEO_PIPELINE_BOOST_ROOT AND VIDEO_PIPELINE_DEPS_ROOT STREQUAL VIDEO_PIPELINE_DEFAULT_DEPS_ROOT)
+    set(VIDEO_PIPELINE_DEPS_ROOT "${VIDEO_PIPELINE_BOOST_ROOT}" CACHE PATH "vcpkg installed prefix for Boost, spdlog, and runtime DLLs" FORCE)
+endif()
+
+if(VIDEO_PIPELINE_DEPS_ROOT)
+    list(PREPEND CMAKE_PREFIX_PATH "${VIDEO_PIPELINE_DEPS_ROOT}")
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
@@ -40,63 +57,50 @@ foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
 endforeach()
 
 # ============================================================
-# Header-only dependencies
+# vcpkg dependencies
 # ============================================================
-set(ASIO_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/asio-1.36.0")
-if(NOT EXISTS "${ASIO_INCLUDE_DIR}/asio.hpp")
-    message(FATAL_ERROR "ASIO headers not found: ${ASIO_INCLUDE_DIR}")
+set(Boost_USE_MULTITHREADED ON)
+find_package(Boost ${VIDEO_PIPELINE_BOOST_MIN_VERSION} CONFIG REQUIRED COMPONENTS json process)
+find_package(spdlog CONFIG REQUIRED)
+
+add_library(video_pipeline_boost INTERFACE)
+add_library(video-pipeline::boost ALIAS video_pipeline_boost)
+
+if(TARGET Boost::headers)
+    target_link_libraries(video_pipeline_boost INTERFACE Boost::headers)
+elseif(TARGET Boost::boost)
+    target_link_libraries(video_pipeline_boost INTERFACE Boost::boost)
 endif()
 
-add_library(video_pipeline_asio INTERFACE)
-target_include_directories(video_pipeline_asio INTERFACE "${ASIO_INCLUDE_DIR}")
-target_compile_definitions(video_pipeline_asio INTERFACE ASIO_STANDALONE)
+foreach(boost_component json process)
+    if(TARGET Boost::${boost_component})
+        target_link_libraries(video_pipeline_boost INTERFACE Boost::${boost_component})
+    else()
+        message(FATAL_ERROR "Boost target Boost::${boost_component} was not found")
+    endif()
+endforeach()
 
-set(SPDLOG_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/spdlog-1.17.0/include")
-if(NOT EXISTS "${SPDLOG_INCLUDE_DIR}/spdlog/spdlog.h")
-    message(FATAL_ERROR "spdlog headers not found: ${SPDLOG_INCLUDE_DIR}")
-endif()
+foreach(boost_header_target asio beast)
+    if(TARGET Boost::${boost_header_target})
+        target_link_libraries(video_pipeline_boost INTERFACE Boost::${boost_header_target})
+    endif()
+endforeach()
+
+target_compile_definitions(video_pipeline_boost
+    INTERFACE
+        BOOST_ASIO_NO_DEPRECATED
+        BOOST_BEAST_NO_DEPRECATED
+)
 
 add_library(video_pipeline_spdlog INTERFACE)
-target_include_directories(video_pipeline_spdlog INTERFACE "${SPDLOG_INCLUDE_DIR}")
+add_library(video-pipeline::spdlog ALIAS video_pipeline_spdlog)
 
-# ============================================================
-# Boost dependencies for the native player/service profile
-# ============================================================
-if(VIDEO_PIPELINE_BUILD_NATIVE_PLAYER)
-    set(Boost_USE_MULTITHREADED ON)
-    find_package(Boost ${VIDEO_PIPELINE_BOOST_MIN_VERSION} CONFIG QUIET COMPONENTS json process)
-    if(NOT Boost_FOUND)
-        find_package(Boost ${VIDEO_PIPELINE_BOOST_MIN_VERSION} REQUIRED COMPONENTS json process)
-    endif()
-
-    add_library(video_pipeline_boost INTERFACE)
-    add_library(video-pipeline::boost ALIAS video_pipeline_boost)
-
-    if(TARGET Boost::headers)
-        target_link_libraries(video_pipeline_boost INTERFACE Boost::headers)
-    elseif(TARGET Boost::boost)
-        target_link_libraries(video_pipeline_boost INTERFACE Boost::boost)
-    endif()
-
-    foreach(boost_component json process)
-        if(TARGET Boost::${boost_component})
-            target_link_libraries(video_pipeline_boost INTERFACE Boost::${boost_component})
-        else()
-            message(FATAL_ERROR "Boost target Boost::${boost_component} was not found")
-        endif()
-    endforeach()
-
-    foreach(boost_header_target beast asio)
-        if(TARGET Boost::${boost_header_target})
-            target_link_libraries(video_pipeline_boost INTERFACE Boost::${boost_header_target})
-        endif()
-    endforeach()
-
-    target_compile_definitions(video_pipeline_boost
-        INTERFACE
-            BOOST_ASIO_NO_DEPRECATED
-            BOOST_BEAST_NO_DEPRECATED
-    )
+if(TARGET spdlog::spdlog)
+    target_link_libraries(video_pipeline_spdlog INTERFACE spdlog::spdlog)
+elseif(TARGET spdlog::spdlog_header_only)
+    target_link_libraries(video_pipeline_spdlog INTERFACE spdlog::spdlog_header_only)
+else()
+    message(FATAL_ERROR "spdlog target was not found")
 endif()
 
 # ============================================================
@@ -138,6 +142,21 @@ else()
     set(FFMPEG_RUNTIME_DLLS "")
 endif()
 
+set(VIDEO_PIPELINE_RESOLVED_DEPS_ROOT "${VIDEO_PIPELINE_DEPS_ROOT}")
+if(NOT VIDEO_PIPELINE_RESOLVED_DEPS_ROOT AND Boost_DIR)
+    get_filename_component(VIDEO_PIPELINE_RESOLVED_DEPS_ROOT "${Boost_DIR}/../.." ABSOLUTE)
+endif()
+set(VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR "")
+set(VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR "")
+if(WIN32 AND VIDEO_PIPELINE_RESOLVED_DEPS_ROOT)
+    set(VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR "${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}/bin")
+    if(EXISTS "${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}/debug/bin")
+        set(VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR "${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}/debug/bin")
+    else()
+        set(VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR "${VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR}")
+    endif()
+endif()
+
 function(video_pipeline_copy_runtime_dlls target_name)
     if(WIN32)
         foreach(dll IN LISTS FFMPEG_RUNTIME_DLLS)
@@ -148,7 +167,22 @@ function(video_pipeline_copy_runtime_dlls target_name)
                 COMMENT "Copying FFmpeg runtime: ${dll}"
             )
         endforeach()
+
+        if(VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR)
+            if(EXISTS "${VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR}")
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "$<IF:$<CONFIG:Debug>,${VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR},${VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR}>"
+                        "$<TARGET_FILE_DIR:${target_name}>"
+                    COMMENT "Copying vcpkg runtime DLLs"
+                )
+            endif()
+        endif()
     endif()
+endfunction()
+
+function(video_pipeline_copy_boost_runtime_dlls target_name)
+    video_pipeline_copy_runtime_dlls(${target_name})
 endfunction()
 
 # ============================================================
@@ -178,6 +212,8 @@ file(GLOB_RECURSE VIDEO_PIPELINE_SOURCES CONFIGURE_DEPENDS
 )
 list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\main\\.cpp$")
+list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*/common/process/.*\\.cpp$")
+list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\common\\\\process\\\\.*\\.cpp$")
 
 if(NOT ENABLE_PCAP)
     list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*/ethernet_capture\\.cpp$")
@@ -194,8 +230,8 @@ target_include_directories(video_pipeline_lib
 
 target_link_libraries(video_pipeline_lib
     PUBLIC
-        video_pipeline_asio
-        video_pipeline_spdlog
+        video-pipeline::boost
+        video-pipeline::spdlog
 )
 
 if(WIN32)
@@ -220,6 +256,38 @@ if(MSVC)
     target_compile_options(video_pipeline_lib PRIVATE /W3 /utf-8 /Zc:__cplusplus)
 else()
     target_compile_options(video_pipeline_lib PRIVATE -Wall -Wextra)
+endif()
+
+# ============================================================
+# Common Boost.Process helper
+# ============================================================
+if(VIDEO_PIPELINE_BUILD_COMMON_PROCESS)
+    add_library(video_pipeline_common_process STATIC
+        "${CMAKE_SOURCE_DIR}/src/common/process/process.cpp"
+    )
+    add_library(video-pipeline::common_process ALIAS video_pipeline_common_process)
+
+    target_include_directories(video_pipeline_common_process
+        PUBLIC
+            "${CMAKE_SOURCE_DIR}/include"
+    )
+
+    target_link_libraries(video_pipeline_common_process
+        PUBLIC
+            video-pipeline::boost
+            Threads::Threads
+    )
+
+    if(WIN32)
+        target_compile_definitions(video_pipeline_common_process PUBLIC _WIN32_WINNT=0x0601 WIN32_LEAN_AND_MEAN NOMINMAX)
+        target_link_libraries(video_pipeline_common_process PUBLIC ws2_32 mswsock)
+    endif()
+
+    if(MSVC)
+        target_compile_options(video_pipeline_common_process PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(video_pipeline_common_process PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 # ============================================================
@@ -287,6 +355,10 @@ message(STATUS "Build tests: ${BUILD_TESTS}")
 message(STATUS "Build CLI: ${VIDEO_PIPELINE_BUILD_CLI}")
 message(STATUS "Build Tauri module: ${VIDEO_PIPELINE_BUILD_TAURI_MODULE}")
 message(STATUS "Build native player: ${VIDEO_PIPELINE_BUILD_NATIVE_PLAYER}")
+message(STATUS "Build common process: ${VIDEO_PIPELINE_BUILD_COMMON_PROCESS}")
+message(STATUS "Build ZLMediaKit test: ${VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST}")
+message(STATUS "Deps root: ${VIDEO_PIPELINE_DEPS_ROOT}")
+message(STATUS "Resolved deps root: ${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}")
 message(STATUS "Enable pcap: ${ENABLE_PCAP}")
 message(STATUS "Runtime output: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "===========================================")

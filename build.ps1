@@ -12,7 +12,9 @@ param(
     [switch]$NoPcap,
     [switch]$NoCli,
     [switch]$TauriModule,
-    [switch]$NativePlayer
+    [switch]$NativePlayer,
+    [string]$DepsRoot = "C:\vcpkg_env\vcpkg_installed\x64-windows",
+    [string]$BoostRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -24,6 +26,10 @@ $EnablePcap = if ($NoPcap) { "OFF" } else { "ON" }
 $BuildCli = if ($NoCli) { "OFF" } else { "ON" }
 $BuildTauriModule = if ($TauriModule) { "ON" } else { "OFF" }
 $BuildNativePlayer = if ($NativePlayer) { "ON" } else { "OFF" }
+if (-not [string]::IsNullOrWhiteSpace($BoostRoot)) {
+    $DepsRoot = $BoostRoot
+}
+$DepsRootArg = if ([string]::IsNullOrWhiteSpace($DepsRoot)) { "" } else { " -DVIDEO_PIPELINE_DEPS_ROOT=`"$DepsRoot`"" }
 
 function Find-VcVars64 {
     $candidates = @(
@@ -89,16 +95,23 @@ function Invoke-CMakeInEnvironment {
 
 function Configure-Project {
     if ($VcVars64) {
-        Invoke-CMakeInEnvironment "cmake -S `"$ProjectRoot`" -B `"$BuildDir`" -G `"NMake Makefiles`" -DBUILD_TESTS=$BuildTests -DENABLE_PCAP=$EnablePcap -DVIDEO_PIPELINE_PROFILE=$Profile -DVIDEO_PIPELINE_BUILD_CLI=$BuildCli -DVIDEO_PIPELINE_BUILD_TAURI_MODULE=$BuildTauriModule -DVIDEO_PIPELINE_BUILD_NATIVE_PLAYER=$BuildNativePlayer -DCMAKE_BUILD_TYPE=$Config"
+        Invoke-CMakeInEnvironment "cmake -S `"$ProjectRoot`" -B `"$BuildDir`" -G `"NMake Makefiles`" -DBUILD_TESTS=$BuildTests -DENABLE_PCAP=$EnablePcap -DVIDEO_PIPELINE_PROFILE=$Profile -DVIDEO_PIPELINE_BUILD_CLI=$BuildCli -DVIDEO_PIPELINE_BUILD_TAURI_MODULE=$BuildTauriModule -DVIDEO_PIPELINE_BUILD_NATIVE_PLAYER=$BuildNativePlayer$DepsRootArg -DCMAKE_BUILD_TYPE=$Config"
     } else {
-        Invoke-Native cmake -S $ProjectRoot -B $BuildDir `
-            -DBUILD_TESTS=$BuildTests `
-            -DENABLE_PCAP=$EnablePcap `
-            -DVIDEO_PIPELINE_PROFILE=$Profile `
-            -DVIDEO_PIPELINE_BUILD_CLI=$BuildCli `
-            -DVIDEO_PIPELINE_BUILD_TAURI_MODULE=$BuildTauriModule `
-            -DVIDEO_PIPELINE_BUILD_NATIVE_PLAYER=$BuildNativePlayer `
-            -DCMAKE_BUILD_TYPE=$Config
+        $configureArgs = @(
+            "-S", $ProjectRoot,
+            "-B", $BuildDir,
+            "-DBUILD_TESTS=$BuildTests",
+            "-DENABLE_PCAP=$EnablePcap",
+            "-DVIDEO_PIPELINE_PROFILE=$Profile",
+            "-DVIDEO_PIPELINE_BUILD_CLI=$BuildCli",
+            "-DVIDEO_PIPELINE_BUILD_TAURI_MODULE=$BuildTauriModule",
+            "-DVIDEO_PIPELINE_BUILD_NATIVE_PLAYER=$BuildNativePlayer",
+            "-DCMAKE_BUILD_TYPE=$Config"
+        )
+        if (-not [string]::IsNullOrWhiteSpace($DepsRoot)) {
+            $configureArgs += "-DVIDEO_PIPELINE_DEPS_ROOT=$DepsRoot"
+        }
+        Invoke-Native cmake @configureArgs
     }
 }
 

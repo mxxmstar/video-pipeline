@@ -1,0 +1,26 @@
+{
+  "$schema": "https://githubusercontent.com",
+  "name": "my-global-env",
+  "version": "1.0.0",
+  "dependencies": [
+	"spdlog",	
+    "boost-asio",
+    "boost-beast",
+    "boost-system",
+    "boost-uuid",
+    "boost-json",
+    "boost-process",
+    "boost-mysql",
+    "boost-redis",
+    "boost-pool",
+    "boost-lockfree",
+    "boost-filesystem",
+    "zlmediakit",    
+    "libyuv",
+    "grpc",
+    "protobuf",
+    "zeromq",    
+    "yaml-cpp",
+    "libdatachannel"
+  ]
+}

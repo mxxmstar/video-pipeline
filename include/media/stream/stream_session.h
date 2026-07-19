@@ -6,8 +6,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <asio/io_context.hpp>
-#include <asio/steady_timer.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/system/error_code.hpp>
 
 #include "media/media_packet.h"
 #include "media/stream/stream_info.h"
@@ -19,7 +20,7 @@
 ///
 /// 管理一次拉流连接的生命周期，职责包括：
 ///   - 连接 / 断开 / 自动重连
-///   - 读循环（通过 asio::post 调度到 io_context）
+///   - 读循环（通过 boost::asio::post 调度到 io_context）
 ///   - Watchdog 读超时检测（steady_timer）
 ///   - 码率统计（原子计数器 + 定时汇总）
 ///
@@ -50,7 +51,7 @@ public:
 
     /// @brief 构造
     /// @param io 外部 io_context（用于异步定时器）
-    explicit MediaStreamSession(asio::io_context& io);
+    explicit MediaStreamSession(boost::asio::io_context& io);
 
     ~MediaStreamSession();
 
@@ -129,7 +130,7 @@ private:
     void startDecoderDriveTimer();
 
     /// @brief 解码器驱动定时器回调
-    void onDecoderDriveTimer(const asio::error_code& ec);
+    void onDecoderDriveTimer(const boost::system::error_code& ec);
 
     /// @brief 入队媒体包
     void enqueuePacket(std::shared_ptr<MediaPacket> packet);
@@ -144,7 +145,7 @@ private:
     void startWatchdog();
 
     /// @brief Watchdog 检测回调
-    void onWatchdog(const asio::error_code& ec);
+    void onWatchdog(const boost::system::error_code& ec);
 
     // ==================== 状态变更 ====================
 
@@ -153,16 +154,16 @@ private:
 
     // ==================== 成员 ====================
 
-    asio::io_context& io_;        ///< 外部 io_context
+    boost::asio::io_context& io_;        ///< 外部 io_context
     std::unique_ptr<IPuller> puller_;    ///< 底层拉流器
     std::string url_;                    ///< 拉流地址
 
     std::atomic<State> state_{State::KIDLE}; ///< 当前状态
     std::atomic<bool> running_{false};      ///< 读线程运行标志
 
-    asio::steady_timer reconnect_timer_;      ///< 重连延迟定时器
-    asio::steady_timer watchdog_timer_;       ///< Watchdog 定时器
-    asio::steady_timer decoder_timer_;        ///< Decoder drive timer
+    boost::asio::steady_timer reconnect_timer_;      ///< 重连延迟定时器
+    boost::asio::steady_timer watchdog_timer_;       ///< Watchdog 定时器
+    boost::asio::steady_timer decoder_timer_;        ///< Decoder drive timer
 
     // ── 配置 ──
     int reconnect_interval_ms_{3000};   ///< 重连间隔

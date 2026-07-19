@@ -9,15 +9,15 @@
 #include "media/stream/stream_source.h"
 #include "media/puller/ffmpeg_puller.h"
 #include "media/decoder/ffmpeg_decoder.h"
-#include <asio.hpp>
+#include <boost/asio.hpp>
 
 struct IOTestContext {
-    asio::io_context io;
-    asio::executor_work_guard<asio::io_context::executor_type> work;
+    boost::asio::io_context io;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
     std::thread thread;
 
     IOTestContext()
-        : work(asio::make_work_guard(io))
+        : work(boost::asio::make_work_guard(io))
         , thread([this]() { io.run(); }) {}
 
     ~IOTestContext() {

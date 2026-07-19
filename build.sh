@@ -8,9 +8,9 @@ BUILD_DIR="${PROJECT_ROOT}/build"
 usage() {
     cat <<EOF
 Usage:
-  ./build.sh build [Debug|Release] [test] [--no-pcap] [--profile tauri|native|all|custom]
-  ./build.sh run   [Debug|Release] [--no-pcap] [--profile tauri|native|all|custom]
-  ./build.sh test  [Debug|Release] [--no-pcap] [--profile tauri|native|all|custom]
+  ./build.sh build [Debug|Release] [test] [--no-pcap] [--profile tauri|native|all|custom] [--deps-root PATH]
+  ./build.sh run   [Debug|Release] [--no-pcap] [--profile tauri|native|all|custom] [--deps-root PATH]
+  ./build.sh test  [Debug|Release] [--no-pcap] [--profile tauri|native|all|custom] [--deps-root PATH]
   ./build.sh clean
 EOF
 }
@@ -34,6 +34,7 @@ profile="tauri"
 cli="ON"
 tauri_module="OFF"
 native_player="OFF"
+deps_root="C:/vcpkg_env/vcpkg_installed/x64-windows"
 
 while [[ $# -gt 0 ]]; do
     case "${1,,}" in
@@ -64,6 +65,18 @@ while [[ $# -gt 0 ]]; do
         --native-player)
             native_player="ON"
             ;;
+        --deps-root|--boost-root)
+            flag="${1}"
+            shift
+            if [[ $# -eq 0 ]]; then
+                echo "${flag} requires a path" >&2
+                exit 1
+            fi
+            deps_root="${1}"
+            ;;
+        --deps-root=*|--boost-root=*)
+            deps_root="${1#*=}"
+            ;;
         -h|--help)
             usage
             exit 0
@@ -82,14 +95,23 @@ if [[ "${action,,}" == "test" ]]; then
 fi
 
 configure() {
-    cmake -S "${PROJECT_ROOT}" -B "${BUILD_DIR}" \
-        -DCMAKE_BUILD_TYPE="${config}" \
-        -DBUILD_TESTS="${tests}" \
-        -DENABLE_PCAP="${pcap}" \
-        -DVIDEO_PIPELINE_PROFILE="${profile}" \
-        -DVIDEO_PIPELINE_BUILD_CLI="${cli}" \
-        -DVIDEO_PIPELINE_BUILD_TAURI_MODULE="${tauri_module}" \
+    local cmake_args=(
+        -S "${PROJECT_ROOT}"
+        -B "${BUILD_DIR}"
+        -DCMAKE_BUILD_TYPE="${config}"
+        -DBUILD_TESTS="${tests}"
+        -DENABLE_PCAP="${pcap}"
+        -DVIDEO_PIPELINE_PROFILE="${profile}"
+        -DVIDEO_PIPELINE_BUILD_CLI="${cli}"
+        -DVIDEO_PIPELINE_BUILD_TAURI_MODULE="${tauri_module}"
         -DVIDEO_PIPELINE_BUILD_NATIVE_PLAYER="${native_player}"
+    )
+
+    if [[ -n "${deps_root}" ]]; then
+        cmake_args+=(-DVIDEO_PIPELINE_DEPS_ROOT="${deps_root}")
+    fi
+
+    cmake "${cmake_args[@]}"
 }
 
 build() {
