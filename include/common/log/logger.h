@@ -43,8 +43,7 @@
 #include "spdlog/sinks/rotating_file_sink.h"
 #include "spdlog/sinks/daily_file_sink.h"
 
-namespace ai_camera {
-namespace log {
+namespace logger {
 
 /// @brief 日志级别
 enum class Level {
@@ -189,8 +188,7 @@ inline void Flush() {
     spdlog::default_logger()->flush();
 }
 
-} // namespace log
-} // namespace ai_camera
+} // namespace logger
 
 // ============================================================
 // 日志宏（方便使用）

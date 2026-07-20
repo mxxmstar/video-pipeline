@@ -17,6 +17,17 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 }
 
+namespace {
+
+void ResetEncoderFrameHints(AVFrame* frame) {
+    if (!frame) {
+        return;
+    }
+    frame->pict_type = AV_PICTURE_TYPE_NONE;
+}
+
+} // namespace
+
 FFmpegEncoder::~FFmpegEncoder() {
     Close();
 }
@@ -494,6 +505,7 @@ AVFrame* FFmpegEncoder::BuildInputFrame(const FramePtr& frame) {
                 return nullptr;
             }
             cloned->pts = ResolveFramePts(*frame);
+            ResetEncoderFrameHints(cloned);
             return cloned;
         }
 
@@ -516,6 +528,7 @@ AVFrame* FFmpegEncoder::BuildInputFrame(const FramePtr& frame) {
             converted->nb_samples = src->nb_samples;
         }
         converted->pts = ResolveFramePts(*frame);
+        ResetEncoderFrameHints(converted);
 
         int ret = av_frame_get_buffer(converted, 32);
         if (ret < 0) {
@@ -566,6 +579,7 @@ AVFrame* FFmpegEncoder::BuildInputFrame(const FramePtr& frame) {
         dst->nb_samples = frame->NbSamples() > 0 ? frame->NbSamples() : config_.audio.sample_rate / 100;
     }
     dst->pts = ResolveFramePts(*frame);
+    ResetEncoderFrameHints(dst);
 
     int ret = av_frame_get_buffer(dst, 32);
     if (ret < 0) {

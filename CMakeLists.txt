@@ -1,5 +1,18 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Visual Studio loads the vcpkg toolchain during project(), so vcpkg cache
+# variables must be set before that call.
+set(VIDEO_PIPELINE_VCPKG_INSTALLED_DIR "C:/vcpkg_env/vcpkg_installed" CACHE PATH "Shared vcpkg installed root")
+if(NOT DEFINED VCPKG_INSTALLED_DIR)
+    set(VCPKG_INSTALLED_DIR "${VIDEO_PIPELINE_VCPKG_INSTALLED_DIR}" CACHE PATH "vcpkg installed root")
+endif()
+if(NOT DEFINED VCPKG_TARGET_TRIPLET)
+    set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "vcpkg target triplet")
+endif()
+if(NOT DEFINED VCPKG_MANIFEST_INSTALL)
+    set(VCPKG_MANIFEST_INSTALL OFF CACHE BOOL "Do not automatically run vcpkg install during CMake configure")
+endif()
+
 project(video-pipeline LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
@@ -16,7 +29,7 @@ option(VIDEO_PIPELINE_BUILD_CLI "Build standalone C++ CLI/demo executable" ON)
 option(VIDEO_PIPELINE_BUILD_TAURI_MODULE "Build embeddable Tauri C ABI module when src/c_api sources exist" OFF)
 option(VIDEO_PIPELINE_BUILD_NATIVE_PLAYER "Build Boost based native player/web service app" OFF)
 set(VIDEO_PIPELINE_BOOST_MIN_VERSION "1.91" CACHE STRING "Minimum Boost version for project Boost components")
-set(VIDEO_PIPELINE_DEFAULT_DEPS_ROOT "C:/vcpkg_env/vcpkg_installed/x64-windows")
+set(VIDEO_PIPELINE_DEFAULT_DEPS_ROOT "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
 set(VIDEO_PIPELINE_DEPS_ROOT "${VIDEO_PIPELINE_DEFAULT_DEPS_ROOT}" CACHE PATH "vcpkg installed prefix for Boost, spdlog, and runtime DLLs")
 set(VIDEO_PIPELINE_BOOST_ROOT "" CACHE PATH "Deprecated alias for VIDEO_PIPELINE_DEPS_ROOT")
 option(VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST "Build manual ZLMediaKit process smoke test" ON)

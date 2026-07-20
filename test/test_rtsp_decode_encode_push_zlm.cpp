@@ -3,7 +3,7 @@
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/puller/ffmpeg_puller.h"
-#include "media/pusher/ffmpeg_pusher.h"
+#include "media/publisher/i_publisher.h"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/address.hpp>
@@ -255,7 +255,7 @@ bool VerifyOutputRtspOnce() {
 
 struct PipelineState {
     std::unique_ptr<FFmpegEncoder> encoder;
-    std::unique_ptr<IPusher> pusher;
+    std::unique_ptr<IPublisher> publisher;
     int64_t frame_duration_us{1'000'000 / kFallbackFps};
     int fps{kFallbackFps};
     int decoded_frames{0};
@@ -301,24 +301,31 @@ bool InitializeEncodeAndPush(PipelineState& state,
         return false;
     }
 
-    PusherConfig pusher_config;
-    pusher_config.url = kPushRtmpUrl;
-    pusher_config.format_name = "flv";
-    pusher_config.media_type = MediaType::VIDEO;
-    pusher_config.codec_type = CodecType::H264;
-    pusher_config.width = video_info.width;
-    pusher_config.height = video_info.height;
-    pusher_config.time_base_num = encoder_config.time_base_num;
-    pusher_config.time_base_den = encoder_config.time_base_den;
-    pusher_config.extra_data = state.encoder->GetExtraData();
+    PublisherConfig publisher_config;
+    publisher_config.mode = PublishMode::PushClient;
+    publisher_config.protocol = PublishProtocol::FfmpegMux;
+    publisher_config.url = kPushRtmpUrl;
+    publisher_config.ffmpeg.format_name = "flv";
 
-    if (pusher_config.extra_data.empty()) {
+    MediaTrackConfig track;
+    track.track_id = 0;
+    track.media_type = MediaType::VIDEO;
+    track.codec_type = CodecType::H264;
+    track.width = video_info.width;
+    track.height = video_info.height;
+    track.fps = static_cast<float>(state.fps);
+    track.time_base_num = encoder_config.time_base_num;
+    track.time_base_den = encoder_config.time_base_den;
+    track.extra_data = state.encoder->GetExtraData();
+    publisher_config.tracks.push_back(std::move(track));
+
+    if (publisher_config.tracks.front().extra_data.empty()) {
         std::cout << "Warning: encoder extradata is empty; continuing anyway.\n";
     }
 
-    state.pusher = IPusher::Create(std::move(pusher_config));
-    if (!state.pusher || !state.pusher->Connect()) {
-        state.error = "failed to connect FFmpegPusher to ZLMediaKit";
+    state.publisher = IPublisher::Create(publisher_config);
+    if (!state.publisher || !state.publisher->Start(publisher_config)) {
+        state.error = "failed to start FFmpeg publisher to ZLMediaKit";
         return false;
     }
 
@@ -354,7 +361,7 @@ bool PushEncodedPackets(PipelineState& state, std::vector<PacketPtr>& packets) {
             ++state.keyframes;
         }
 
-        if (!state.pusher->Send(*packet)) {
+        if (!state.publisher->Publish(*packet)) {
             state.error = "failed to send encoded packet to ZLMediaKit";
             return false;
         }
@@ -373,11 +380,11 @@ bool PushEncodedPackets(PipelineState& state, std::vector<PacketPtr>& packets) {
 } // namespace
 
 int main() {
-    ai_camera::log::Init("video_pipeline_e2e");
+    logger::Init("video_pipeline_e2e");
 
     ZlmServerGuard zlm;
     if (!zlm.Start()) {
-        ai_camera::log::Shutdown();
+        logger::Shutdown();
         return 1;
     }
 
@@ -391,14 +398,14 @@ int main() {
     std::cout << "Opening source: " << kSourceRtspUrl << "\n";
     if (!puller.Open(kSourceRtspUrl)) {
         std::cerr << "Failed to open source RTSP.\n";
-        ai_camera::log::Shutdown();
+        logger::Shutdown();
         return 1;
     }
 
     const auto multi_info = puller.GetStreamInfo();
     if (!multi_info.HasVideoStream()) {
         std::cerr << "Source has no video stream.\n";
-        ai_camera::log::Shutdown();
+        logger::Shutdown();
         return 1;
     }
 
@@ -438,7 +445,7 @@ int main() {
 
     if (!decoder.Open(video_stream_info)) {
         std::cerr << "Failed to open video decoder.\n";
-        ai_camera::log::Shutdown();
+        logger::Shutdown();
         return 1;
     }
 
@@ -498,15 +505,15 @@ int main() {
         state.output_verified = verify_future.get();
     }
 
-    if (!state.failed && state.encoder && state.pusher) {
+    if (!state.failed && state.encoder && state.publisher) {
         std::vector<PacketPtr> flushed;
         if (state.encoder->Encode(nullptr, flushed)) {
             (void)PushEncodedPackets(state, flushed);
         }
     }
 
-    if (state.pusher) {
-        state.pusher->Close();
+    if (state.publisher) {
+        state.publisher->Stop();
     }
     if (state.encoder) {
         state.encoder->Close();
@@ -516,14 +523,14 @@ int main() {
 
     if (state.failed) {
         std::cerr << "Pipeline failed: " << state.error << "\n";
-        ai_camera::log::Shutdown();
+        logger::Shutdown();
         return 1;
     }
 
     if (!state.output_verified) {
         std::cerr << "Pipeline pushed packets, but output RTSP verification failed: "
                   << kVerifyRtspUrl << "\n";
-        ai_camera::log::Shutdown();
+        logger::Shutdown();
         return 1;
     }
 
@@ -534,6 +541,6 @@ int main() {
     std::cout << "RTMP publish URL: " << kPushRtmpUrl << "\n";
     std::cout << "RTSP play URL:    " << kVerifyRtspUrl << "\n";
 
-    ai_camera::log::Shutdown();
+    logger::Shutdown();
     return 0;
 }
