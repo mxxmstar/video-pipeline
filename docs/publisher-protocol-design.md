@@ -56,6 +56,10 @@ flowchart TD
 - `tracks`：媒体 track 元数据。
 - `ffmpeg`：FFmpeg muxer 选项。
 - `rtsp`：RTSP server 选项。
+  - `enable_tcp_interleaved`：是否接受 `RTP/AVP/TCP`。
+  - `enable_udp`：是否接受 UDP unicast 和 UDP multicast。
+  - `multicast_address` / `multicast_rtp_port` / `multicast_rtcp_port` / `multicast_ttl`：客户端 SETUP multicast 时未指定目标信息，则使用这些默认值。
+  - `max_payload_size`：H264 RTP payload 最大分片大小。
 
 ### MediaTrackConfig
 
@@ -279,7 +283,7 @@ Stop()
 - 使用 Boost.Asio 监听 TCP 端口。
 - 管理 RTSP client session。
 - 处理 RTSP 方法。
-- 在 PLAY 状态下给客户端发送 RTP over TCP interleaved frame。
+- 在 PLAY 状态下给客户端发送 RTP packet，当前支持 TCP interleaved、UDP unicast 和 UDP multicast。
 - 生成 SDP。
 
 当前支持的 RTSP 方法：
@@ -294,8 +298,10 @@ Stop()
 
 当前 RTP 传输：
 
-- 支持 `RTP/AVP/TCP;interleaved=0-1`
-- 暂不支持 UDP 和 RTCP sender report
+- 支持 `RTP/AVP/TCP;unicast;interleaved=0-1`
+- 支持 `RTP/AVP;unicast;client_port=RTP-RTCP`
+- 支持 `RTP/AVP;multicast;destination=239.x.x.x;port=RTP-RTCP;source=server-ip;ttl=N`
+- 暂不支持 RTCP sender report
 
 写入链路：
 
@@ -303,9 +309,9 @@ Stop()
 RtspServerProtocol::Write(access_unit)
   -> H264RtpPacketizer::Packetize(access_unit)
   -> snapshot current sessions
-  -> only PLAYING clients receive RTP
-  -> ClientSession::SendRtpPayload()
-  -> TCP interleaved RTP frame
+  -> TCP interleaved / UDP unicast: 逐个 PLAYING client session 发送
+  -> UDP multicast: 只通过 protocol 级共享 sender 发送一份 RTP
+  -> TCP interleaved RTP frame 或 UDP RTP datagram
 ```
 
 RTSP server 和 FFmpeg muxer 的角色差异：
@@ -458,12 +464,12 @@ publisher->Publish(packet);
 
 ## 当前限制
 
-RTSP server MVP 当前限制：
+RTSP server 当前限制：
 
 - 仅支持 H264 video。
 - 仅支持单视频 track。
-- 仅支持 RTSP over TCP interleaved。
-- 暂不支持 UDP transport。
+- 支持 RTSP over TCP interleaved、UDP unicast 和标准共享 UDP multicast。
+- UDP multicast 使用 protocol 级共享 socket、SSRC 和 sequence；多个客户端订阅同一个组播流，不会按客户端数量重复发送。
 - 暂不发送 RTCP sender report。
 - RTSP request parser 是最小可用实现，不是完整 RFC 解析器。
 - SDP 中 SPS/PPS 可从 `extra_data` 或写入包中更新，但客户端通常在 `DESCRIBE` 阶段就需要完整参数，因此生产路径建议在 `MediaTrackConfig.extra_data` 中提供 SPS/PPS。
@@ -488,6 +494,8 @@ FFmpeg muxer 当前限制：
   - 执行 `DESCRIBE -> SETUP -> PLAY`。
   - 发布一帧 H264 packet。
   - 验证客户端收到 RTP over TCP interleaved frame。
+  - 验证 UDP unicast SETUP 返回 `server_port`，并且客户端 UDP socket 能收到 RTP packet。
+  - 验证 UDP multicast SDP/SETUP 返回 `destination/port/source/ttl`，两个 RTSP 客户端订阅时仍只发送一份组播 RTP。
 - `test_rtsp_decode_encode_push_zlm`
   - 已迁移为通过 `IPublisher` 使用 `FfmpegMuxProtocol` 推到 ZLMediaKit。
 
@@ -524,8 +532,10 @@ RTSP server 协议：
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
+- `include/media/protocol/rtsp_transport_spec.h`
 - `src/media/protocol/rtsp_server_protocol_adapter.cpp`
 - `src/media/protocol/rtsp_server_protocol.cpp`
+- `src/media/protocol/rtsp_transport_spec.cpp`
 
 H264/RTP 工具：
 

@@ -65,6 +65,12 @@ struct FfmpegPublishOptions {
 struct RtspServerOptions {
     bool enable_tcp_interleaved{true};  ///< 是否开启 TCP 交错模式.
     bool enable_udp{false};             ///< 是否开启 UDP 模式.
+    // 当 SETUP 请求 RTP/AVP;multicast 但没有指定 destination、port 或 ttl 时，
+    // 使用这里的默认组播目标。
+    std::string multicast_address{"239.255.0.1"};
+    std::uint16_t multicast_rtp_port{5004};
+    std::uint16_t multicast_rtcp_port{5005};
+    std::uint8_t multicast_ttl{16};
     int max_payload_size{1420};        ///< 最大 payload 大小.
 };
 
@@ -111,5 +117,3 @@ struct PublisherConfig {
         return true;
     }
 };
-
-

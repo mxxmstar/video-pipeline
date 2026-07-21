@@ -1,10 +1,12 @@
 #include "media/protocol/h264_bitstream.h"
 #include "media/protocol/h264_rtp_packetizer.h"
+#include "media/protocol/rtsp_transport_spec.h"
 #include "media/publisher/i_publisher.h"
 
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 static PublisherConfig MakeRtspConfig() {
@@ -99,12 +101,99 @@ static void TestFuAPacketization() {
     assert(packets.back().marker);
 }
 
+static void TestRtspTransportSpecTcp() {
+    RtspTransportSpec spec;
+    std::string error;
+    assert(RtspTransportSpec::Parse(
+        "RTP/AVP/TCP;unicast;interleaved=2-3",
+        spec,
+        &error));
+    assert(spec.mode == RtspTransportMode::TcpInterleaved);
+    assert(spec.rtp_channel == 2);
+    assert(spec.rtcp_channel == 3);
+    assert(spec.ToSetupResponseHeader() ==
+           "RTP/AVP/TCP;unicast;interleaved=2-3");
+
+    assert(RtspTransportSpec::Parse("rtp/avp/tcp;Interleaved=0-1", spec));
+    assert(spec.rtp_channel == 0);
+    assert(spec.rtcp_channel == 1);
+
+    assert(RtspTransportSpec::Parse("RTP/AVP/TCP;unicast", spec));
+    assert(spec.rtp_channel == 0);
+    assert(spec.rtcp_channel == 1);
+}
+
+static void TestRtspTransportSpecUdp() {
+    RtspTransportSpec spec;
+    assert(RtspTransportSpec::Parse(
+        "RTP/AVP;unicast;client_port=5004-5005",
+        spec));
+    assert(spec.mode == RtspTransportMode::UdpUnicast);
+    assert(spec.client_rtp_port == 5004);
+    assert(spec.client_rtcp_port == 5005);
+    assert(spec.ToSetupResponseHeader() ==
+           "RTP/AVP;unicast;client_port=5004-5005");
+
+    spec.server_rtp_port = 6000;
+    spec.server_rtcp_port = 6001;
+    assert(spec.ToSetupResponseHeader() ==
+           "RTP/AVP;unicast;client_port=5004-5005;server_port=6000-6001");
+}
+
+static void TestRtspTransportSpecMulticast() {
+    RtspTransportSpec spec;
+    assert(RtspTransportSpec::Parse(
+        "RTP/AVP;multicast;destination=239.255.0.1;port=5004-5005;ttl=16",
+        spec));
+    assert(spec.mode == RtspTransportMode::UdpMulticast);
+    assert(spec.destination == "239.255.0.1");
+    assert(spec.server_rtp_port == 5004);
+    assert(spec.server_rtcp_port == 5005);
+    assert(spec.ttl == 16);
+    assert(spec.ToSetupResponseHeader() ==
+           "RTP/AVP;multicast;destination=239.255.0.1;port=5004-5005;ttl=16");
+
+    assert(RtspTransportSpec::Parse("RTP/AVP;multicast", spec));
+    assert(spec.mode == RtspTransportMode::UdpMulticast);
+    assert(spec.destination.empty());
+    assert(spec.server_rtp_port == 0);
+    assert(spec.ttl == 0);
+}
+
+static void TestRtspTransportSpecAlternatives() {
+    RtspTransportSpec spec;
+    assert(RtspTransportSpec::Parse(
+        "unsupported;foo=bar, RTP/AVP/TCP;unicast;interleaved=4-5",
+        spec));
+    assert(spec.mode == RtspTransportMode::TcpInterleaved);
+    assert(spec.rtp_channel == 4);
+    assert(spec.rtcp_channel == 5);
+}
+
+static void TestRtspTransportSpecInvalid() {
+    RtspTransportSpec spec;
+    std::string error;
+    assert(!RtspTransportSpec::Parse("RTP/AVP;unicast", spec, &error));
+    assert(!error.empty());
+
+    assert(!RtspTransportSpec::Parse(
+        "RTP/AVP/TCP;unicast;interleaved=abc-1",
+        spec,
+        &error));
+    assert(!error.empty());
+}
+
 int main() {
     TestPublisherConfigValidation();
     TestAnnexBSplit();
     TestAvccExtradata();
     TestAvccSplit();
     TestFuAPacketization();
+    TestRtspTransportSpecTcp();
+    TestRtspTransportSpecUdp();
+    TestRtspTransportSpecMulticast();
+    TestRtspTransportSpecAlternatives();
+    TestRtspTransportSpecInvalid();
 
     auto publisher = IPublisher::Create(MakeRtspConfig());
     assert(publisher);

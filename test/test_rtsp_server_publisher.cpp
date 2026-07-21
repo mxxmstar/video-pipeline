@@ -1,7 +1,9 @@
 #include "media/publisher/i_publisher.h"
 #include "media/simple_buffer.h"
 
+#include <boost/asio/ip/multicast.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <boost/asio/write.hpp>
 
 #include <algorithm>
@@ -16,15 +18,27 @@
 
 namespace {
 
-constexpr std::uint16_t kTestPort = 18554;
+constexpr std::uint16_t kTcpTestPort = 18554;
+constexpr std::uint16_t kUdpTestPort = 18555;
+constexpr std::uint16_t kMulticastTestPort = 18556;
+constexpr const char* kMulticastAddress = "239.255.42.1";
 
-PublisherConfig MakeConfig() {
+PublisherConfig MakeConfig(std::uint16_t port,
+                           bool enable_udp,
+                           std::uint16_t multicast_rtp_port = 0) {
     PublisherConfig config;
     config.mode = PublishMode::PullServer;
     config.protocol = PublishProtocol::RtspServer;
     config.listen_host = "127.0.0.1";
-    config.listen_port = kTestPort;
+    config.listen_port = port;
     config.stream_path = "/live/test";
+    config.rtsp.enable_udp = enable_udp;
+    if (multicast_rtp_port != 0) {
+        config.rtsp.multicast_address = kMulticastAddress;
+        config.rtsp.multicast_rtp_port = multicast_rtp_port;
+        config.rtsp.multicast_rtcp_port = multicast_rtp_port + 1;
+        config.rtsp.multicast_ttl = 16;
+    }
 
     MediaTrackConfig track;
     track.track_id = 0;
@@ -97,6 +111,72 @@ bool ReadInterleavedFrame(boost::asio::ip::tcp::socket& socket,
     return false;
 }
 
+bool ReadUdpPacket(boost::asio::ip::udp::socket& socket,
+                   std::vector<std::uint8_t>& packet) {
+    std::array<std::uint8_t, 2048> chunk{};
+    boost::asio::ip::udp::endpoint sender;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        boost::system::error_code ec;
+        const auto n = socket.receive_from(boost::asio::buffer(chunk), sender, 0, ec);
+        if (!ec && n > 0) {
+            packet.assign(chunk.data(), chunk.data() + n);
+            return true;
+        }
+        if (ec == boost::asio::error::would_block ||
+            ec == boost::asio::error::try_again) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        if (ec) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+int DrainUdpPackets(boost::asio::ip::udp::socket& socket,
+                    std::chrono::milliseconds first_packet_timeout,
+                    std::chrono::milliseconds quiet_timeout) {
+    int count = 0;
+    std::array<std::uint8_t, 2048> chunk{};
+    boost::asio::ip::udp::endpoint sender;
+    auto deadline = std::chrono::steady_clock::now() + first_packet_timeout;
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        boost::system::error_code ec;
+        const auto n = socket.receive_from(boost::asio::buffer(chunk), sender, 0, ec);
+        if (!ec && n > 0) {
+            if (n >= 13 && chunk[0] == 0x80 && (chunk[1] & 0x7F) == 96) {
+                ++count;
+                deadline = std::chrono::steady_clock::now() + quiet_timeout;
+            }
+            continue;
+        }
+        if (ec == boost::asio::error::would_block ||
+            ec == boost::asio::error::try_again) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        if (ec) {
+            break;
+        }
+    }
+
+    return count;
+}
+
+std::uint16_t FindFreeUdpPort() {
+    boost::asio::io_context io;
+    boost::asio::ip::udp::socket socket(io);
+    socket.open(boost::asio::ip::udp::v4());
+    socket.bind({boost::asio::ip::udp::v4(), 0});
+    const auto port = socket.local_endpoint().port();
+    return port == 65535 ? 5004 : port;
+}
+
 void SendRequest(boost::asio::ip::tcp::socket& socket, const std::string& request) {
     boost::asio::write(socket, boost::asio::buffer(request));
 }
@@ -119,20 +199,19 @@ MediaPacket MakePacket() {
     return packet;
 }
 
-} // namespace
-
-int main() {
-    auto config = MakeConfig();
+void TestTcpInterleavedPublisher() {
+    auto config = MakeConfig(kTcpTestPort, false);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
     assert(publisher->Start(config));
 
     boost::asio::io_context io;
     boost::asio::ip::tcp::socket socket(io);
-    socket.connect({boost::asio::ip::make_address("127.0.0.1"), kTestPort});
+    socket.connect({boost::asio::ip::make_address("127.0.0.1"), kTcpTestPort});
     socket.non_blocking(true);
 
-    const std::string url = "rtsp://127.0.0.1:" + std::to_string(kTestPort) + "/live/test";
+    const std::string url =
+        "rtsp://127.0.0.1:" + std::to_string(kTcpTestPort) + "/live/test";
     SendRequest(socket,
                 "DESCRIBE " + url + " RTSP/1.0\r\n"
                 "CSeq: 1\r\n"
@@ -165,5 +244,166 @@ int main() {
     assert((frame[5] & 0x7F) == 96);
 
     publisher->Stop();
+}
+
+void TestUdpUnicastPublisher() {
+    auto config = MakeConfig(kUdpTestPort, true);
+    auto publisher = IPublisher::Create(config);
+    assert(publisher);
+    assert(publisher->Start(config));
+
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::socket rtsp_socket(io);
+    rtsp_socket.connect({boost::asio::ip::make_address("127.0.0.1"), kUdpTestPort});
+    rtsp_socket.non_blocking(true);
+
+    boost::asio::ip::udp::socket rtp_socket(io);
+    rtp_socket.open(boost::asio::ip::udp::v4());
+    rtp_socket.bind({boost::asio::ip::make_address("127.0.0.1"), 0});
+    rtp_socket.non_blocking(true);
+
+    boost::asio::ip::udp::socket rtcp_socket(io);
+    rtcp_socket.open(boost::asio::ip::udp::v4());
+    rtcp_socket.bind({boost::asio::ip::make_address("127.0.0.1"), 0});
+
+    const auto client_rtp_port = rtp_socket.local_endpoint().port();
+    const auto client_rtcp_port = rtcp_socket.local_endpoint().port();
+    const std::string url =
+        "rtsp://127.0.0.1:" + std::to_string(kUdpTestPort) + "/live/test";
+
+    SendRequest(rtsp_socket,
+                "DESCRIBE " + url + " RTSP/1.0\r\n"
+                "CSeq: 1\r\n"
+                "Accept: application/sdp\r\n\r\n");
+    auto response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+
+    SendRequest(rtsp_socket,
+                "SETUP " + url + "/track0 RTSP/1.0\r\n"
+                "CSeq: 2\r\n"
+                "Transport: RTP/AVP;unicast;client_port=" +
+                    std::to_string(client_rtp_port) + "-" +
+                    std::to_string(client_rtcp_port) + "\r\n\r\n");
+    response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("Transport: RTP/AVP;unicast") != std::string::npos);
+    assert(response.find("server_port=") != std::string::npos);
+
+    SendRequest(rtsp_socket,
+                "PLAY " + url + " RTSP/1.0\r\n"
+                "CSeq: 3\r\n"
+                "Session: 00000001\r\n\r\n");
+    response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+
+    assert(publisher->Publish(MakePacket()));
+
+    std::vector<std::uint8_t> packet;
+    assert(ReadUdpPacket(rtp_socket, packet));
+    assert(packet.size() >= 12 + 1);
+    assert(packet[0] == 0x80);
+    assert((packet[1] & 0x7F) == 96);
+
+    publisher->Stop();
+}
+
+void TestUdpMulticastPublisher() {
+    const auto multicast_rtp_port = FindFreeUdpPort();
+    auto config = MakeConfig(kMulticastTestPort, true, multicast_rtp_port);
+    auto publisher = IPublisher::Create(config);
+    assert(publisher);
+    assert(publisher->Start(config));
+
+    boost::asio::io_context io;
+    boost::asio::ip::udp::socket rtp_socket(io);
+    boost::system::error_code ec;
+    rtp_socket.open(boost::asio::ip::udp::v4(), ec);
+    assert(!ec);
+    rtp_socket.set_option(boost::asio::socket_base::reuse_address(true), ec);
+    assert(!ec);
+    rtp_socket.bind({boost::asio::ip::udp::v4(), multicast_rtp_port}, ec);
+    assert(!ec);
+    // 优先加入 loopback 接口，失败时回退到系统默认组播接口。
+    rtp_socket.set_option(boost::asio::ip::multicast::join_group(
+        boost::asio::ip::make_address_v4(kMulticastAddress),
+        boost::asio::ip::address_v4::loopback()),
+        ec);
+    if (ec) {
+        rtp_socket.set_option(boost::asio::ip::multicast::join_group(
+            boost::asio::ip::make_address_v4(kMulticastAddress)),
+            ec);
+    }
+    assert(!ec);
+    rtp_socket.non_blocking(true);
+
+    const std::string url =
+        "rtsp://127.0.0.1:" + std::to_string(kMulticastTestPort) + "/live/test";
+
+    auto connect_multicast_client =
+        [&](boost::asio::ip::tcp::socket& rtsp_socket, int cseq_base) {
+            rtsp_socket.connect({boost::asio::ip::make_address("127.0.0.1"),
+                                 kMulticastTestPort});
+            rtsp_socket.non_blocking(true);
+
+            SendRequest(rtsp_socket,
+                        "DESCRIBE " + url + " RTSP/1.0\r\n"
+                        "CSeq: " + std::to_string(cseq_base) + "\r\n"
+                        "Accept: application/sdp\r\n\r\n");
+            auto response = ReadUntilHeader(rtsp_socket);
+            assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+            assert(response.find(std::string{"c=IN IP4 "} + kMulticastAddress) !=
+                   std::string::npos);
+            assert(response.find("a=type:broadcast") != std::string::npos);
+            assert(response.find(std::string{"m=video "} +
+                                 std::to_string(multicast_rtp_port)) !=
+                   std::string::npos);
+
+            SendRequest(rtsp_socket,
+                        "SETUP " + url + "/track0 RTSP/1.0\r\n"
+                        "CSeq: " + std::to_string(cseq_base + 1) + "\r\n"
+                        "Transport: RTP/AVP;multicast\r\n\r\n");
+            response = ReadUntilHeader(rtsp_socket);
+            assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+            assert(response.find("Transport: RTP/AVP;multicast") != std::string::npos);
+            assert(response.find(std::string{"destination="} + kMulticastAddress) !=
+                   std::string::npos);
+            assert(response.find(std::string{"port="} +
+                                 std::to_string(multicast_rtp_port) + "-" +
+                                 std::to_string(multicast_rtp_port + 1)) !=
+                   std::string::npos);
+            assert(response.find("source=127.0.0.1") != std::string::npos);
+            assert(response.find("ttl=16") != std::string::npos);
+
+            SendRequest(rtsp_socket,
+                        "PLAY " + url + " RTSP/1.0\r\n"
+                        "CSeq: " + std::to_string(cseq_base + 2) + "\r\n"
+                        "Session: 00000001\r\n\r\n");
+            response = ReadUntilHeader(rtsp_socket);
+            assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+        };
+
+    boost::asio::ip::tcp::socket rtsp_socket_1(io);
+    boost::asio::ip::tcp::socket rtsp_socket_2(io);
+    connect_multicast_client(rtsp_socket_1, 1);
+    connect_multicast_client(rtsp_socket_2, 11);
+
+    assert(publisher->Publish(MakePacket()));
+
+    const auto packet_count = DrainUdpPackets(
+        rtp_socket,
+        std::chrono::seconds(2),
+        std::chrono::milliseconds(200));
+    assert(packet_count >= 1);
+    assert(packet_count <= 3);
+
+    publisher->Stop();
+}
+
+} // namespace
+
+int main() {
+    TestTcpInterleavedPublisher();
+    TestUdpUnicastPublisher();
+    TestUdpMulticastPublisher();
     return 0;
 }

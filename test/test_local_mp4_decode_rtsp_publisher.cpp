@@ -47,7 +47,7 @@ void PrintUsage(const char* exe) {
         << "Usage:\n"
         << "  " << exe << " [--loop|--once] [--port N] [--self-test]\n\n"
         << "Defaults are VLC-friendly: --loop --port 7852 --no-self-test --realtime\n"
-        << "Open VLC with TCP transport: rtsp://127.0.0.1:7852/local/mp4\n";
+        << "Open VLC: rtsp://127.0.0.1:7852/local/mp4\n";
 }
 
 int ParseInt(const char* value, const char* option_name) {
@@ -435,6 +435,7 @@ bool InitializePipeline(PipelineState& state,
     publisher_config.listen_host = "127.0.0.1";
     publisher_config.listen_port = state.rtsp_port;
     publisher_config.stream_path = kStreamPath;
+    publisher_config.rtsp.enable_udp = true;
 
     MediaTrackConfig track;
     track.track_id = 0;
@@ -464,7 +465,7 @@ bool InitializePipeline(PipelineState& state,
     std::cout << "Local MP4 pipeline initialized: "
               << width << "x" << height << " @" << state.fps
               << "fps, play=" << state.publisher->GetPlayUrl() << "\n";
-    std::cout << "VLC must use RTSP over TCP for the current RTSP server MVP.\n";
+    std::cout << "RTSP server accepts TCP interleaved, UDP unicast, and UDP multicast transports.\n";
     return true;
 }
 
