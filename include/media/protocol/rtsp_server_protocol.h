@@ -1,10 +1,13 @@
 #pragma once
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <boost/asio/executor_work_guard.hpp>
@@ -41,17 +44,50 @@ public:
 
 private:
     class ClientSession;
+    struct MulticastRtcpFeedback {
+        std::uint32_t media_ssrc{0};
+        std::uint8_t fraction_lost{0};
+        std::int32_t cumulative_lost{0};
+        std::uint32_t extended_highest_sequence{0};
+        std::uint32_t jitter{0};
+        std::uint32_t last_sender_report{0};
+        std::uint32_t delay_since_last_sender_report{0};
+        std::uint64_t reports_received{0};
+    };
 
     void AcceptNext();
     void OnAccepted(boost::system::error_code ec,
                     boost::asio::ip::tcp::socket socket);
     void SnapshotSessions(std::vector<std::shared_ptr<ClientSession>>& sessions) const;
     void UpdateH264ParameterSets(const EncodedAccessUnit& access_unit);
+    void AddRtcpReceiverReportsReceived(std::uint64_t count);
     bool ConfigureSharedMulticastTransport(RtspTransportSpec& transport_spec,
                                            const std::string& source_address);
     void CloseSharedMulticastTransport();
     void SendMulticastRtpPayload(const RtpPayload& payload,
                                  std::uint8_t payload_type);
+    void SendMulticastRtcpSenderReport();
+    void StartMulticastRtcpReceive();
+    void HandleMulticastRtcpPacket(
+        const std::uint8_t* data,
+        std::size_t size,
+        const boost::asio::ip::udp::endpoint& sender_endpoint);
+    void ParseMulticastRtcpReceiverReport(
+        const std::uint8_t* packet,
+        std::size_t packet_size,
+        std::uint8_t report_count,
+        const boost::asio::ip::udp::endpoint& sender_endpoint);
+    void ParseMulticastRtcpSenderReport(
+        const std::uint8_t* packet,
+        std::size_t packet_size,
+        std::uint8_t report_count,
+        const boost::asio::ip::udp::endpoint& sender_endpoint);
+    void ParseMulticastRtcpReportBlocks(
+        const std::uint8_t* blocks,
+        std::uint8_t report_count,
+        std::uint32_t reporter_ssrc,
+        const char* packet_type_name,
+        const boost::asio::ip::udp::endpoint& sender_endpoint);
     std::uint16_t GetMulticastSequence() const;
     std::uint32_t GetMulticastLastRtpTimestamp() const;
 
@@ -68,12 +104,20 @@ private:
 
     std::shared_ptr<boost::asio::ip::udp::socket> multicast_rtp_socket_;
     std::shared_ptr<boost::asio::ip::udp::socket> multicast_rtcp_socket_;
+    std::shared_ptr<boost::asio::ip::udp::socket> multicast_rtcp_receiver_socket_;
     boost::asio::ip::udp::endpoint multicast_rtp_endpoint_;
     boost::asio::ip::udp::endpoint multicast_rtcp_endpoint_;
+    boost::asio::ip::udp::endpoint multicast_rtcp_sender_endpoint_;
+    std::array<std::uint8_t, 2048> multicast_rtcp_read_buffer_{};
     RtspTransportSpec multicast_transport_spec_;
     std::uint32_t multicast_ssrc_{0};
     std::uint16_t multicast_sequence_{0};
     std::uint32_t multicast_last_rtp_timestamp_{0};
+    std::uint32_t multicast_rtcp_packet_count_{0};
+    std::uint32_t multicast_rtcp_octet_count_{0};
+    std::chrono::steady_clock::time_point multicast_next_rtcp_sr_time_{};
+    std::unordered_map<std::uint32_t, MulticastRtcpFeedback>
+        multicast_rtcp_feedback_by_reporter_;
     bool multicast_ready_{false};
 
     mutable std::mutex mutex_;

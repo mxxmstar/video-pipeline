@@ -301,7 +301,9 @@ Stop()
 - 支持 `RTP/AVP/TCP;unicast;interleaved=0-1`
 - 支持 `RTP/AVP;unicast;client_port=RTP-RTCP`
 - 支持 `RTP/AVP;multicast;destination=239.x.x.x;port=RTP-RTCP;source=server-ip;ttl=N`
-- 暂不支持 RTCP sender report
+- 支持 RTCP sender report：TCP interleaved 使用 RTCP channel，UDP unicast 使用客户端 RTCP 端口，UDP multicast 使用共享组播 RTCP 端口
+- 支持解析客户端 RTCP receiver report：TCP interleaved、UDP unicast 和 UDP multicast 都会消费 compound RTCP，并提取 RR report block 的丢包、最高序列号、jitter、LSR/DLSR
+- `PublisherStats.rtcp_receiver_reports_received` 会累计已接收的 RTCP receiver report block 数量
 
 写入链路：
 
@@ -311,7 +313,10 @@ RtspServerProtocol::Write(access_unit)
   -> snapshot current sessions
   -> TCP interleaved / UDP unicast: 逐个 PLAYING client session 发送
   -> UDP multicast: 只通过 protocol 级共享 sender 发送一份 RTP
-  -> TCP interleaved RTP frame 或 UDP RTP datagram
+  -> 首个 RTP 包后发送 RTCP sender report，后续每 5 秒补发
+  -> TCP interleaved / UDP unicast: 按 session 接收并解析客户端 RTCP receiver report
+  -> UDP multicast: protocol 级接收组播 RTCP receiver report，并按 reporter SSRC 聚合
+  -> TCP interleaved RTP/RTCP frame 或 UDP RTP/RTCP datagram
 ```
 
 RTSP server 和 FFmpeg muxer 的角色差异：
@@ -470,7 +475,8 @@ RTSP server 当前限制：
 - 仅支持单视频 track。
 - 支持 RTSP over TCP interleaved、UDP unicast 和标准共享 UDP multicast。
 - UDP multicast 使用 protocol 级共享 socket、SSRC 和 sequence；多个客户端订阅同一个组播流，不会按客户端数量重复发送。
-- 暂不发送 RTCP sender report。
+- 已发送 RTCP sender report，并解析 TCP interleaved、UDP unicast、UDP multicast 客户端回传的 RTCP receiver report。
+- RTCP SDES、BYE、APP 当前只识别并忽略。
 - RTSP request parser 是最小可用实现，不是完整 RFC 解析器。
 - SDP 中 SPS/PPS 可从 `extra_data` 或写入包中更新，但客户端通常在 `DESCRIBE` 阶段就需要完整参数，因此生产路径建议在 `MediaTrackConfig.extra_data` 中提供 SPS/PPS。
 
@@ -495,6 +501,8 @@ FFmpeg muxer 当前限制：
   - 发布一帧 H264 packet。
   - 验证客户端收到 RTP over TCP interleaved frame。
   - 验证 UDP unicast SETUP 返回 `server_port`，并且客户端 UDP socket 能收到 RTP packet。
+  - 验证 TCP interleaved、UDP unicast 和 UDP multicast 都能收到 RTCP sender report。
+  - 验证 TCP interleaved、UDP unicast 和 UDP multicast 可以接收客户端 compound RTCP receiver report。
   - 验证 UDP multicast SDP/SETUP 返回 `destination/port/source/ttl`，两个 RTSP 客户端订阅时仍只发送一份组播 RTP。
 - `test_rtsp_decode_encode_push_zlm`
   - 已迁移为通过 `IPublisher` 使用 `FfmpegMuxProtocol` 推到 ZLMediaKit。

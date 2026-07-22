@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -12,6 +13,7 @@ struct PublisherStats {
     std::uint64_t packets_published{0};
     std::uint64_t bytes_published{0};
     std::uint64_t clients_connected{0};
+    std::uint64_t rtcp_receiver_reports_received{0};
 };
 
 class IPublisher {
@@ -27,5 +29,4 @@ public:
 
     static std::unique_ptr<IPublisher> Create(PublisherConfig config);
 };
-
 

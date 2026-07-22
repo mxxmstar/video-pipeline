@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -79,24 +80,49 @@ std::string ReadUntilHeader(boost::asio::ip::tcp::socket& socket) {
     return data;
 }
 
-bool ReadInterleavedFrame(boost::asio::ip::tcp::socket& socket,
-                          std::vector<std::uint8_t>& frame) {
-    std::array<std::uint8_t, 2048> chunk{};
+bool ReadInterleavedFrames(boost::asio::ip::tcp::socket& socket,
+                           std::vector<std::vector<std::uint8_t>>& frames,
+                           std::size_t min_frame_count) {
+    std::array<std::uint8_t, 4096> chunk{};
+    std::vector<std::uint8_t> buffer;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 
     while (std::chrono::steady_clock::now() < deadline) {
         boost::system::error_code ec;
         const auto n = socket.read_some(boost::asio::buffer(chunk), ec);
         if (!ec && n > 0) {
-            frame.insert(frame.end(), chunk.data(), chunk.data() + n);
-            auto dollar = std::find(frame.begin(), frame.end(), static_cast<std::uint8_t>('$'));
-            if (dollar != frame.end() && std::distance(dollar, frame.end()) >= 4) {
-                const auto offset = static_cast<std::size_t>(std::distance(frame.begin(), dollar));
+            buffer.insert(buffer.end(), chunk.data(), chunk.data() + n);
+
+            while (true) {
+                auto dollar = std::find(buffer.begin(),
+                                        buffer.end(),
+                                        static_cast<std::uint8_t>('$'));
+                if (dollar == buffer.end()) {
+                    buffer.clear();
+                    break;
+                }
+
+                if (dollar != buffer.begin()) {
+                    buffer.erase(buffer.begin(), dollar);
+                }
+                if (buffer.size() < 4) {
+                    break;
+                }
+
                 const auto length = static_cast<std::uint16_t>(
-                    (frame[offset + 2] << 8) | frame[offset + 3]);
-                if (frame.size() >= offset + 4 + length) {
-                    frame.erase(frame.begin(), frame.begin() + static_cast<std::ptrdiff_t>(offset));
-                    frame.resize(4 + length);
+                    (buffer[2] << 8) | buffer[3]);
+                const auto frame_size = 4 + length;
+                if (buffer.size() < frame_size) {
+                    break;
+                }
+
+                frames.emplace_back(buffer.begin(),
+                                    buffer.begin() +
+                                        static_cast<std::ptrdiff_t>(frame_size));
+                buffer.erase(buffer.begin(),
+                             buffer.begin() +
+                                 static_cast<std::ptrdiff_t>(frame_size));
+                if (frames.size() >= min_frame_count) {
                     return true;
                 }
             }
@@ -108,7 +134,7 @@ bool ReadInterleavedFrame(boost::asio::ip::tcp::socket& socket,
         }
     }
 
-    return false;
+    return frames.size() >= min_frame_count;
 }
 
 bool ReadUdpPacket(boost::asio::ip::udp::socket& socket,
@@ -135,6 +161,116 @@ bool ReadUdpPacket(boost::asio::ip::udp::socket& socket,
     }
 
     return false;
+}
+
+bool IsRtcpSenderReport(const std::vector<std::uint8_t>& packet,
+                        std::size_t offset = 0) {
+    return packet.size() >= offset + 28 &&
+           packet[offset] == 0x80 &&
+           packet[offset + 1] == 200 &&
+           packet[offset + 2] == 0 &&
+           packet[offset + 3] == 6;
+}
+
+std::uint16_t ReadU16(const std::uint8_t* data) {
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8) |
+                                      static_cast<std::uint16_t>(data[1]));
+}
+
+std::uint32_t ReadU32(const std::uint8_t* data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
+}
+
+void WriteU16(std::uint8_t* data, std::uint16_t value) {
+    data[0] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    data[1] = static_cast<std::uint8_t>(value & 0xFF);
+}
+
+void WriteU32(std::uint8_t* data, std::uint32_t value) {
+    data[0] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+    data[1] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    data[2] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    data[3] = static_cast<std::uint8_t>(value & 0xFF);
+}
+
+std::vector<std::uint8_t> MakeRtcpReceiverReport(std::uint32_t media_ssrc,
+                                                 std::uint16_t highest_sequence) {
+    std::vector<std::uint8_t> packet(32);
+    packet[0] = 0x81; // V=2, RC=1
+    packet[1] = 201;  // RR
+    WriteU16(packet.data() + 2, 7);
+    WriteU32(packet.data() + 4, 0x01020304); // receiver SSRC
+    WriteU32(packet.data() + 8, media_ssrc);
+    packet[12] = 0; // fraction lost
+    packet[13] = 0;
+    packet[14] = 0;
+    packet[15] = 0; // cumulative lost
+    WriteU32(packet.data() + 16, highest_sequence);
+    WriteU32(packet.data() + 20, 0); // jitter
+    WriteU32(packet.data() + 24, 0); // LSR
+    WriteU32(packet.data() + 28, 0); // DLSR
+    return packet;
+}
+
+std::vector<std::uint8_t> MakeRtcpSdesCname() {
+    const std::string cname = "video-pipeline-test";
+    std::vector<std::uint8_t> packet;
+    packet.resize(4 + 4 + 2 + cname.size() + 1);
+    packet[0] = 0x81; // V=2, SC=1
+    packet[1] = 202;  // SDES
+    WriteU32(packet.data() + 4, 0x01020304);
+    packet[8] = 1; // CNAME
+    packet[9] = static_cast<std::uint8_t>(cname.size());
+    std::copy(cname.begin(), cname.end(), packet.begin() + 10);
+    packet.back() = 0;
+
+    while ((packet.size() % 4) != 0) {
+        packet.push_back(0);
+    }
+    WriteU16(packet.data() + 2,
+             static_cast<std::uint16_t>((packet.size() / 4) - 1));
+    return packet;
+}
+
+std::vector<std::uint8_t> MakeCompoundReceiverReport(
+    std::uint32_t media_ssrc,
+    std::uint16_t highest_sequence) {
+    auto rr = MakeRtcpReceiverReport(media_ssrc, highest_sequence);
+    auto sdes = MakeRtcpSdesCname();
+    rr.insert(rr.end(), sdes.begin(), sdes.end());
+    return rr;
+}
+
+std::vector<std::uint8_t> MakeInterleavedFrame(
+    std::uint8_t channel,
+    const std::vector<std::uint8_t>& packet) {
+    std::vector<std::uint8_t> frame(4 + packet.size());
+    frame[0] = '$';
+    frame[1] = channel;
+    WriteU16(frame.data() + 2, static_cast<std::uint16_t>(packet.size()));
+    std::copy(packet.begin(), packet.end(), frame.begin() + 4);
+    return frame;
+}
+
+std::pair<std::uint16_t, std::uint16_t> ParseServerPorts(
+    const std::string& response) {
+    const auto marker = response.find("server_port=");
+    assert(marker != std::string::npos);
+    const auto value_begin = marker + std::string{"server_port="}.size();
+    const auto dash = response.find('-', value_begin);
+    assert(dash != std::string::npos);
+    const auto value_end = response.find_first_of(";\r\n", dash + 1);
+    const auto rtp_port =
+        static_cast<std::uint16_t>(std::stoi(response.substr(value_begin,
+                                                            dash - value_begin)));
+    const auto rtcp_port =
+        static_cast<std::uint16_t>(std::stoi(response.substr(
+            dash + 1,
+            value_end == std::string::npos ? std::string::npos : value_end - dash - 1)));
+    return {rtp_port, rtcp_port};
 }
 
 int DrainUdpPackets(boost::asio::ip::udp::socket& socket,
@@ -175,6 +311,78 @@ std::uint16_t FindFreeUdpPort() {
     socket.bind({boost::asio::ip::udp::v4(), 0});
     const auto port = socket.local_endpoint().port();
     return port == 65535 ? 5004 : port;
+}
+
+std::uint16_t FindFreeUdpPortPair() {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        boost::asio::io_context io;
+        boost::asio::ip::udp::socket rtp_socket(io);
+        rtp_socket.open(boost::asio::ip::udp::v4());
+        rtp_socket.bind({boost::asio::ip::udp::v4(), 0});
+
+        const auto rtp_port = rtp_socket.local_endpoint().port();
+        if (rtp_port == 65535) {
+            continue;
+        }
+
+        boost::system::error_code ec;
+        boost::asio::ip::udp::socket rtcp_socket(io);
+        rtcp_socket.open(boost::asio::ip::udp::v4(), ec);
+        if (ec) {
+            continue;
+        }
+        rtcp_socket.bind({boost::asio::ip::udp::v4(),
+                          static_cast<std::uint16_t>(rtp_port + 1)},
+                         ec);
+        if (!ec) {
+            return rtp_port;
+        }
+    }
+
+    return FindFreeUdpPort();
+}
+
+void BindAndJoinMulticastSocket(boost::asio::ip::udp::socket& socket,
+                                std::uint16_t port) {
+    boost::system::error_code ec;
+    socket.open(boost::asio::ip::udp::v4(), ec);
+    assert(!ec);
+    socket.set_option(boost::asio::socket_base::reuse_address(true), ec);
+    assert(!ec);
+    socket.bind({boost::asio::ip::udp::v4(), port}, ec);
+    assert(!ec);
+    // 优先加入 loopback 接口，失败时回退到系统默认组播接口。
+    socket.set_option(boost::asio::ip::multicast::join_group(
+        boost::asio::ip::make_address_v4(kMulticastAddress),
+        boost::asio::ip::address_v4::loopback()),
+        ec);
+    if (ec) {
+        socket.set_option(boost::asio::ip::multicast::join_group(
+            boost::asio::ip::make_address_v4(kMulticastAddress)),
+            ec);
+    }
+    assert(!ec);
+    // 测试里需要把客户端 RR 发回 loopback 组播组，显式指定接口可减少系统路由差异。
+    socket.set_option(
+        boost::asio::ip::multicast::outbound_interface(
+            boost::asio::ip::address_v4::loopback()),
+        ec);
+    if (ec) {
+        socket.set_option(boost::asio::ip::multicast::enable_loopback(true), ec);
+    }
+    socket.non_blocking(true);
+}
+
+bool WaitForRtcpReceiverReports(IPublisher& publisher,
+                                std::uint64_t expected_count) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (publisher.GetStats().rtcp_receiver_reports_received >= expected_count) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return publisher.GetStats().rtcp_receiver_reports_received >= expected_count;
 }
 
 void SendRequest(boost::asio::ip::tcp::socket& socket, const std::string& request) {
@@ -236,12 +444,45 @@ void TestTcpInterleavedPublisher() {
 
     assert(publisher->Publish(MakePacket()));
 
-    std::vector<std::uint8_t> frame;
-    assert(ReadInterleavedFrame(socket, frame));
-    assert(frame.size() >= 4 + 12 + 1);
-    assert(frame[0] == '$');
-    assert(frame[1] == 0);
-    assert((frame[5] & 0x7F) == 96);
+    std::vector<std::vector<std::uint8_t>> frames;
+    assert(ReadInterleavedFrames(socket, frames, 4));
+
+    const auto rtp_frame = std::find_if(
+        frames.begin(),
+        frames.end(),
+        [](const auto& frame) {
+            return frame.size() >= 4 + 12 + 1 &&
+                   frame[0] == '$' &&
+                   frame[1] == 0 &&
+                   (frame[5] & 0x7F) == 96;
+        });
+    assert(rtp_frame != frames.end());
+    const auto media_ssrc = ReadU32(rtp_frame->data() + 12);
+    const auto highest_sequence = ReadU16(rtp_frame->data() + 6);
+
+    const auto rtcp_frame = std::find_if(
+        frames.begin(),
+        frames.end(),
+        [](const auto& frame) {
+            return frame.size() >= 4 + 28 &&
+                   frame[0] == '$' &&
+                   frame[1] == 1 &&
+                   IsRtcpSenderReport(frame, 4);
+        });
+    assert(rtcp_frame != frames.end());
+
+    const auto receiver_report =
+        MakeCompoundReceiverReport(media_ssrc, highest_sequence);
+    const auto receiver_report_frame = MakeInterleavedFrame(1, receiver_report);
+    boost::asio::write(socket, boost::asio::buffer(receiver_report_frame));
+
+    SendRequest(socket,
+                "GET_PARAMETER " + url + " RTSP/1.0\r\n"
+                "CSeq: 4\r\n"
+                "Session: 00000001\r\n\r\n");
+    response = ReadUntilHeader(socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(WaitForRtcpReceiverReports(*publisher, 1));
 
     publisher->Stop();
 }
@@ -265,6 +506,7 @@ void TestUdpUnicastPublisher() {
     boost::asio::ip::udp::socket rtcp_socket(io);
     rtcp_socket.open(boost::asio::ip::udp::v4());
     rtcp_socket.bind({boost::asio::ip::make_address("127.0.0.1"), 0});
+    rtcp_socket.non_blocking(true);
 
     const auto client_rtp_port = rtp_socket.local_endpoint().port();
     const auto client_rtcp_port = rtcp_socket.local_endpoint().port();
@@ -288,6 +530,8 @@ void TestUdpUnicastPublisher() {
     assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
     assert(response.find("Transport: RTP/AVP;unicast") != std::string::npos);
     assert(response.find("server_port=") != std::string::npos);
+    const auto server_ports = ParseServerPorts(response);
+    const auto server_rtcp_port = server_ports.second;
 
     SendRequest(rtsp_socket,
                 "PLAY " + url + " RTSP/1.0\r\n"
@@ -303,12 +547,32 @@ void TestUdpUnicastPublisher() {
     assert(packet.size() >= 12 + 1);
     assert(packet[0] == 0x80);
     assert((packet[1] & 0x7F) == 96);
+    const auto media_ssrc = ReadU32(packet.data() + 8);
+    const auto highest_sequence = ReadU16(packet.data() + 2);
+
+    std::vector<std::uint8_t> rtcp_packet;
+    assert(ReadUdpPacket(rtcp_socket, rtcp_packet));
+    assert(IsRtcpSenderReport(rtcp_packet));
+
+    const auto receiver_report =
+        MakeCompoundReceiverReport(media_ssrc, highest_sequence);
+    rtcp_socket.send_to(
+        boost::asio::buffer(receiver_report),
+        {boost::asio::ip::make_address("127.0.0.1"), server_rtcp_port});
+
+    SendRequest(rtsp_socket,
+                "GET_PARAMETER " + url + " RTSP/1.0\r\n"
+                "CSeq: 4\r\n"
+                "Session: 00000001\r\n\r\n");
+    response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(WaitForRtcpReceiverReports(*publisher, 1));
 
     publisher->Stop();
 }
 
 void TestUdpMulticastPublisher() {
-    const auto multicast_rtp_port = FindFreeUdpPort();
+    const auto multicast_rtp_port = FindFreeUdpPortPair();
     auto config = MakeConfig(kMulticastTestPort, true, multicast_rtp_port);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
@@ -316,25 +580,9 @@ void TestUdpMulticastPublisher() {
 
     boost::asio::io_context io;
     boost::asio::ip::udp::socket rtp_socket(io);
-    boost::system::error_code ec;
-    rtp_socket.open(boost::asio::ip::udp::v4(), ec);
-    assert(!ec);
-    rtp_socket.set_option(boost::asio::socket_base::reuse_address(true), ec);
-    assert(!ec);
-    rtp_socket.bind({boost::asio::ip::udp::v4(), multicast_rtp_port}, ec);
-    assert(!ec);
-    // 优先加入 loopback 接口，失败时回退到系统默认组播接口。
-    rtp_socket.set_option(boost::asio::ip::multicast::join_group(
-        boost::asio::ip::make_address_v4(kMulticastAddress),
-        boost::asio::ip::address_v4::loopback()),
-        ec);
-    if (ec) {
-        rtp_socket.set_option(boost::asio::ip::multicast::join_group(
-            boost::asio::ip::make_address_v4(kMulticastAddress)),
-            ec);
-    }
-    assert(!ec);
-    rtp_socket.non_blocking(true);
+    boost::asio::ip::udp::socket rtcp_socket(io);
+    BindAndJoinMulticastSocket(rtp_socket, multicast_rtp_port);
+    BindAndJoinMulticastSocket(rtcp_socket, multicast_rtp_port + 1);
 
     const std::string url =
         "rtsp://127.0.0.1:" + std::to_string(kMulticastTestPort) + "/live/test";
@@ -389,12 +637,33 @@ void TestUdpMulticastPublisher() {
 
     assert(publisher->Publish(MakePacket()));
 
-    const auto packet_count = DrainUdpPackets(
+    std::vector<std::uint8_t> first_rtp_packet;
+    assert(ReadUdpPacket(rtp_socket, first_rtp_packet));
+    assert(first_rtp_packet.size() >= 12 + 1);
+    assert(first_rtp_packet[0] == 0x80);
+    assert((first_rtp_packet[1] & 0x7F) == 96);
+    const auto media_ssrc = ReadU32(first_rtp_packet.data() + 8);
+    const auto highest_sequence = ReadU16(first_rtp_packet.data() + 2);
+
+    const auto extra_packet_count = DrainUdpPackets(
         rtp_socket,
-        std::chrono::seconds(2),
+        std::chrono::milliseconds(200),
         std::chrono::milliseconds(200));
+    const auto packet_count = 1 + extra_packet_count;
     assert(packet_count >= 1);
     assert(packet_count <= 3);
+
+    std::vector<std::uint8_t> rtcp_packet;
+    assert(ReadUdpPacket(rtcp_socket, rtcp_packet));
+    assert(IsRtcpSenderReport(rtcp_packet));
+
+    const auto receiver_report =
+        MakeCompoundReceiverReport(media_ssrc, highest_sequence);
+    rtcp_socket.send_to(
+        boost::asio::buffer(receiver_report),
+        {boost::asio::ip::make_address(kMulticastAddress),
+         static_cast<std::uint16_t>(multicast_rtp_port + 1)});
+    assert(WaitForRtcpReceiverReports(*publisher, 1));
 
     publisher->Stop();
 }
