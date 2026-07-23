@@ -90,6 +90,13 @@ bool FfmpegMuxProtocol::Start(const PublisherConfig& config,
     }
 
     header_written_ = true;
+    for (unsigned int i = 0; i < fmt_ctx_->nb_streams; ++i) {
+        const auto* stream = fmt_ctx_->streams[i];
+        LOG_INFO("FfmpegMuxProtocol: output stream {} time_base={}/{}",
+                 stream->index,
+                 stream->time_base.num,
+                 stream->time_base.den);
+    }
     LOG_INFO("FfmpegMuxProtocol: started {}", config_.url);
     return true;
 }
@@ -146,6 +153,10 @@ int FfmpegMuxProtocol::MapCodecType(CodecType type) {
             return AV_CODEC_ID_AAC;
         case CodecType::OPUS:
             return AV_CODEC_ID_OPUS;
+        case CodecType::G711A:
+            return AV_CODEC_ID_PCM_ALAW;
+        case CodecType::G711U:
+            return AV_CODEC_ID_PCM_MULAW;
         default:
             return AV_CODEC_ID_NONE;
     }
@@ -260,6 +271,13 @@ bool FfmpegMuxProtocol::BuildPacket(const EncodedAccessUnit& access_unit,
     out->duration = access_unit.duration;
     out->pos = -1;
 
+    const auto* stream = fmt_ctx_->streams[out->stream_index];
+    const AVRational source_time_base{
+        access_unit.time_base.num > 0 ? access_unit.time_base.num : 1,
+        access_unit.time_base.den > 0 ? access_unit.time_base.den : 1000000,
+    };
+    av_packet_rescale_ts(out, source_time_base, stream->time_base);
+
     if (access_unit.keyframe) {
         out->flags |= AV_PKT_FLAG_KEY;
     } else {
@@ -294,5 +312,3 @@ void FfmpegMuxProtocol::FreeContext(bool write_trailer) {
     header_written_ = false;
     config_ = {};
 }
-
-

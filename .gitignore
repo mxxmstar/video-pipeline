@@ -39,3 +39,4 @@ Makefile
 CTestTestfile.cmake
 
 *.ts
+*.m3u8

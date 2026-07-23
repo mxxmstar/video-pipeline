@@ -20,14 +20,23 @@ add_test(NAME test_publisher_protocol COMMAND test_publisher_protocol)
 
 add_executable(test_rtsp_server_publisher test_rtsp_server_publisher.cpp)
 target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_lib)
+target_compile_definitions(test_rtsp_server_publisher
+    PRIVATE
+        VIDEO_PIPELINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+if(TARGET video_pipeline_common_process)
+    target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_common_process)
+    target_compile_definitions(test_rtsp_server_publisher
+        PRIVATE
+            VIDEO_PIPELINE_HAS_COMMON_PROCESS=1
+    )
+endif()
 video_pipeline_copy_runtime_dlls(test_rtsp_server_publisher)
 if(MSVC)
     target_compile_options(test_rtsp_server_publisher PRIVATE /W3 /utf-8 /Zc:__cplusplus)
 else()
     target_compile_options(test_rtsp_server_publisher PRIVATE -Wall -Wextra)
 endif()
-add_test(NAME test_rtsp_server_publisher COMMAND test_rtsp_server_publisher)
-
 add_executable(test_local_mp4_decode_rtsp_publisher test_local_mp4_decode_rtsp_publisher.cpp)
 target_link_libraries(test_local_mp4_decode_rtsp_publisher PRIVATE video_pipeline_lib)
 target_compile_definitions(test_local_mp4_decode_rtsp_publisher

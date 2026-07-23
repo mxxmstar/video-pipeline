@@ -73,10 +73,10 @@ flowchart TD
 - `width` / `height` / `fps`：视频参数。
 - `sample_rate` / `channels`：音频参数。
 - `time_base_num` / `time_base_den`：packet 时间基。
-- `extra_data`：编码参数，例如 H264 SPS/PPS。
+- `extra_data`：编码参数，例如 H264 SPS/PPS、AAC AudioSpecificConfig。
 - `rtp_payload_type` / `rtp_clock_rate`：RTP track 参数。
 
-当前 RTSP server MVP 支持单路 H264 视频，默认 payload type 为 96，RTP clock rate 为 90000。
+当前 RTSP server 支持 H264 视频 track，以及 AAC/G711A/G711U 音频 track。视频 RTP clock rate 为 90000；音频 RTP clock rate 使用采样率。
 
 ## Publisher 层
 
@@ -191,23 +191,24 @@ public:
 职责：
 
 - 面向本机 RTSP server 的 adapter。
-- 当前只支持 H264 video。
-- 将 `MediaPacket` 拆成 H264 NAL units。
-- 支持 Annex-B 和 AVCC 两类 H264 packet。
+- 支持 H264 video 与 AAC/G711 audio。
+- 按 `MediaPacket.stream_index` / media type / codec 映射到 `MediaTrackConfig.track_id`。
+- H264 会拆成 NAL units，支持 Annex-B 和 AVCC 两类 H264 packet。
+- AAC/G711 直接保留 encoded payload，由 `RtspServerProtocol` 做 RTP audio payload 封装。
 - 从 `extra_data` 识别 AVCC NAL length size。
-- 将项目内部时间戳换算成 RTP 90000 Hz timestamp。
+- 按每个 track 的 RTP clock rate 换算 timestamp；音频使用 sample rate。
 - 将结果写入 `RtspServerProtocol`。
 
 关键转换：
 
 ```text
 MediaPacket
-  -> H264Bitstream::SplitPacket()
-  -> EncodedAccessUnit{nals, rtp timestamp, keyframe}
+  -> H264Bitstream::SplitPacket() 或 audio encoded payload
+  -> EncodedAccessUnit{track_id, nals/audio payload, rtp timestamp, keyframe}
   -> RtspServerProtocol::Write()
 ```
 
-注意：`EncodedAccessUnit.pts` 在 RTSP server 路径中已经被 adapter 转换成 RTP timestamp，`time_base` 会被设置为 `1/90000`。
+注意：`EncodedAccessUnit.pts` 在 RTSP server 路径中已经被 adapter 转换成对应 track 的 RTP timestamp，`time_base` 会被设置为 `1/rtp_clock_rate`。
 
 ## Protocol 层
 
@@ -309,10 +310,12 @@ Stop()
 
 ```text
 RtspServerProtocol::Write(access_unit)
-  -> H264RtpPacketizer::Packetize(access_unit)
+  -> H264: H264RtpPacketizer::Packetize(access_unit)
+  -> AAC: RFC 3640 MPEG4-GENERIC AU header + raw AAC access unit
+  -> G711A/G711U: RTP payload 直载
   -> snapshot current sessions
   -> TCP interleaved / UDP unicast: 逐个 PLAYING client session 发送
-  -> UDP multicast: 只通过 protocol 级共享 sender 发送一份 RTP
+  -> UDP multicast: 当前只对 H264 video 通过 protocol 级共享 sender 发送一份 RTP
   -> 首个 RTP 包后发送 RTCP sender report，后续每 5 秒补发
   -> TCP interleaved / UDP unicast: 按 session 接收并解析客户端 RTCP receiver report
   -> UDP multicast: protocol 级接收组播 RTCP receiver report，并按 reporter SSRC 聚合
@@ -471,14 +474,16 @@ publisher->Publish(packet);
 
 RTSP server 当前限制：
 
-- 仅支持 H264 video。
-- 仅支持单视频 track。
+- 支持 H264 video、AAC audio、G711A/G711U audio。
+- 支持多 track SDP 和多 track SETUP；每个 RTSP session 按 track 维护独立 SSRC、sequence、RTCP SR/RR 状态。
 - 支持 RTSP over TCP interleaved、UDP unicast 和标准共享 UDP multicast。
+- UDP multicast 当前只支持 H264 video；音频 multicast 需要后续扩展独立端口组。
 - UDP multicast 使用 protocol 级共享 socket、SSRC 和 sequence；多个客户端订阅同一个组播流，不会按客户端数量重复发送。
 - 已发送 RTCP sender report，并解析 TCP interleaved、UDP unicast、UDP multicast 客户端回传的 RTCP receiver report。
 - RTCP SDES、BYE、APP 当前只识别并忽略。
 - RTSP request parser 是最小可用实现，不是完整 RFC 解析器。
-- SDP 中 SPS/PPS 可从 `extra_data` 或写入包中更新，但客户端通常在 `DESCRIBE` 阶段就需要完整参数，因此生产路径建议在 `MediaTrackConfig.extra_data` 中提供 SPS/PPS。
+- SDP 中 H264 SPS/PPS 可从 `extra_data` 或写入包中更新，但客户端通常在 `DESCRIBE` 阶段就需要完整参数，因此生产路径建议在 `MediaTrackConfig.extra_data` 中提供 SPS/PPS。
+- SDP 中 AAC `config` 优先来自 `MediaTrackConfig.extra_data`；为空时会按 AAC-LC、sample rate、channels 生成 AudioSpecificConfig。
 
 FFmpeg muxer 当前限制：
 
@@ -499,6 +504,8 @@ FFmpeg muxer 当前限制：
   - 启动本机 RTSP publisher。
   - 执行 `DESCRIBE -> SETUP -> PLAY`。
   - 发布一帧 H264 packet。
+  - 验证 H264 + AAC 双 track SDP、双 SETUP、TCP interleaved RTP/RTCP。
+  - 验证只 SETUP AAC audio track 时，UDP unicast 能收到 RFC 3640 AAC RTP payload 和 RTCP sender report。
   - 验证客户端收到 RTP over TCP interleaved frame。
   - 验证 UDP unicast SETUP 返回 `server_port`，并且客户端 UDP socket 能收到 RTP packet。
   - 验证 TCP interleaved、UDP unicast 和 UDP multicast 都能收到 RTCP sender report。
@@ -557,3 +564,7 @@ H264/RTP 工具：
 - `test/test_publisher_protocol.cpp`
 - `test/test_rtsp_server_publisher.cpp`
 - `test/test_rtsp_decode_encode_push_zlm.cpp`
+
+## 关联文档
+
+- [RTSP / ZLMediaKit Pipeline 排障记录](rtsp-zlm-pipeline-troubleshooting.md)

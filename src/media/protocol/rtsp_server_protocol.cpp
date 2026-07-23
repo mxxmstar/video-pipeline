@@ -35,6 +35,7 @@ constexpr std::uint8_t kRtcpByePacketType = 203;
 constexpr std::uint8_t kRtcpAppPacketType = 204;
 constexpr std::chrono::seconds kRtcpSenderReportInterval{5};
 constexpr std::uint64_t kUnixToNtpSeconds = 2208988800ULL;
+constexpr std::size_t kAacAuHeaderSize = 4;
 
 struct RtcpReportBlock {
     std::uint32_t source_ssrc{0};
@@ -309,6 +310,201 @@ std::size_t FindHeaderEnd(const std::vector<std::uint8_t>& buffer) {
     return std::string::npos;
 }
 
+bool ParseTrackIdFromUrl(const std::string& url, int& track_id) {
+    const auto marker = url.rfind("track");
+    if (marker == std::string::npos) {
+        return false;
+    }
+
+    const auto digits_begin = marker + std::string{"track"}.size();
+    if (digits_begin >= url.size() ||
+        !std::isdigit(static_cast<unsigned char>(url[digits_begin]))) {
+        return false;
+    }
+
+    int value = 0;
+    for (std::size_t i = digits_begin; i < url.size(); ++i) {
+        const auto ch = static_cast<unsigned char>(url[i]);
+        if (!std::isdigit(ch)) {
+            break;
+        }
+        value = value * 10 + static_cast<int>(ch - '0');
+    }
+    track_id = value;
+    return true;
+}
+
+const MediaTrackConfig* FindTrackById(const std::vector<MediaTrackConfig>& tracks,
+                                      int track_id) {
+    auto it = std::find_if(tracks.begin(), tracks.end(), [track_id](const auto& track) {
+        return track.track_id == track_id;
+    });
+    return it == tracks.end() ? nullptr : &*it;
+}
+
+bool IsRtspServerSupportedTrack(const MediaTrackConfig& track) {
+    if (track.media_type == MediaType::VIDEO) {
+        return track.codec_type == CodecType::H264;
+    }
+    if (track.media_type == MediaType::AUDIO) {
+        return track.codec_type == CodecType::AAC ||
+               track.codec_type == CodecType::G711A ||
+               track.codec_type == CodecType::G711U;
+    }
+    return false;
+}
+
+void NormalizeRtspTrackDefaults(std::vector<MediaTrackConfig>& tracks) {
+    std::array<bool, 128> used_payload_types{};
+    std::uint8_t next_dynamic_payload_type = 96;
+
+    const auto allocate_dynamic_payload_type = [&]() {
+        while (next_dynamic_payload_type < 128 &&
+               used_payload_types[next_dynamic_payload_type]) {
+            ++next_dynamic_payload_type;
+        }
+        return next_dynamic_payload_type < 128 ? next_dynamic_payload_type++ : 96;
+    };
+
+    for (auto& track : tracks) {
+        if (track.media_type == MediaType::AUDIO) {
+            // 音频 RTP timestamp 使用采样率时钟；旧配置默认 90000 是视频时钟，不能直接沿用。
+            track.rtp_clock_rate = track.sample_rate > 0
+                ? static_cast<std::uint32_t>(track.sample_rate)
+                : track.rtp_clock_rate;
+        } else if (track.rtp_clock_rate == 0) {
+            track.rtp_clock_rate = 90000;
+        }
+
+        auto desired_payload_type = track.rtp_payload_type;
+        if (track.media_type == MediaType::AUDIO &&
+            track.codec_type == CodecType::G711A &&
+            desired_payload_type == 96 &&
+            track.sample_rate == 8000) {
+            // RFC 3551 的静态 PT 8 只表示 8kHz PCMA；16kHz 等宽带语音必须使用动态 PT。
+            desired_payload_type = 8;
+        } else if (track.media_type == MediaType::AUDIO &&
+                   track.codec_type == CodecType::G711U &&
+                   desired_payload_type == 96 &&
+                   track.sample_rate == 8000) {
+            // RFC 3551 的静态 PT 0 只表示 8kHz PCMU；其它采样率走动态 payload type。
+            desired_payload_type = 0;
+        }
+
+        if (desired_payload_type >= used_payload_types.size() ||
+            used_payload_types[desired_payload_type]) {
+            desired_payload_type = allocate_dynamic_payload_type();
+        }
+        track.rtp_payload_type = desired_payload_type;
+        if (track.rtp_payload_type < used_payload_types.size()) {
+            used_payload_types[track.rtp_payload_type] = true;
+        }
+    }
+}
+
+int AacSamplingFrequencyIndex(int sample_rate) {
+    constexpr std::array<int, 13> kRates{
+        96000, 88200, 64000, 48000, 44100, 32000, 24000,
+        22050, 16000, 12000, 11025, 8000, 7350,
+    };
+    for (std::size_t i = 0; i < kRates.size(); ++i) {
+        if (kRates[i] == sample_rate) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+std::string HexLower(const std::vector<std::uint8_t>& bytes) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::nouppercase;
+    for (const auto byte : bytes) {
+        oss << std::setw(2) << static_cast<int>(byte);
+    }
+    return oss.str();
+}
+
+std::string AacAudioSpecificConfigHex(const MediaTrackConfig& track) {
+    if (!track.extra_data.empty()) {
+        return HexLower(track.extra_data);
+    }
+
+    const auto sampling_index = AacSamplingFrequencyIndex(track.sample_rate);
+    if (sampling_index < 0 || track.channels <= 0 || track.channels > 7) {
+        return {};
+    }
+
+    // AAC-LC AudioSpecificConfig: audioObjectType=2, samplingFrequencyIndex, channelConfiguration。
+    const auto config = static_cast<std::uint16_t>(
+        (2U << 11U) |
+        (static_cast<std::uint16_t>(sampling_index) << 7U) |
+        (static_cast<std::uint16_t>(track.channels) << 3U));
+    std::vector<std::uint8_t> bytes{
+        static_cast<std::uint8_t>((config >> 8) & 0xFF),
+        static_cast<std::uint8_t>(config & 0xFF),
+    };
+    return HexLower(bytes);
+}
+
+std::size_t AdtsHeaderSize(const std::uint8_t* data, std::size_t size) {
+    if (size < 7 || data[0] != 0xFF || (data[1] & 0xF0) != 0xF0) {
+        return 0;
+    }
+
+    const bool protection_absent = (data[1] & 0x01) != 0;
+    const auto header_size = protection_absent ? std::size_t{7} : std::size_t{9};
+    return size >= header_size ? header_size : 0;
+}
+
+std::vector<RtpPayload> PacketizeAacAccessUnit(
+    const EncodedAccessUnit& access_unit) {
+    if (!access_unit.encoded_data || !access_unit.encoded_data->Data() ||
+        access_unit.encoded_data->Size() == 0) {
+        return {};
+    }
+
+    const auto* data = access_unit.encoded_data->Data();
+    auto size = access_unit.encoded_data->Size();
+    // RTSP/RTP 发送的是 AAC access unit；如果上游给的是 ADTS 帧，需要先剥掉 ADTS 头。
+    const auto adts_header_size = AdtsHeaderSize(data, size);
+    if (adts_header_size > 0) {
+        data += adts_header_size;
+        size -= adts_header_size;
+    }
+    if (size == 0) {
+        return {};
+    }
+
+    RtpPayload payload;
+    payload.timestamp = static_cast<std::uint32_t>(access_unit.pts);
+    payload.marker = true;
+    payload.payload.resize(kAacAuHeaderSize + size);
+
+    // RFC 3640 AAC-hbr：AU-headers-length=16bit，单个 AU-header 使用 13bit size + 3bit index。
+    WriteU16(payload.payload.data(), 16);
+    const auto au_header = static_cast<std::uint16_t>(
+        (static_cast<std::uint16_t>(size) & 0x1FFFU) << 3U);
+    WriteU16(payload.payload.data() + 2, au_header);
+    std::copy(data, data + size, payload.payload.begin() + kAacAuHeaderSize);
+    return {std::move(payload)};
+}
+
+std::vector<RtpPayload> PacketizeRawAudioAccessUnit(
+    const EncodedAccessUnit& access_unit) {
+    if (!access_unit.encoded_data || !access_unit.encoded_data->Data() ||
+        access_unit.encoded_data->Size() == 0) {
+        return {};
+    }
+
+    RtpPayload payload;
+    payload.timestamp = static_cast<std::uint32_t>(access_unit.pts);
+    payload.marker = true;
+    const auto* data = access_unit.encoded_data->Data();
+    const auto size = access_unit.encoded_data->Size();
+    payload.payload.assign(data, data + size);
+    return {std::move(payload)};
+}
+
 } // namespace
 
 /// @brief RTSP 会话
@@ -322,9 +518,7 @@ public:
         : socket_(std::move(socket)),
           owner_(owner),
           id_(id),
-          session_id_(MakeSessionId(id)),
-          ssrc_(RandomU32()),
-          sequence_(RandomU16()) {
+          session_id_(MakeSessionId(id)) {
     }
 
     void Start() {
@@ -336,7 +530,7 @@ public:
         ready_ = false;
 
         boost::system::error_code ignored;
-        CloseUdpSockets();
+        CloseAllUdpSockets();
         socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
         socket_.close(ignored);
     }
@@ -346,33 +540,81 @@ public:
     }
 
     bool IsMulticastTransport() const {
-        return transport_spec_.mode == RtspTransportMode::UdpMulticast;
+        return std::any_of(track_states_.begin(),
+                           track_states_.end(),
+                           [](const auto& item) {
+                               return item.second.ready &&
+                                      item.second.transport_spec.mode ==
+                                          RtspTransportMode::UdpMulticast;
+                           });
     }
 
     bool IsPlayingMulticast() const {
         return playing_.load() && IsMulticastTransport();
     }
 
+    bool IsPlayingMulticastTrack(int track_id) const {
+        const auto* state = FindTrackState(track_id);
+        return playing_.load() &&
+               state &&
+               state->ready &&
+               state->transport_spec.mode == RtspTransportMode::UdpMulticast;
+    }
+
     std::uint64_t Id() const {
         return id_;
     }
 
-    void SendRtpPayload(const RtpPayload& payload, std::uint8_t payload_type) {
+    void SendRtpPayload(int track_id,
+                        const RtpPayload& payload,
+                        std::uint8_t payload_type) {
         if (!playing_.load() || payload.payload.empty()) {
             return;
         }
 
-        if (transport_spec_.IsTcpInterleaved()) {
-            SendTcpInterleavedRtpPayload(payload, payload_type);
+        auto* state = FindTrackState(track_id);
+        if (!state || !state->ready) {
             return;
         }
 
-        if (transport_spec_.mode == RtspTransportMode::UdpUnicast) {
-            SendUdpRtpPayload(payload, payload_type);
+        if (state->transport_spec.IsTcpInterleaved()) {
+            SendTcpInterleavedRtpPayload(*state, payload, payload_type);
+            return;
+        }
+
+        if (state->transport_spec.mode == RtspTransportMode::UdpUnicast) {
+            SendUdpRtpPayload(*state, payload, payload_type);
         }
     }
 
 private:
+    // 每个 SDP track 都有独立的 RTP/RTCP 状态。音频和视频不能共用 SSRC、
+    // sequence 或 timestamp，否则播放器会把不同媒体流混到同一条 RTP 时间线里。
+    struct TrackSessionState {
+        int track_id{0};
+        const MediaTrackConfig* track{nullptr};
+        RtspTransportSpec transport_spec;
+        std::unique_ptr<boost::asio::ip::udp::socket> udp_rtp_socket;
+        std::unique_ptr<boost::asio::ip::udp::socket> udp_rtcp_socket;
+        boost::asio::ip::udp::endpoint udp_rtp_endpoint;
+        boost::asio::ip::udp::endpoint udp_rtcp_endpoint;
+        boost::asio::ip::udp::endpoint udp_rtcp_sender_endpoint;
+        std::array<std::uint8_t, 2048> udp_rtcp_read_buffer{};
+        std::uint32_t ssrc{0};
+        std::uint16_t sequence{0};
+        std::uint32_t last_rtp_timestamp{0};
+        std::uint32_t rtcp_packet_count{0};
+        std::uint32_t rtcp_octet_count{0};
+        std::chrono::steady_clock::time_point next_rtcp_sr_time{};
+        RtcpReportBlock last_receiver_report{};
+        std::uint32_t last_receiver_reporter_ssrc{0};
+        std::uint64_t receiver_reports_received{0};
+        int rtp_channel{0};
+        int rtcp_channel{1};
+        bool has_receiver_report{false};
+        bool ready{false};
+    };
+
     void DoRead() {
         auto self = shared_from_this();
         socket_.async_read_some(
@@ -403,9 +645,10 @@ private:
                     return;
                 }
 
-                if (ready_ && channel == static_cast<std::uint8_t>(rtcp_channel_) &&
-                    length > 0) {
-                    HandleRtcpPacket(read_buffer_.data() + kTcpInterleavedHeaderSize,
+                auto* state = FindTrackStateByRtcpChannel(channel);
+                if (state && length > 0) {
+                    HandleRtcpPacket(*state,
+                                     read_buffer_.data() + kTcpInterleavedHeaderSize,
                                      length,
                                      "tcp-interleaved");
                 }
@@ -475,6 +718,13 @@ private:
 
         if (upper_method == "SETUP") {
             requested_url_ = url;
+            const auto* track = FindTrackForSetupUrl(url);
+            if (!track) {
+                LOG_WARN("RTSP SETUP rejected unknown track url '{}'", url);
+                SendRtsp(BuildResponse(404, "Not Found", cseq));
+                return;
+            }
+
             const auto transport = HeaderValue(headers, "Transport");
             std::string transport_error;
             RtspTransportSpec transport_spec;
@@ -504,22 +754,38 @@ private:
             }
 
             if (transport_spec.mode == RtspTransportMode::UdpUnicast) {
-                if (!ConfigureUdpTransport(transport_spec)) {
+                auto& state = PrepareTrackState(*track);
+                if (!ConfigureUdpTransport(state, transport_spec)) {
                     SendRtsp(BuildResponse(461, "Unsupported Transport", cseq));
                     return;
                 }
+                FinishTrackSetup(state, transport_spec);
+            } else if (transport_spec.mode == RtspTransportMode::UdpMulticast) {
+                if (!owner_.config_.rtsp.enable_multicast) {
+                    LOG_WARN("RTSP SETUP multicast rejected because multicast is disabled");
+                    SendRtsp(BuildResponse(461, "Unsupported Transport", cseq));
+                    return;
+                }
+                if (track->media_type != MediaType::VIDEO ||
+                    track->codec_type != CodecType::H264) {
+                    // 当前共享 multicast sender 仍按单视频流建模，音频 multicast 后续再扩展独立端口组。
+                    LOG_WARN("RTSP SETUP multicast rejected for non-H264 video track {}",
+                             track->track_id);
+                    SendRtsp(BuildResponse(461, "Unsupported Transport", cseq));
+                    return;
+                }
+                auto& state = PrepareTrackState(*track);
+                if (!owner_.ConfigureSharedMulticastTransport(transport_spec,
+                                                              LocalAddress())) {
+                    SendRtsp(BuildResponse(461, "Unsupported Transport", cseq));
+                    return;
+                }
+                FinishTrackSetup(state, transport_spec);
+            } else {
+                auto& state = PrepareTrackState(*track);
+                FinishTrackSetup(state, transport_spec);
             }
 
-            if (transport_spec.mode == RtspTransportMode::UdpMulticast &&
-                !owner_.ConfigureSharedMulticastTransport(transport_spec, LocalAddress())) {
-                SendRtsp(BuildResponse(461, "Unsupported Transport", cseq));
-                return;
-            }
-
-            transport_spec_ = transport_spec;
-            rtp_channel_ = static_cast<int>(transport_spec_.rtp_channel);
-            rtcp_channel_ = static_cast<int>(transport_spec_.rtcp_channel);
-            ready_ = true;
             playing_ = false;
 
             SendRtsp(BuildResponse(
@@ -527,34 +793,25 @@ private:
                 "OK",
                 cseq,
                 {{"Session", session_id_},
-                 {"Transport", transport_spec_.ToSetupResponseHeader()}}
+                 {"Transport", transport_spec.ToSetupResponseHeader()}}
             ));
             return;
         }
 
         if (upper_method == "PLAY") {
-            if (!ready_) {
+            if (!HasReadyTrack()) {
                 SendRtsp(BuildResponse(455, "Method Not Valid In This State", cseq));
                 return;
             }
 
             playing_ = true;
             const auto play_url = url.empty() ? requested_url_ : url;
-            const auto rtp_sequence = IsMulticastTransport()
-                ? owner_.GetMulticastSequence()
-                : sequence_;
-            const auto rtp_timestamp = IsMulticastTransport()
-                ? owner_.GetMulticastLastRtpTimestamp()
-                : last_rtp_timestamp_;
             SendRtsp(BuildResponse(
                 200,
                 "OK",
                 cseq,
                 {{"Session", session_id_},
-                 {"RTP-Info",
-                  "url=" + play_url + "/track0;seq=" +
-                      std::to_string(rtp_sequence) + ";rtptime=" +
-                      std::to_string(rtp_timestamp)}}));
+                 {"RTP-Info", BuildRtpInfo(play_url)}}));
             return;
         }
 
@@ -595,81 +852,182 @@ private:
         return frame;
     }
 
+    TrackSessionState* FindTrackState(int track_id) {
+        auto it = track_states_.find(track_id);
+        return it == track_states_.end() ? nullptr : &it->second;
+    }
+
+    const TrackSessionState* FindTrackState(int track_id) const {
+        auto it = track_states_.find(track_id);
+        return it == track_states_.end() ? nullptr : &it->second;
+    }
+
+    TrackSessionState* FindTrackStateByRtcpChannel(std::uint8_t channel) {
+        auto it = std::find_if(track_states_.begin(),
+                               track_states_.end(),
+                               [channel](auto& item) {
+                                   return item.second.ready &&
+                                          item.second.transport_spec.IsTcpInterleaved() &&
+                                          item.second.rtcp_channel ==
+                                              static_cast<int>(channel);
+                               });
+        return it == track_states_.end() ? nullptr : &it->second;
+    }
+
+    const MediaTrackConfig* FindTrackForSetupUrl(const std::string& url) const {
+        int track_id = 0;
+        if (ParseTrackIdFromUrl(url, track_id)) {
+            return FindTrackById(owner_.tracks_, track_id);
+        }
+        return owner_.tracks_.size() == 1 ? &owner_.tracks_.front() : nullptr;
+    }
+
+    TrackSessionState& PrepareTrackState(const MediaTrackConfig& track) {
+        auto& state = track_states_[track.track_id];
+        CloseUdpSockets(state);
+        state = {};
+        state.track_id = track.track_id;
+        state.track = &track;
+        state.ssrc = RandomU32();
+        state.sequence = RandomU16();
+        return state;
+    }
+
+    void FinishTrackSetup(TrackSessionState& state,
+                          const RtspTransportSpec& transport_spec) {
+        state.transport_spec = transport_spec;
+        state.rtp_channel = static_cast<int>(transport_spec.rtp_channel);
+        state.rtcp_channel = static_cast<int>(transport_spec.rtcp_channel);
+        state.ready = true;
+        ready_ = true;
+    }
+
+    bool HasReadyTrack() const {
+        return std::any_of(track_states_.begin(),
+                           track_states_.end(),
+                           [](const auto& item) {
+                               return item.second.ready;
+                           });
+    }
+
+    std::string BuildTrackUrl(const std::string& play_url, int track_id) const {
+        if (play_url.find("track" + std::to_string(track_id)) != std::string::npos) {
+            return play_url;
+        }
+        return play_url + (play_url.empty() || play_url.back() == '/' ? "" : "/") +
+               "track" + std::to_string(track_id);
+    }
+
+    std::string BuildRtpInfo(const std::string& play_url) const {
+        std::ostringstream oss;
+        bool first = true;
+        for (const auto& [track_id, state] : track_states_) {
+            if (!state.ready) {
+                continue;
+            }
+
+            const auto rtp_sequence =
+                state.transport_spec.mode == RtspTransportMode::UdpMulticast
+                    ? owner_.GetMulticastSequence()
+                    : state.sequence;
+            const auto rtp_timestamp =
+                state.transport_spec.mode == RtspTransportMode::UdpMulticast
+                    ? owner_.GetMulticastLastRtpTimestamp()
+                    : state.last_rtp_timestamp;
+            if (!first) {
+                oss << ",";
+            }
+            first = false;
+            oss << "url=" << BuildTrackUrl(play_url, track_id)
+                << ";seq=" << rtp_sequence
+                << ";rtptime=" << rtp_timestamp;
+        }
+        return oss.str();
+    }
+
     std::vector<std::uint8_t> BuildInterleavedRtpFrame(
+        TrackSessionState& state,
         const RtpPayload& payload,
         std::uint8_t payload_type) {
-        return BuildInterleavedFrame(BuildRtpPacket(payload, payload_type),
-                                     rtp_channel_);
+        return BuildInterleavedFrame(BuildRtpPacket(state, payload, payload_type),
+                                     state.rtp_channel);
     }
 
     std::vector<std::uint8_t> BuildRtpPacket(
+        TrackSessionState& state,
         const RtpPayload& payload,
         std::uint8_t payload_type) {
         auto packet = MakeRtpPacket(payload,
                                     payload_type,
-                                    ssrc_,
-                                    sequence_,
-                                    last_rtp_timestamp_);
-        RecordRtcpSenderStats(payload);
+                                    state.ssrc,
+                                    state.sequence,
+                                    state.last_rtp_timestamp);
+        RecordRtcpSenderStats(state, payload);
         return packet;
     }
 
-    void RecordRtcpSenderStats(const RtpPayload& payload) {
+    void RecordRtcpSenderStats(TrackSessionState& state,
+                               const RtpPayload& payload) {
         // RTCP SR 的 sender octet count 只统计 RTP payload 字节数，不包含 RTP header。
-        ++rtcp_packet_count_;
-        rtcp_octet_count_ += static_cast<std::uint32_t>(payload.payload.size());
+        ++state.rtcp_packet_count;
+        state.rtcp_octet_count += static_cast<std::uint32_t>(payload.payload.size());
     }
 
-    void SendTcpInterleavedRtpPayload(const RtpPayload& payload,
+    void SendTcpInterleavedRtpPayload(TrackSessionState& state,
+                                      const RtpPayload& payload,
                                       std::uint8_t payload_type) {
         auto self = shared_from_this();
-        auto frame = BuildInterleavedRtpFrame(payload, payload_type);
+        auto frame = BuildInterleavedRtpFrame(state, payload, payload_type);
         boost::asio::post(socket_.get_executor(),
                           [self, frame = std::move(frame)]() mutable {
                               self->EnqueueWrite(std::move(frame));
                           });
-        MaybeSendRtcpSenderReport();
+        MaybeSendRtcpSenderReport(state);
     }
 
-    void SendUdpRtpPayload(const RtpPayload& payload,
+    void SendUdpRtpPayload(TrackSessionState& state,
+                           const RtpPayload& payload,
                            std::uint8_t payload_type) {
         auto self = shared_from_this();
+        const auto track_id = state.track_id;
         // UDP unicast 发送裸 RTP 包，不能带 RTSP over TCP 的 '$' 头。
         auto packet = std::make_shared<std::vector<std::uint8_t>>(
-            BuildRtpPacket(payload, payload_type));
+            BuildRtpPacket(state, payload, payload_type));
 
         boost::asio::post(
             socket_.get_executor(),
-            [self, packet]() {
-                if (!self->udp_rtp_socket_ || !self->udp_rtp_socket_->is_open()) {
+            [self, track_id, packet]() {
+                auto* state = self->FindTrackState(track_id);
+                if (!state || !state->udp_rtp_socket ||
+                    !state->udp_rtp_socket->is_open()) {
                     return;
                 }
 
-                self->udp_rtp_socket_->async_send_to(
+                state->udp_rtp_socket->async_send_to(
                     boost::asio::buffer(*packet),
-                    self->udp_rtp_endpoint_,
+                    state->udp_rtp_endpoint,
                     [self, packet](boost::system::error_code ec, std::size_t) {
                         if (ec && !self->closed_) {
                             LOG_WARN("RTSP UDP RTP send failed: {}", ec.message());
                         }
                     });
             });
-        MaybeSendRtcpSenderReport();
+        MaybeSendRtcpSenderReport(state);
     }
 
-    void MaybeSendRtcpSenderReport() {
-        if (rtcp_packet_count_ == 0 ||
-            !ShouldSendRtcpSenderReport(next_rtcp_sr_time_)) {
+    void MaybeSendRtcpSenderReport(TrackSessionState& state) {
+        if (state.rtcp_packet_count == 0 ||
+            !ShouldSendRtcpSenderReport(state.next_rtcp_sr_time)) {
             return;
         }
 
-        auto report = BuildRtcpSenderReport(ssrc_,
-                                            last_rtp_timestamp_,
-                                            rtcp_packet_count_,
-                                            rtcp_octet_count_);
-        if (transport_spec_.IsTcpInterleaved()) {
+        auto report = BuildRtcpSenderReport(state.ssrc,
+                                            state.last_rtp_timestamp,
+                                            state.rtcp_packet_count,
+                                            state.rtcp_octet_count);
+        if (state.transport_spec.IsTcpInterleaved()) {
             auto self = shared_from_this();
-            auto frame = BuildInterleavedFrame(report, rtcp_channel_);
+            auto frame = BuildInterleavedFrame(report, state.rtcp_channel);
             boost::asio::post(socket_.get_executor(),
                               [self, frame = std::move(frame)]() mutable {
                                   self->EnqueueWrite(std::move(frame));
@@ -677,26 +1035,29 @@ private:
             return;
         }
 
-        if (transport_spec_.mode == RtspTransportMode::UdpUnicast) {
-            SendUdpRtcpSenderReport(std::move(report));
+        if (state.transport_spec.mode == RtspTransportMode::UdpUnicast) {
+            SendUdpRtcpSenderReport(state.track_id, std::move(report));
         }
     }
 
-    void SendUdpRtcpSenderReport(std::vector<std::uint8_t> report) {
+    void SendUdpRtcpSenderReport(int track_id,
+                                 std::vector<std::uint8_t> report) {
         auto self = shared_from_this();
         auto packet =
             std::make_shared<std::vector<std::uint8_t>>(std::move(report));
 
         boost::asio::post(
             socket_.get_executor(),
-            [self, packet]() {
-                if (!self->udp_rtcp_socket_ || !self->udp_rtcp_socket_->is_open()) {
+            [self, track_id, packet]() {
+                auto* state = self->FindTrackState(track_id);
+                if (!state || !state->udp_rtcp_socket ||
+                    !state->udp_rtcp_socket->is_open()) {
                     return;
                 }
 
-                self->udp_rtcp_socket_->async_send_to(
+                state->udp_rtcp_socket->async_send_to(
                     boost::asio::buffer(*packet),
-                    self->udp_rtcp_endpoint_,
+                    state->udp_rtcp_endpoint,
                     [self, packet](boost::system::error_code ec, std::size_t) {
                         if (ec && !self->closed_) {
                             LOG_WARN("RTSP UDP RTCP sender report send failed: {}",
@@ -706,7 +1067,8 @@ private:
             });
     }
 
-    void HandleRtcpPacket(const std::uint8_t* data,
+    void HandleRtcpPacket(TrackSessionState& state,
+                          const std::uint8_t* data,
                           std::size_t size,
                           const char* transport_name) {
         std::size_t offset = 0;
@@ -730,9 +1092,17 @@ private:
             }
 
             if (packet_type == kRtcpReceiverReportPacketType) {
-                ParseRtcpReceiverReport(packet, packet_size, report_count, transport_name);
+                ParseRtcpReceiverReport(state,
+                                        packet,
+                                        packet_size,
+                                        report_count,
+                                        transport_name);
             } else if (packet_type == kRtcpSenderReportPacketType) {
-                ParseRtcpSenderReport(packet, packet_size, report_count, transport_name);
+                ParseRtcpSenderReport(state,
+                                      packet,
+                                      packet_size,
+                                      report_count,
+                                      transport_name);
             } else {
                 LOG_DEBUG("RTSP RTCP {} received: session={}, transport={}, size={}",
                           RtcpPacketTypeName(packet_type),
@@ -753,7 +1123,8 @@ private:
         }
     }
 
-    void ParseRtcpReceiverReport(const std::uint8_t* packet,
+    void ParseRtcpReceiverReport(TrackSessionState& state,
+                                 const std::uint8_t* packet,
                                  std::size_t packet_size,
                                  std::uint8_t report_count,
                                  const char* transport_name) {
@@ -767,14 +1138,16 @@ private:
         }
 
         const auto reporter_ssrc = ReadU32(packet + 4);
-        ParseRtcpReportBlocks(packet + 8,
+        ParseRtcpReportBlocks(state,
+                              packet + 8,
                               report_count,
                               reporter_ssrc,
                               transport_name,
                               "RR");
     }
 
-    void ParseRtcpSenderReport(const std::uint8_t* packet,
+    void ParseRtcpSenderReport(TrackSessionState& state,
+                               const std::uint8_t* packet,
                                std::size_t packet_size,
                                std::uint8_t report_count,
                                const char* transport_name) {
@@ -788,14 +1161,16 @@ private:
         }
 
         const auto reporter_ssrc = ReadU32(packet + 4);
-        ParseRtcpReportBlocks(packet + 28,
+        ParseRtcpReportBlocks(state,
+                              packet + 28,
                               report_count,
                               reporter_ssrc,
                               transport_name,
                               "SR");
     }
 
-    void ParseRtcpReportBlocks(const std::uint8_t* blocks,
+    void ParseRtcpReportBlocks(TrackSessionState& state,
+                               const std::uint8_t* blocks,
                                std::uint8_t report_count,
                                std::uint32_t reporter_ssrc,
                                const char* transport_name,
@@ -819,12 +1194,12 @@ private:
             }
 
             // Receiver Report 里的 source_ssrc 应该指向本 server 发送 RTP 使用的 SSRC。
-            const bool matches_sender = block.source_ssrc == ssrc_;
-            if (matches_sender || !has_receiver_report_) {
-                last_receiver_report_ = block;
-                last_receiver_reporter_ssrc_ = reporter_ssrc;
-                has_receiver_report_ = true;
-                ++receiver_reports_received_;
+            const bool matches_sender = block.source_ssrc == state.ssrc;
+            if (matches_sender || !state.has_receiver_report) {
+                state.last_receiver_report = block;
+                state.last_receiver_reporter_ssrc = reporter_ssrc;
+                state.has_receiver_report = true;
+                ++state.receiver_reports_received;
                 // session 级 RR 最终汇总到 PublisherStats，便于外部观察客户端反馈是否到达。
                 owner_.AddRtcpReceiverReportsReceived(1);
             }
@@ -847,16 +1222,21 @@ private:
         }
     }
 
-    void StartUdpRtcpReceive() {
-        if (!udp_rtcp_socket_ || !udp_rtcp_socket_->is_open()) {
+    void StartUdpRtcpReceive(TrackSessionState& state) {
+        if (!state.udp_rtcp_socket || !state.udp_rtcp_socket->is_open()) {
             return;
         }
 
         auto self = shared_from_this();
-        udp_rtcp_socket_->async_receive_from(
-            boost::asio::buffer(udp_rtcp_read_buffer_),
-            udp_rtcp_sender_endpoint_,
-            [self](boost::system::error_code ec, std::size_t bytes) {
+        const auto track_id = state.track_id;
+        state.udp_rtcp_socket->async_receive_from(
+            boost::asio::buffer(state.udp_rtcp_read_buffer),
+            state.udp_rtcp_sender_endpoint,
+            [self, track_id](boost::system::error_code ec, std::size_t bytes) {
+                auto* state = self->FindTrackState(track_id);
+                if (!state) {
+                    return;
+                }
                 if (ec) {
                     if (ec != boost::asio::error::operation_aborted &&
                         !self->closed_) {
@@ -868,30 +1248,32 @@ private:
                 }
 
                 const bool expected_sender =
-                    self->udp_rtcp_sender_endpoint_.address() ==
-                        self->udp_rtcp_endpoint_.address() &&
-                    self->udp_rtcp_sender_endpoint_.port() ==
-                        self->udp_rtcp_endpoint_.port();
+                    state->udp_rtcp_sender_endpoint.address() ==
+                        state->udp_rtcp_endpoint.address() &&
+                    state->udp_rtcp_sender_endpoint.port() ==
+                        state->udp_rtcp_endpoint.port();
                 if (expected_sender) {
-                    self->HandleRtcpPacket(self->udp_rtcp_read_buffer_.data(),
+                    self->HandleRtcpPacket(*state,
+                                           state->udp_rtcp_read_buffer.data(),
                                            bytes,
                                            "udp-unicast");
                 } else {
                     LOG_DEBUG("RTSP UDP RTCP ignored from unexpected endpoint: "
                               "session={}, endpoint={}:{}",
                               self->id_,
-                              self->udp_rtcp_sender_endpoint_.address().to_string(),
-                              self->udp_rtcp_sender_endpoint_.port());
+                              state->udp_rtcp_sender_endpoint.address().to_string(),
+                              state->udp_rtcp_sender_endpoint.port());
                 }
 
                 if (!self->closed_) {
-                    self->StartUdpRtcpReceive();
+                    self->StartUdpRtcpReceive(*state);
                 }
             });
     }
 
-    bool ConfigureUdpTransport(RtspTransportSpec& transport_spec) {
-        CloseUdpSockets();
+    bool ConfigureUdpTransport(TrackSessionState& state,
+                               RtspTransportSpec& transport_spec) {
+        CloseUdpSockets(state);
 
         boost::system::error_code ec;
         const auto remote_tcp_endpoint = socket_.remote_endpoint(ec);
@@ -929,49 +1311,49 @@ private:
             bind_address = local_tcp_endpoint.address();
         }
 
-        udp_rtp_socket_ =
+        state.udp_rtp_socket =
             std::make_unique<boost::asio::ip::udp::socket>(socket_.get_executor());
-        udp_rtcp_socket_ =
+        state.udp_rtcp_socket =
             std::make_unique<boost::asio::ip::udp::socket>(socket_.get_executor());
 
-        udp_rtp_socket_->open(protocol, ec);
+        state.udp_rtp_socket->open(protocol, ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP RTP socket open failed: {}", ec.message());
-            CloseUdpSockets();
+            CloseUdpSockets(state);
             return false;
         }
 
-        udp_rtcp_socket_->open(protocol, ec);
+        state.udp_rtcp_socket->open(protocol, ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP RTCP socket open failed: {}", ec.message());
-            CloseUdpSockets();
+            CloseUdpSockets(state);
             return false;
         }
 
-        udp_rtp_socket_->bind(boost::asio::ip::udp::endpoint(bind_address, 0), ec);
+        state.udp_rtp_socket->bind(boost::asio::ip::udp::endpoint(bind_address, 0), ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP RTP socket bind failed: {}", ec.message());
-            CloseUdpSockets();
+            CloseUdpSockets(state);
             return false;
         }
 
-        udp_rtcp_socket_->bind(boost::asio::ip::udp::endpoint(bind_address, 0), ec);
+        state.udp_rtcp_socket->bind(boost::asio::ip::udp::endpoint(bind_address, 0), ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP RTCP socket bind failed: {}", ec.message());
-            CloseUdpSockets();
+            CloseUdpSockets(state);
             return false;
         }
 
-        const auto rtp_local_endpoint = udp_rtp_socket_->local_endpoint(ec);
+        const auto rtp_local_endpoint = state.udp_rtp_socket->local_endpoint(ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP RTP local endpoint failed: {}", ec.message());
-            CloseUdpSockets();
+            CloseUdpSockets(state);
             return false;
         }
-        const auto rtcp_local_endpoint = udp_rtcp_socket_->local_endpoint(ec);
+        const auto rtcp_local_endpoint = state.udp_rtcp_socket->local_endpoint(ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP RTCP local endpoint failed: {}", ec.message());
-            CloseUdpSockets();
+            CloseUdpSockets(state);
             return false;
         }
 
@@ -980,17 +1362,17 @@ private:
         if (!rtp_local_endpoint.address().is_unspecified()) {
             transport_spec.source = rtp_local_endpoint.address().to_string();
         }
-        udp_rtp_endpoint_ =
+        state.udp_rtp_endpoint =
             boost::asio::ip::udp::endpoint(destination, transport_spec.client_rtp_port);
-        udp_rtcp_endpoint_ =
+        state.udp_rtcp_endpoint =
             boost::asio::ip::udp::endpoint(destination, transport_spec.client_rtcp_port);
 
         LOG_INFO("RTSP SETUP UDP transport: client_rtp={}:{} server_rtp={}:{}",
-                 udp_rtp_endpoint_.address().to_string(),
-                 udp_rtp_endpoint_.port(),
+                 state.udp_rtp_endpoint.address().to_string(),
+                 state.udp_rtp_endpoint.port(),
                  rtp_local_endpoint.address().to_string(),
                  rtp_local_endpoint.port());
-        StartUdpRtcpReceive();
+        StartUdpRtcpReceive(state);
         return true;
     }
 
@@ -1032,17 +1414,23 @@ private:
         return ec ? "127.0.0.1" : endpoint.address().to_string();
     }
 
-    void CloseUdpSockets() {
+    void CloseUdpSockets(TrackSessionState& state) {
         boost::system::error_code ignored;
-        if (udp_rtp_socket_) {
-            udp_rtp_socket_->cancel(ignored);
-            udp_rtp_socket_->close(ignored);
-            udp_rtp_socket_.reset();
+        if (state.udp_rtp_socket) {
+            state.udp_rtp_socket->cancel(ignored);
+            state.udp_rtp_socket->close(ignored);
+            state.udp_rtp_socket.reset();
         }
-        if (udp_rtcp_socket_) {
-            udp_rtcp_socket_->cancel(ignored);
-            udp_rtcp_socket_->close(ignored);
-            udp_rtcp_socket_.reset();
+        if (state.udp_rtcp_socket) {
+            state.udp_rtcp_socket->cancel(ignored);
+            state.udp_rtcp_socket->close(ignored);
+            state.udp_rtcp_socket.reset();
+        }
+    }
+
+    void CloseAllUdpSockets() {
+        for (auto& [_, state] : track_states_) {
+            CloseUdpSockets(state);
         }
     }
 
@@ -1055,7 +1443,7 @@ private:
         ready_ = false;
 
         boost::system::error_code ignored;
-        CloseUdpSockets();
+        CloseAllUdpSockets();
         socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
         socket_.close(ignored);
         owner_.RemoveSession(id_);
@@ -1069,25 +1457,8 @@ private:
     std::array<std::uint8_t, 8192> read_chunk_{};
     std::vector<std::uint8_t> read_buffer_;
     std::deque<std::vector<std::uint8_t>> write_queue_;
-    std::uint32_t ssrc_{0};
-    std::uint16_t sequence_{0};
-    std::uint32_t last_rtp_timestamp_{0};
-    RtspTransportSpec transport_spec_;
-    std::unique_ptr<boost::asio::ip::udp::socket> udp_rtp_socket_;
-    std::unique_ptr<boost::asio::ip::udp::socket> udp_rtcp_socket_;
-    boost::asio::ip::udp::endpoint udp_rtp_endpoint_;
-    boost::asio::ip::udp::endpoint udp_rtcp_endpoint_;
-    boost::asio::ip::udp::endpoint udp_rtcp_sender_endpoint_;
-    std::array<std::uint8_t, 2048> udp_rtcp_read_buffer_{};
-    std::uint32_t rtcp_packet_count_{0};
-    std::uint32_t rtcp_octet_count_{0};
-    std::chrono::steady_clock::time_point next_rtcp_sr_time_{};
-    RtcpReportBlock last_receiver_report_{};
-    std::uint32_t last_receiver_reporter_ssrc_{0};
-    std::uint64_t receiver_reports_received_{0};
-    bool has_receiver_report_{false};
-    int rtp_channel_{0};
-    int rtcp_channel_{1};
+    // key 对应 MediaTrackConfig::track_id，也就是 SDP/SETUP 中的 trackN。
+    std::map<int, TrackSessionState> track_states_;
     bool ready_{false};
     std::atomic_bool playing_{false};
     bool closed_{false};
@@ -1619,20 +1990,29 @@ bool RtspServerProtocol::Start(const PublisherConfig& config,
                                const std::vector<MediaTrackConfig>& tracks) {
     Stop();
 
-    if (tracks.empty() || tracks.front().codec_type != CodecType::H264 ||
+    if (tracks.empty() ||
+        !std::all_of(tracks.begin(), tracks.end(), IsRtspServerSupportedTrack) ||
         (!config.rtsp.enable_tcp_interleaved && !config.rtsp.enable_udp)) {
-        LOG_ERROR("RtspServerProtocol: supports H264 with RTSP TCP interleaved or UDP");
+        LOG_ERROR("RtspServerProtocol: supports H264 video and AAC/G711 audio with RTSP TCP interleaved or UDP");
         return false;
     }
 
     config_ = config;
     tracks_ = tracks;
+    NormalizeRtspTrackDefaults(tracks_);
+    config_.tracks = tracks_;
     stats_ = {};
     h264_packetizer_ = H264RtpPacketizer(
         config_.rtsp.max_payload_size > 0
             ? static_cast<std::size_t>(config_.rtsp.max_payload_size)
             : 1420);
-    h264_parameter_sets_ = H264Bitstream::ExtractParameterSets(tracks_.front().extra_data);
+    auto h264_track = std::find_if(tracks_.begin(), tracks_.end(), [](const auto& track) {
+        return track.media_type == MediaType::VIDEO &&
+               track.codec_type == CodecType::H264;
+    });
+    h264_parameter_sets_ = h264_track == tracks_.end()
+        ? H264ParameterSets{}
+        : H264Bitstream::ExtractParameterSets(h264_track->extra_data);
 
     boost::system::error_code ec;
     auto address = boost::asio::ip::make_address(config_.listen_host, ec);
@@ -1690,7 +2070,8 @@ bool RtspServerProtocol::Start(const PublisherConfig& config,
 }
 
 bool RtspServerProtocol::Write(const EncodedAccessUnit& access_unit) {
-    if (access_unit.codec_type != CodecType::H264 || access_unit.nals.empty()) {
+    const auto* track = FindTrackById(tracks_, access_unit.track_id);
+    if (!track || access_unit.codec_type != track->codec_type) {
         return false;
     }
 
@@ -1701,30 +2082,39 @@ bool RtspServerProtocol::Write(const EncodedAccessUnit& access_unit) {
         }
     }
 
-    UpdateH264ParameterSets(access_unit);
-
-    const auto packets = h264_packetizer_.Packetize(access_unit);
+    std::vector<RtpPayload> packets;
+    if (track->codec_type == CodecType::H264) {
+        if (access_unit.nals.empty()) {
+            return false;
+        }
+        UpdateH264ParameterSets(access_unit);
+        packets = h264_packetizer_.Packetize(access_unit);
+    } else if (track->codec_type == CodecType::AAC) {
+        packets = PacketizeAacAccessUnit(access_unit);
+    } else if (track->codec_type == CodecType::G711A ||
+               track->codec_type == CodecType::G711U) {
+        packets = PacketizeRawAudioAccessUnit(access_unit);
+    }
     if (packets.empty()) {
         return false;
     }
 
     std::vector<std::shared_ptr<ClientSession>> sessions;
     SnapshotSessions(sessions);
-    const auto payload_type = tracks_.empty() ? std::uint8_t{96}
-                                             : tracks_.front().rtp_payload_type;
+    const auto payload_type = track->rtp_payload_type;
     const auto has_multicast_receiver =
-        std::any_of(sessions.begin(), sessions.end(), [](const auto& session) {
-            return session && session->IsPlayingMulticast();
+        std::any_of(sessions.begin(), sessions.end(), [track](const auto& session) {
+            return session && session->IsPlayingMulticastTrack(track->track_id);
         });
 
     for (const auto& packet : packets) {
         for (const auto& session : sessions) {
             if (session && session->IsPlaying() &&
-                !session->IsMulticastTransport()) {
-                session->SendRtpPayload(packet, payload_type);
+                !session->IsPlayingMulticastTrack(track->track_id)) {
+                session->SendRtpPayload(track->track_id, packet, payload_type);
             }
         }
-        if (has_multicast_receiver) {
+        if (has_multicast_receiver && track->codec_type == CodecType::H264) {
             SendMulticastRtpPayload(packet, payload_type);
         }
     }
@@ -1815,13 +2205,13 @@ void RtspServerProtocol::AddRtcpReceiverReportsReceived(std::uint64_t count) {
 
 std::string RtspServerProtocol::BuildSdp(const std::string& host_for_sdp) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    const auto& track = tracks_.front();
 
     boost::system::error_code address_ec;
     const auto multicast_address =
         boost::asio::ip::make_address(config_.rtsp.multicast_address, address_ec);
     const bool use_multicast_sdp =
         config_.rtsp.enable_udp &&
+        config_.rtsp.enable_multicast &&
         !address_ec &&
         IsIpv4Multicast(multicast_address) &&
         config_.rtsp.multicast_rtp_port != 0;
@@ -1844,24 +2234,56 @@ std::string RtspServerProtocol::BuildSdp(const std::string& host_for_sdp) const 
         oss << "c=IN IP4 0.0.0.0\r\n";
     }
 
-    oss << "m=video "
-        << (use_multicast_sdp ? config_.rtsp.multicast_rtp_port : 0)
-        << " RTP/AVP " << static_cast<int>(track.rtp_payload_type) << "\r\n"
-        << "a=rtpmap:" << static_cast<int>(track.rtp_payload_type)
-        << " H264/" << track.rtp_clock_rate << "\r\n";
+    for (const auto& track : tracks_) {
+        const auto media_name =
+            track.media_type == MediaType::AUDIO ? "audio" : "video";
+        const auto media_port =
+            use_multicast_sdp && track.media_type == MediaType::VIDEO
+                ? config_.rtsp.multicast_rtp_port
+                : 0;
 
-    oss << "a=fmtp:" << static_cast<int>(track.rtp_payload_type)
-        << " packetization-mode=1;profile-level-id="
-        << ProfileLevelId(h264_parameter_sets_.sps);
+        oss << "m=" << media_name << " " << media_port
+            << " RTP/AVP " << static_cast<int>(track.rtp_payload_type) << "\r\n";
 
-    if (h264_parameter_sets_.HasBoth()) {
-        oss << ";sprop-parameter-sets="
-            << H264Bitstream::Base64Encode(h264_parameter_sets_.sps)
-            << ","
-            << H264Bitstream::Base64Encode(h264_parameter_sets_.pps);
+        if (track.codec_type == CodecType::H264) {
+            oss << "a=rtpmap:" << static_cast<int>(track.rtp_payload_type)
+                << " H264/" << track.rtp_clock_rate << "\r\n";
+            oss << "a=fmtp:" << static_cast<int>(track.rtp_payload_type)
+                << " packetization-mode=1;profile-level-id="
+                << ProfileLevelId(h264_parameter_sets_.sps);
+
+            if (h264_parameter_sets_.HasBoth()) {
+                oss << ";sprop-parameter-sets="
+                    << H264Bitstream::Base64Encode(h264_parameter_sets_.sps)
+                    << ","
+                    << H264Bitstream::Base64Encode(h264_parameter_sets_.pps);
+            }
+            oss << "\r\n";
+        } else if (track.codec_type == CodecType::AAC) {
+            // AAC 走 RFC 3640 MPEG4-GENERIC；config 是 AudioSpecificConfig 的十六进制。
+            oss << "a=rtpmap:" << static_cast<int>(track.rtp_payload_type)
+                << " MPEG4-GENERIC/" << track.rtp_clock_rate << "/"
+                << track.channels << "\r\n";
+            oss << "a=fmtp:" << static_cast<int>(track.rtp_payload_type)
+                << " streamtype=5;profile-level-id=1;mode=AAC-hbr"
+                << ";sizelength=13;indexlength=3;indexdeltalength=3";
+            const auto config_hex = AacAudioSpecificConfigHex(track);
+            if (!config_hex.empty()) {
+                oss << ";config=" << config_hex;
+            }
+            oss << "\r\n";
+        } else if (track.codec_type == CodecType::G711A) {
+            oss << "a=rtpmap:" << static_cast<int>(track.rtp_payload_type)
+                << " PCMA/" << track.rtp_clock_rate << "/"
+                << track.channels << "\r\n";
+        } else if (track.codec_type == CodecType::G711U) {
+            oss << "a=rtpmap:" << static_cast<int>(track.rtp_payload_type)
+                << " PCMU/" << track.rtp_clock_rate << "/"
+                << track.channels << "\r\n";
+        }
+
+        oss << "a=control:track" << track.track_id << "\r\n";
     }
-    oss << "\r\n";
-    oss << "a=control:track0\r\n";
     return oss.str();
 }
 

@@ -1,5 +1,12 @@
+#include "media/decoder/ffmpeg_decoder.h"
+#include "media/encoder/ffmpeg_encoder.h"
+#include "media/puller/ffmpeg_puller.h"
 #include "media/publisher/i_publisher.h"
 #include "media/simple_buffer.h"
+
+#if defined(VIDEO_PIPELINE_HAS_COMMON_PROCESS) && VIDEO_PIPELINE_HAS_COMMON_PROCESS
+#include "common/process/process.h"
+#endif
 
 #include <boost/asio/ip/multicast.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -10,19 +17,49 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifndef VIDEO_PIPELINE_SOURCE_DIR
+#define VIDEO_PIPELINE_SOURCE_DIR "."
+#endif
 
 namespace {
 
 constexpr std::uint16_t kTcpTestPort = 18554;
 constexpr std::uint16_t kUdpTestPort = 18555;
 constexpr std::uint16_t kMulticastTestPort = 18556;
+constexpr std::uint16_t kAudioVideoTestPort = 18557;
+constexpr std::uint16_t kAudioUdpTestPort = 18558;
+
+// 摄像头端到端手动测试配置全部写死在这里，不再从命令行读取参数。
+constexpr std::uint16_t kManualRtspServerPort = 7852;
+constexpr bool kRunCameraAudioVideoPipeline = true;
 constexpr const char* kMulticastAddress = "239.255.42.1";
+constexpr const char* kManualCameraSourceUrl = "rtsp://192.168.66.83/live/mainstream";
+constexpr const char* kManualRtspServerPath = "/camera/mainstream";
+constexpr const char* kManualZlmStreamPath = "/live/video_pipeline_av_test";
+constexpr int kManualConnectTimeoutMs = 5000;
+constexpr int kManualReadTimeoutMs = 5000;
+constexpr int kManualFallbackFps = 30;
+constexpr int kManualTargetBitrate = 2'000'000;
+constexpr unsigned short kZlmHttpPort = 8888;
+constexpr unsigned short kZlmRtspPort = 554;
+constexpr unsigned short kZlmRtcSignalingPort = 13000;
+constexpr unsigned short kZlmRtcSignalingSslPort = 13001;
+const std::filesystem::path kManualZlmMediaServerPath =
+    std::filesystem::path{VIDEO_PIPELINE_SOURCE_DIR} /
+    "third_apps/win32/zlmediakit/MediaServer.exe";
 
 PublisherConfig MakeConfig(std::uint16_t port,
                            bool enable_udp,
@@ -35,6 +72,7 @@ PublisherConfig MakeConfig(std::uint16_t port,
     config.stream_path = "/live/test";
     config.rtsp.enable_udp = enable_udp;
     if (multicast_rtp_port != 0) {
+        config.rtsp.enable_multicast = true;
         config.rtsp.multicast_address = kMulticastAddress;
         config.rtsp.multicast_rtp_port = multicast_rtp_port;
         config.rtsp.multicast_rtcp_port = multicast_rtp_port + 1;
@@ -53,6 +91,26 @@ PublisherConfig MakeConfig(std::uint16_t port,
         0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x06, 0xe2,
     };
     config.tracks.push_back(track);
+    return config;
+}
+
+PublisherConfig MakeAudioVideoConfig(std::uint16_t port,
+                                     bool enable_udp = false) {
+    auto config = MakeConfig(port, enable_udp);
+
+    MediaTrackConfig audio_track;
+    audio_track.track_id = 1;
+    audio_track.media_type = MediaType::AUDIO;
+    audio_track.codec_type = CodecType::AAC;
+    audio_track.sample_rate = 48000;
+    audio_track.channels = 2;
+    audio_track.time_base_num = 1;
+    audio_track.time_base_den = 1000000;
+    audio_track.rtp_payload_type = 97;
+    audio_track.rtp_clock_rate = 48000;
+    // AAC-LC, 48kHz, stereo AudioSpecificConfig。
+    audio_track.extra_data = {0x11, 0x90};
+    config.tracks.push_back(std::move(audio_track));
     return config;
 }
 
@@ -407,6 +465,643 @@ MediaPacket MakePacket() {
     return packet;
 }
 
+MediaPacket MakeAacPacket() {
+    std::vector<std::uint8_t> data{
+        0x21, 0x10, 0x04, 0x60, 0x8c, 0x1c, 0x20, 0x00,
+    };
+
+    MediaPacket packet;
+    packet.type = MediaType::AUDIO;
+    packet.codec = CodecType::AAC;
+    packet.stream_index = 1;
+    packet.pts = 40000;
+    packet.dts = 40000;
+    packet.time_base = Rational{1, 1000000};
+    packet.buffer = std::make_shared<SimpleBuffer>(std::move(data));
+    return packet;
+}
+
+int ResolveManualFps(const VideoStreamInfo& video_info) {
+    if (std::isfinite(video_info.fps) && video_info.fps >= 1.0f) {
+        return std::clamp(static_cast<int>(std::lround(video_info.fps)), 1, 60);
+    }
+    return kManualFallbackFps;
+}
+
+std::string TrimLeftText(std::string value) {
+    value.erase(value.begin(),
+                std::find_if(value.begin(), value.end(), [](unsigned char ch) {
+                    return ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n';
+                }));
+    return value;
+}
+
+bool StartsWithText(const std::string& value, const std::string& prefix) {
+    return value.size() >= prefix.size() &&
+           value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool CanConnectTcp(const std::string& host, unsigned short port) {
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::socket socket(io);
+    boost::system::error_code ec;
+    socket.connect({boost::asio::ip::make_address(host), port}, ec);
+    return !ec;
+}
+
+#if defined(VIDEO_PIPELINE_HAS_COMMON_PROCESS) && VIDEO_PIPELINE_HAS_COMMON_PROCESS
+// 给手动测试生成一份临时 ZLMediaKit 配置，避免修改 third_apps 中的原始 config.ini。
+std::filesystem::path MakeZlmRuntimeConfig(
+    const std::filesystem::path& media_server) {
+    const auto source = media_server.parent_path() / "config.ini";
+    if (!std::filesystem::exists(source)) {
+        throw std::runtime_error("ZLMediaKit config.ini not found: " + source.string());
+    }
+
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto output = std::filesystem::temp_directory_path() /
+                  ("video_pipeline_camera_zlm_" + std::to_string(stamp) + ".ini");
+
+    std::ifstream in(source, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("failed to open ZLMediaKit config: " +
+                                 source.string());
+    }
+
+    std::ofstream out(output, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("failed to create runtime config: " +
+                                 output.string());
+    }
+
+    std::string section;
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto trimmed = TrimLeftText(line);
+        if (!trimmed.empty() && trimmed.front() == '[') {
+            const auto end = trimmed.find(']');
+            section = end == std::string::npos ? std::string{} : trimmed.substr(0, end + 1);
+        }
+
+        if (section == "[rtc]" && StartsWithText(trimmed, "signalingPort=")) {
+            out << "signalingPort=" << kZlmRtcSignalingPort << "\n";
+            continue;
+        }
+        if (section == "[rtc]" && StartsWithText(trimmed, "signalingSslPort=")) {
+            out << "signalingSslPort=" << kZlmRtcSignalingSslPort << "\n";
+            continue;
+        }
+
+        out << line << "\n";
+    }
+
+    return output;
+}
+
+// 进程守卫负责启动/复用 ZLMediaKit，并在本测试拥有进程时自动清理。
+class ZlmServerGuard {
+public:
+    explicit ZlmServerGuard(std::filesystem::path media_server)
+        : process_(io_.get_executor()),
+          media_server_(std::move(media_server)) {
+    }
+
+    ~ZlmServerGuard() {
+        Stop();
+    }
+
+    bool Start() {
+        if (CanConnectTcp("127.0.0.1", kZlmHttpPort) &&
+            CanConnectTcp("127.0.0.1", kZlmRtspPort)) {
+            std::cout << "Reuse existing ZLMediaKit on HTTP " << kZlmHttpPort
+                      << " and RTSP " << kZlmRtspPort << ".\n";
+            return true;
+        }
+
+        if (!std::filesystem::exists(media_server_)) {
+            std::cerr << "MediaServer.exe not found: "
+                      << media_server_.string() << "\n";
+            return false;
+        }
+
+        try {
+            runtime_config_ = MakeZlmRuntimeConfig(media_server_);
+        } catch (const std::exception& e) {
+            std::cerr << e.what() << "\n";
+            return false;
+        }
+
+        common::process::ProcessOptions options;
+        options.executable = media_server_;
+        options.working_directory = media_server_.parent_path();
+        options.arguments = {"-c", runtime_config_.string()};
+        options.console_mode = common::process::ConsoleMode::NewConsole;
+        options.window_mode = common::process::WindowMode::Hidden;
+
+        boost::system::error_code ec;
+        if (!process_.Start(options, ec)) {
+            std::cerr << "Failed to start MediaServer: " << ec.message()
+                      << " (" << process_.LastError() << ")\n";
+            return false;
+        }
+
+        owns_process_ = true;
+        std::cout << "Started MediaServer, pid=" << process_.Pid()
+                  << ", config=" << runtime_config_.string() << "\n";
+
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            boost::system::error_code running_ec;
+            if (!process_.IsRunning(running_ec)) {
+                std::cerr << "MediaServer exited during startup, exit_code="
+                          << process_.ExitCode() << "\n";
+                return false;
+            }
+            if (CanConnectTcp("127.0.0.1", kZlmHttpPort) &&
+                CanConnectTcp("127.0.0.1", kZlmRtspPort)) {
+                std::cout << "ZLMediaKit is ready.\n";
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        }
+
+        std::cerr << "Timed out waiting for ZLMediaKit.\n";
+        return false;
+    }
+
+    void Stop() {
+        boost::system::error_code ec;
+        if (owns_process_ && process_.IsRunning(ec)) {
+            process_.RequestExit(ec);
+            for (int i = 0; i < 20; ++i) {
+                boost::system::error_code running_ec;
+                if (!process_.IsRunning(running_ec)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+
+            boost::system::error_code running_ec;
+            if (process_.IsRunning(running_ec)) {
+                process_.Terminate(ec);
+                process_.Wait(ec);
+            }
+        }
+
+        owns_process_ = false;
+        if (!runtime_config_.empty()) {
+            std::error_code ignored;
+            std::filesystem::remove(runtime_config_, ignored);
+            runtime_config_.clear();
+        }
+    }
+
+private:
+    boost::asio::io_context io_;
+    common::process::Process process_;
+    std::filesystem::path media_server_;
+    std::filesystem::path runtime_config_;
+    bool owns_process_{false};
+};
+#endif
+
+// 摄像头链路同时发布到两个目标，状态集中放在这里，便于回调和主循环共享。
+struct CameraAvPipelineState {
+    std::unique_ptr<FFmpegEncoder> video_encoder;
+    std::unique_ptr<IPublisher> zlm_publisher;
+    std::unique_ptr<IPublisher> rtsp_server_publisher;
+    std::deque<MediaPacket> pending_audio_packets;
+
+    int fps{kManualFallbackFps};
+    int64_t frame_duration_us{1'000'000 / kManualFallbackFps};
+    int64_t next_audio_pts_us{0};
+    int decoded_video_frames{0};
+    int decoded_audio_frames{0};
+    int encoded_video_packets{0};
+    int published_video_packets{0};
+    int published_audio_packets{0};
+    int read_video_packets{0};
+    int read_audio_packets{0};
+    bool initialized{false};
+    bool failed{false};
+    std::string error;
+};
+
+void NormalizeCameraVideoFrameTime(CameraAvPipelineState& state,
+                                   MediaFrame& frame) {
+    const auto frame_index =
+        static_cast<int64_t>(std::max(0, state.decoded_video_frames - 1));
+    const auto pts_us = frame_index * state.frame_duration_us;
+    frame.time.pts_us = pts_us;
+    frame.time.dts_us = pts_us;
+    frame.time.duration_us = state.frame_duration_us;
+}
+
+int64_t EstimateG711DurationUs(const MediaPacket& packet,
+                               const AudioStreamInfo& audio_info) {
+    if (packet.duration > 0) {
+        return packet.duration;
+    }
+    if (!packet.buffer || audio_info.sample_rate <= 0 || audio_info.channels <= 0) {
+        return 0;
+    }
+
+    // G711 A-law/u-law 每个采样 1 字节；这里用包大小估算缺失 duration。
+    const auto samples = static_cast<int64_t>(packet.buffer->Size()) /
+                         std::max(1, audio_info.channels);
+    return samples * 1'000'000LL / audio_info.sample_rate;
+}
+
+MediaPacket MakeCameraAudioPacket(CameraAvPipelineState& state,
+                                  const MediaPacket& source,
+                                  const AudioStreamInfo& audio_info,
+                                  CodecType codec) {
+    MediaPacket packet = source;
+    packet.type = MediaType::AUDIO;
+    packet.codec = codec;
+    packet.stream_index = 1;
+    packet.time_base = Rational{1, 1'000'000};
+    packet.duration = EstimateG711DurationUs(source, audio_info);
+    if (packet.duration <= 0) {
+        packet.duration = 20'000;
+    }
+    packet.pts = state.next_audio_pts_us;
+    packet.dts = packet.pts;
+    state.next_audio_pts_us += packet.duration;
+    return packet;
+}
+
+bool PublishCameraAudioPacket(CameraAvPipelineState& state,
+                              const MediaPacket& audio_packet) {
+    if (!state.initialized) {
+        // 视频编码器要等首个解码帧才能确定输入像素格式；这之前先缓存音频包。
+        state.pending_audio_packets.push_back(audio_packet);
+        return true;
+    }
+
+    if (!state.rtsp_server_publisher->Publish(audio_packet)) {
+        state.error = "failed to publish G711 audio packet to local RTSP server";
+        return false;
+    }
+    ++state.published_audio_packets;
+    return true;
+}
+
+bool FlushPendingCameraAudio(CameraAvPipelineState& state) {
+    while (!state.pending_audio_packets.empty()) {
+        auto packet = std::move(state.pending_audio_packets.front());
+        state.pending_audio_packets.pop_front();
+        if (!PublishCameraAudioPacket(state, packet)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PublishCameraVideoPackets(CameraAvPipelineState& state,
+                               std::vector<PacketPtr>& packets) {
+    for (auto& packet : packets) {
+        if (!packet) {
+            continue;
+        }
+
+        packet->stream_index = 0;
+        packet->time_base = Rational{1, 1'000'000};
+        if (packet->duration <= 0) {
+            packet->duration = state.frame_duration_us;
+        }
+
+        if (!state.zlm_publisher->Publish(*packet)) {
+            state.error = "failed to publish encoded H264 video packet to ZLMediaKit";
+            return false;
+        }
+        if (!state.rtsp_server_publisher->Publish(*packet)) {
+            state.error = "failed to publish encoded H264 video packet to local RTSP server";
+            return false;
+        }
+        ++state.encoded_video_packets;
+        ++state.published_video_packets;
+    }
+    return true;
+}
+
+PublisherConfig MakeCameraZlmPublisherConfig(const std::string& zlm_push_url,
+                                             const MediaTrackConfig& video_track) {
+    PublisherConfig config;
+    config.mode = PublishMode::PushClient;
+    config.protocol = PublishProtocol::FfmpegMux;
+    config.url = zlm_push_url;
+    config.ffmpeg.format_name = "rtsp";
+    config.ffmpeg.rtsp_transport = "tcp";
+    config.tracks.push_back(video_track);
+    return config;
+}
+
+PublisherConfig MakeCameraRtspServerPublisherConfig(
+    const MediaTrackConfig& video_track,
+    const MediaTrackConfig& audio_track) {
+    PublisherConfig config;
+    config.mode = PublishMode::PullServer;
+    config.protocol = PublishProtocol::RtspServer;
+    config.listen_host = "127.0.0.1";
+    config.listen_port = kManualRtspServerPort;
+    config.stream_path = kManualRtspServerPath;
+    config.rtsp.enable_udp = true;
+    config.rtsp.enable_multicast = false;
+    config.tracks.push_back(video_track);
+    config.tracks.push_back(audio_track);
+    return config;
+}
+
+bool InitializeCameraAvPublishers(CameraAvPipelineState& state,
+                                  const MediaFrame& first_frame,
+                                  const VideoStreamInfo& video_info,
+                                  const MediaStreamInfo& audio_stream_info) {
+    const auto pixel_format = first_frame.GetPixelFormat();
+    if (pixel_format == PixelFormat::kUnknown) {
+        state.error = "decoded video frame pixel format is unknown";
+        return false;
+    }
+
+    const int width = first_frame.Width() > 0 ? first_frame.Width() : video_info.width;
+    const int height = first_frame.Height() > 0 ? first_frame.Height() : video_info.height;
+    if (width <= 0 || height <= 0) {
+        state.error = "invalid decoded video size";
+        return false;
+    }
+
+    EncoderConfig encoder_config;
+    encoder_config.media_type = MediaType::VIDEO;
+    encoder_config.codec_type = CodecType::H264;
+    encoder_config.video.width = width;
+    encoder_config.video.height = height;
+    encoder_config.video.fps_num = state.fps;
+    encoder_config.video.fps_den = 1;
+    encoder_config.video.pixel_format = pixel_format;
+    encoder_config.video.gop_size = state.fps;
+    encoder_config.video.max_b_frames = 0;
+    encoder_config.bitrate = kManualTargetBitrate;
+    encoder_config.time_base_num = 1;
+    encoder_config.time_base_den = 1'000'000;
+    encoder_config.encoder_name = "libx264";
+    encoder_config.preset = "ultrafast";
+    encoder_config.tune = "zerolatency";
+    encoder_config.global_header = true;
+
+    state.video_encoder = std::make_unique<FFmpegEncoder>();
+    if (!state.video_encoder->Open(encoder_config)) {
+        state.error = "failed to open H264 encoder";
+        return false;
+    }
+
+    MediaTrackConfig video_track;
+    video_track.track_id = 0;
+    video_track.media_type = MediaType::VIDEO;
+    video_track.codec_type = CodecType::H264;
+    video_track.width = width;
+    video_track.height = height;
+    video_track.fps = static_cast<float>(state.fps);
+    video_track.time_base_num = encoder_config.time_base_num;
+    video_track.time_base_den = encoder_config.time_base_den;
+    video_track.extra_data = state.video_encoder->GetExtraData();
+    video_track.rtp_payload_type = 96;
+    video_track.rtp_clock_rate = 90000;
+
+    const auto& audio_info = audio_stream_info.get_detail<AudioStreamInfo>();
+    MediaTrackConfig audio_track;
+    audio_track.track_id = 1;
+    audio_track.media_type = MediaType::AUDIO;
+    audio_track.codec_type = audio_stream_info.codec_type;
+    audio_track.sample_rate = audio_info.sample_rate;
+    audio_track.channels = audio_info.channels;
+    audio_track.time_base_num = 1;
+    audio_track.time_base_den = 1'000'000;
+    // 16k PCMA/PCMU 不能使用 RTP 静态负载类型 8/0，这里固定使用动态负载类型。
+    audio_track.rtp_payload_type = 97;
+    audio_track.rtp_clock_rate = static_cast<std::uint32_t>(audio_info.sample_rate);
+
+    const std::string zlm_push_url =
+        "rtsp://127.0.0.1:" + std::to_string(kZlmRtspPort) + kManualZlmStreamPath;
+    auto zlm_config = MakeCameraZlmPublisherConfig(zlm_push_url, video_track);
+    auto rtsp_config = MakeCameraRtspServerPublisherConfig(video_track, audio_track);
+
+    state.zlm_publisher = IPublisher::Create(zlm_config);
+    if (!state.zlm_publisher || !state.zlm_publisher->Start(zlm_config)) {
+        state.error = "failed to start FFmpeg RTSP publisher to ZLMediaKit";
+        return false;
+    }
+
+    state.rtsp_server_publisher = IPublisher::Create(rtsp_config);
+    if (!state.rtsp_server_publisher ||
+        !state.rtsp_server_publisher->Start(rtsp_config)) {
+        state.error = "failed to start local RTSP server publisher";
+        return false;
+    }
+
+    state.initialized = true;
+    std::cout << "Manual camera pipeline initialized: video="
+              << width << "x" << height << " @" << state.fps
+              << "fps, audio=G711 "
+              << audio_info.sample_rate << "Hz/" << audio_info.channels
+              << "ch\n";
+    std::cout << "Pushing video to ZLMediaKit: " << zlm_push_url << "\n";
+    std::cout << "Local RTSP play URL: "
+              << state.rtsp_server_publisher->GetPlayUrl() << "\n";
+    return FlushPendingCameraAudio(state);
+}
+
+// 单独的手动端到端函数：
+// 1. 拉取摄像头 RTSP 音视频；
+// 2. 视频解码后重新编码 H264；
+// 3. 音频经过解码校验后继续发布原始 G711 包；
+// 4. 视频推到 ZLMediaKit，同时启动本项目 RTSP server 发布音视频供播放器直接拉流。
+void TestCameraAudioVideoDecodeEncodePublish() {
+#if defined(VIDEO_PIPELINE_HAS_COMMON_PROCESS) && VIDEO_PIPELINE_HAS_COMMON_PROCESS
+    ZlmServerGuard zlm(kManualZlmMediaServerPath);
+    if (!zlm.Start()) {
+        assert(false);
+        return;
+    }
+#else
+    std::cerr << "test_rtsp_server_publisher requires common process support "
+              << "for TestCameraAudioVideoDecodeEncodePublish.\n";
+    assert(false);
+    return;
+#endif
+
+    FFmpegPuller puller;
+    puller.SetConnectTimeoutMs(kManualConnectTimeoutMs);
+    puller.SetReadTimeoutMs(kManualReadTimeoutMs);
+    puller.SetRtspTransport("tcp");
+    puller.SetRtspAutoSwitchToTcp(false);
+    puller.SetLowLatency(true);
+
+    std::cout << "Opening source: " << kManualCameraSourceUrl << "\n";
+    if (!puller.Open(kManualCameraSourceUrl)) {
+        std::cerr << "Failed to open source RTSP.\n";
+        assert(false);
+        return;
+    }
+
+    const auto multi_info = puller.GetStreamInfo();
+    if (!multi_info.HasVideoStream() || !multi_info.HasAudioStream()) {
+        std::cerr << "Source must contain both video and audio streams.\n";
+        puller.Close();
+        assert(false);
+        return;
+    }
+
+    const auto video_stream_info =
+        multi_info.stream_infos[multi_info.video_stream_idx_];
+    const auto audio_stream_info =
+        multi_info.stream_infos[multi_info.audio_stream_idx_];
+    const auto video_detail = video_stream_info.get_detail<VideoStreamInfo>();
+    const auto audio_detail = audio_stream_info.get_detail<AudioStreamInfo>();
+
+    if (video_stream_info.codec_type != CodecType::H264) {
+        std::cerr << "Expected H264 source video, got codec="
+                  << static_cast<int>(video_stream_info.codec_type) << "\n";
+        puller.Close();
+        assert(false);
+        return;
+    }
+    if (audio_stream_info.codec_type != CodecType::G711A &&
+        audio_stream_info.codec_type != CodecType::G711U) {
+        std::cerr << "Expected G711 audio source, got codec="
+                  << static_cast<int>(audio_stream_info.codec_type) << "\n";
+        puller.Close();
+        assert(false);
+        return;
+    }
+
+    std::cout << "Source video: " << video_detail.width << "x"
+              << video_detail.height << " @" << video_detail.fps << "fps\n";
+    std::cout << "Source audio: codec="
+              << static_cast<int>(audio_stream_info.codec_type)
+              << ", sample_rate=" << audio_detail.sample_rate
+              << ", channels=" << audio_detail.channels << "\n";
+
+    CameraAvPipelineState state;
+    state.fps = ResolveManualFps(video_detail);
+    state.frame_duration_us = 1'000'000 / state.fps;
+
+    FFmpegDecoder video_decoder;
+    FFmpegDecoder audio_decoder;
+    video_decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
+        if (state.failed || !frame || frame->type != MediaType::VIDEO) {
+            return;
+        }
+
+        ++state.decoded_video_frames;
+        // 按照视频帧率调整时间戳，确保视频帧时间间隔一致。
+        NormalizeCameraVideoFrameTime(state, *frame);
+
+        if (!state.initialized &&
+            !InitializeCameraAvPublishers(state,
+                                          *frame,
+                                          video_detail,
+                                          audio_stream_info)) {
+            state.failed = true;
+            return;
+        }
+
+        std::vector<PacketPtr> encoded;
+        if (!state.video_encoder->Encode(std::move(frame), encoded)) {
+            state.failed = true;
+            state.error = "failed to encode H264 video frame";
+            return;
+        }
+
+        if (!PublishCameraVideoPackets(state, encoded)) {
+            state.failed = true;
+        }
+    });
+
+    audio_decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
+        if (!state.failed && frame && frame->type == MediaType::AUDIO) {
+            ++state.decoded_audio_frames;
+        }
+    });
+
+    if (!video_decoder.Open(video_stream_info)) {
+        std::cerr << "Failed to open video decoder.\n";
+        puller.Close();
+        assert(false);
+        return;
+    }
+    if (!audio_decoder.Open(audio_stream_info)) {
+        std::cerr << "Failed to open audio decoder.\n";
+        video_decoder.Close();
+        puller.Close();
+        assert(false);
+        return;
+    }
+
+    while (!state.failed) {
+        std::shared_ptr<MediaPacket> packet;
+        if (!puller.ReadPacket(packet)) {
+            state.failed = true;
+            state.error = "source ReadPacket failed";
+            break;
+        }
+        if (!packet) {
+            continue;
+        }
+
+        if (packet->type == MediaType::VIDEO) {
+            ++state.read_video_packets;
+            if (!video_decoder.Decode(packet)) {
+                state.failed = true;
+                state.error = "video Decode failed";
+                break;
+            }
+        } else if (packet->type == MediaType::AUDIO) {
+            ++state.read_audio_packets;
+            if (!audio_decoder.Decode(packet)) {
+                state.failed = true;
+                state.error = "audio Decode failed";
+                break;
+            }
+            const auto audio_packet =
+                MakeCameraAudioPacket(state, *packet, audio_detail, audio_stream_info.codec_type);
+            if (!PublishCameraAudioPacket(state, audio_packet)) {
+                state.failed = true;
+                break;
+            }
+        }
+
+        const auto published_total =
+            state.published_video_packets + state.published_audio_packets;
+        if (published_total > 0 && published_total % 200 == 0) {
+            std::cout << "camera av pipeline: read_video=" << state.read_video_packets
+                      << ", read_audio=" << state.read_audio_packets
+                      << ", decoded_video=" << state.decoded_video_frames
+                      << ", decoded_audio=" << state.decoded_audio_frames
+                      << ", published_video=" << state.published_video_packets
+                      << ", published_audio=" << state.published_audio_packets << "\n";
+        }
+    }
+
+    if (state.zlm_publisher) {
+        state.zlm_publisher->Stop();
+    }
+    if (state.rtsp_server_publisher) {
+        state.rtsp_server_publisher->Stop();
+    }
+    if (state.video_encoder) {
+        state.video_encoder->Close();
+    }
+    audio_decoder.Close();
+    video_decoder.Close();
+    puller.Close();
+
+    if (state.failed) {
+        std::cerr << "Manual camera pipeline failed: " << state.error << "\n";
+        assert(false);
+    }
+}
+
 void TestTcpInterleavedPublisher() {
     auto config = MakeConfig(kTcpTestPort, false);
     auto publisher = IPublisher::Create(config);
@@ -481,6 +1176,190 @@ void TestTcpInterleavedPublisher() {
                 "CSeq: 4\r\n"
                 "Session: 00000001\r\n\r\n");
     response = ReadUntilHeader(socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(WaitForRtcpReceiverReports(*publisher, 1));
+
+    publisher->Stop();
+}
+
+void TestTcpInterleavedAudioVideoPublisher() {
+    auto config = MakeAudioVideoConfig(kAudioVideoTestPort);
+    auto publisher = IPublisher::Create(config);
+    assert(publisher);
+    assert(publisher->Start(config));
+
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::socket socket(io);
+    socket.connect({boost::asio::ip::make_address("127.0.0.1"), kAudioVideoTestPort});
+    socket.non_blocking(true);
+
+    const std::string url =
+        "rtsp://127.0.0.1:" + std::to_string(kAudioVideoTestPort) + "/live/test";
+    SendRequest(socket,
+                "DESCRIBE " + url + " RTSP/1.0\r\n"
+                "CSeq: 1\r\n"
+                "Accept: application/sdp\r\n\r\n");
+    auto response = ReadUntilHeader(socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("m=video 0 RTP/AVP 96") != std::string::npos);
+    assert(response.find("m=audio 0 RTP/AVP 97") != std::string::npos);
+    assert(response.find("MPEG4-GENERIC/48000/2") != std::string::npos);
+    assert(response.find("config=1190") != std::string::npos);
+    assert(response.find("a=control:track1") != std::string::npos);
+
+    SendRequest(socket,
+                "SETUP " + url + "/track0 RTSP/1.0\r\n"
+                "CSeq: 2\r\n"
+                "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n");
+    response = ReadUntilHeader(socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+
+    SendRequest(socket,
+                "SETUP " + url + "/track1 RTSP/1.0\r\n"
+                "CSeq: 3\r\n"
+                "Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\n\r\n");
+    response = ReadUntilHeader(socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("interleaved=2-3") != std::string::npos);
+
+    SendRequest(socket,
+                "PLAY " + url + " RTSP/1.0\r\n"
+                "CSeq: 4\r\n"
+                "Session: 00000001\r\n\r\n");
+    response = ReadUntilHeader(socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("track0") != std::string::npos);
+    assert(response.find("track1") != std::string::npos);
+
+    assert(publisher->Publish(MakePacket()));
+    assert(publisher->Publish(MakeAacPacket()));
+
+    std::vector<std::vector<std::uint8_t>> frames;
+    assert(ReadInterleavedFrames(socket, frames, 6));
+
+    const auto video_rtp_frame = std::find_if(
+        frames.begin(),
+        frames.end(),
+        [](const auto& frame) {
+            return frame.size() >= 4 + 12 + 1 &&
+                   frame[0] == '$' &&
+                   frame[1] == 0 &&
+                   (frame[5] & 0x7F) == 96;
+        });
+    assert(video_rtp_frame != frames.end());
+
+    const auto audio_rtp_frame = std::find_if(
+        frames.begin(),
+        frames.end(),
+        [](const auto& frame) {
+            return frame.size() >= 4 + 12 + 4 + 1 &&
+                   frame[0] == '$' &&
+                   frame[1] == 2 &&
+                   (frame[5] & 0x7F) == 97 &&
+                   frame[16] == 0 &&
+                   frame[17] == 16;
+        });
+    assert(audio_rtp_frame != frames.end());
+
+    const auto audio_rtcp_frame = std::find_if(
+        frames.begin(),
+        frames.end(),
+        [](const auto& frame) {
+            return frame.size() >= 4 + 28 &&
+                   frame[0] == '$' &&
+                   frame[1] == 3 &&
+                   IsRtcpSenderReport(frame, 4);
+        });
+    assert(audio_rtcp_frame != frames.end());
+
+    publisher->Stop();
+}
+
+void TestUdpUnicastAudioTrackPublisher() {
+    auto config = MakeAudioVideoConfig(kAudioUdpTestPort, true);
+    auto publisher = IPublisher::Create(config);
+    assert(publisher);
+    assert(publisher->Start(config));
+
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::socket rtsp_socket(io);
+    rtsp_socket.connect({boost::asio::ip::make_address("127.0.0.1"),
+                         kAudioUdpTestPort});
+    rtsp_socket.non_blocking(true);
+
+    boost::asio::ip::udp::socket audio_rtp_socket(io);
+    audio_rtp_socket.open(boost::asio::ip::udp::v4());
+    audio_rtp_socket.bind({boost::asio::ip::make_address("127.0.0.1"), 0});
+    audio_rtp_socket.non_blocking(true);
+
+    boost::asio::ip::udp::socket audio_rtcp_socket(io);
+    audio_rtcp_socket.open(boost::asio::ip::udp::v4());
+    audio_rtcp_socket.bind({boost::asio::ip::make_address("127.0.0.1"), 0});
+    audio_rtcp_socket.non_blocking(true);
+
+    const auto audio_client_rtp_port = audio_rtp_socket.local_endpoint().port();
+    const auto audio_client_rtcp_port = audio_rtcp_socket.local_endpoint().port();
+    const std::string url =
+        "rtsp://127.0.0.1:" + std::to_string(kAudioUdpTestPort) + "/live/test";
+
+    SendRequest(rtsp_socket,
+                "DESCRIBE " + url + " RTSP/1.0\r\n"
+                "CSeq: 1\r\n"
+                "Accept: application/sdp\r\n\r\n");
+    auto response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("a=control:track1") != std::string::npos);
+
+    // 只 SETUP 音频 track，验证 RTSP server 的音频路径不依赖视频 track 状态。
+    SendRequest(rtsp_socket,
+                "SETUP " + url + "/track1 RTSP/1.0\r\n"
+                "CSeq: 2\r\n"
+                "Transport: RTP/AVP;unicast;client_port=" +
+                    std::to_string(audio_client_rtp_port) + "-" +
+                    std::to_string(audio_client_rtcp_port) + "\r\n\r\n");
+    response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("Transport: RTP/AVP;unicast") != std::string::npos);
+    assert(response.find("server_port=") != std::string::npos);
+    const auto server_ports = ParseServerPorts(response);
+    const auto server_rtcp_port = server_ports.second;
+
+    SendRequest(rtsp_socket,
+                "PLAY " + url + " RTSP/1.0\r\n"
+                "CSeq: 3\r\n"
+                "Session: 00000001\r\n\r\n");
+    response = ReadUntilHeader(rtsp_socket);
+    assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+    assert(response.find("track1") != std::string::npos);
+
+    assert(publisher->Publish(MakeAacPacket()));
+
+    std::vector<std::uint8_t> audio_packet;
+    assert(ReadUdpPacket(audio_rtp_socket, audio_packet));
+    assert(audio_packet.size() >= 12 + 4 + 1);
+    assert(audio_packet[0] == 0x80);
+    assert((audio_packet[1] & 0x7F) == 97);
+    // AAC RTP payload 前 4 字节是 RFC 3640 AU header section。
+    assert(audio_packet[12] == 0);
+    assert(audio_packet[13] == 16);
+    const auto media_ssrc = ReadU32(audio_packet.data() + 8);
+    const auto highest_sequence = ReadU16(audio_packet.data() + 2);
+
+    std::vector<std::uint8_t> audio_rtcp_packet;
+    assert(ReadUdpPacket(audio_rtcp_socket, audio_rtcp_packet));
+    assert(IsRtcpSenderReport(audio_rtcp_packet));
+
+    const auto receiver_report =
+        MakeCompoundReceiverReport(media_ssrc, highest_sequence);
+    audio_rtcp_socket.send_to(
+        boost::asio::buffer(receiver_report),
+        {boost::asio::ip::make_address("127.0.0.1"), server_rtcp_port});
+
+    SendRequest(rtsp_socket,
+                "GET_PARAMETER " + url + " RTSP/1.0\r\n"
+                "CSeq: 4\r\n"
+                "Session: 00000001\r\n\r\n");
+    response = ReadUntilHeader(rtsp_socket);
     assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
     assert(WaitForRtcpReceiverReports(*publisher, 1));
 
@@ -671,8 +1550,15 @@ void TestUdpMulticastPublisher() {
 } // namespace
 
 int main() {
-    TestTcpInterleavedPublisher();
-    TestUdpUnicastPublisher();
-    TestUdpMulticastPublisher();
+    if constexpr (kRunCameraAudioVideoPipeline) {
+        TestCameraAudioVideoDecodeEncodePublish();
+        return 0;
+    }
+
+    // TestTcpInterleavedPublisher();
+    // TestTcpInterleavedAudioVideoPublisher();
+    // TestUdpUnicastAudioTrackPublisher();
+    // TestUdpUnicastPublisher();
+    // TestUdpMulticastPublisher();
     return 0;
 }

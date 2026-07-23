@@ -436,6 +436,7 @@ bool InitializePipeline(PipelineState& state,
     publisher_config.listen_port = state.rtsp_port;
     publisher_config.stream_path = kStreamPath;
     publisher_config.rtsp.enable_udp = true;
+    publisher_config.rtsp.enable_multicast = true;
 
     MediaTrackConfig track;
     track.track_id = 0;
