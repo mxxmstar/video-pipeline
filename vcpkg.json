@@ -17,6 +17,8 @@
     "boost-filesystem",
     "zlmediakit",    
     "libyuv",
+    "glfw3",
+    "glad",
     "grpc",
     "protobuf",
     "zeromq",    

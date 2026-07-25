@@ -8,6 +8,32 @@ else()
 endif()
 add_test(NAME test_spdlog COMMAND test_spdlog)
 
+add_executable(test_render_frame_converter
+    render/test_frame_converter.cpp
+    "${CMAKE_SOURCE_DIR}/src/render/frame_converter.cpp"
+)
+target_include_directories(test_render_frame_converter PRIVATE "${CMAKE_SOURCE_DIR}/include")
+target_link_libraries(test_render_frame_converter PRIVATE video-pipeline::spdlog)
+if(MSVC)
+    target_compile_options(test_render_frame_converter PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_render_frame_converter PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_render_frame_converter COMMAND test_render_frame_converter)
+
+if(VIDEO_PIPELINE_BUILD_RENDER)
+    add_executable(test_opengl_video_renderer render/test_opengl_video_renderer.cpp)
+    target_link_libraries(test_opengl_video_renderer PRIVATE video_pipeline_lib)
+    video_pipeline_copy_runtime_dlls(test_opengl_video_renderer)
+    if(MSVC)
+        target_compile_options(test_opengl_video_renderer PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(test_opengl_video_renderer PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME test_opengl_video_renderer COMMAND test_opengl_video_renderer --smoke)
+    set_tests_properties(test_opengl_video_renderer PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 add_executable(test_publisher_protocol media/test_publisher_protocol.cpp)
 target_link_libraries(test_publisher_protocol PRIVATE video_pipeline_lib)
 video_pipeline_copy_runtime_dlls(test_publisher_protocol)
