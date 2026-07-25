@@ -28,10 +28,12 @@ set_property(CACHE VIDEO_PIPELINE_PROFILE PROPERTY STRINGS tauri native all cust
 option(VIDEO_PIPELINE_BUILD_CLI "Build standalone C++ CLI/demo executable" ON)
 option(VIDEO_PIPELINE_BUILD_TAURI_MODULE "Build embeddable Tauri C ABI module when src/c_api sources exist" OFF)
 option(VIDEO_PIPELINE_BUILD_NATIVE_PLAYER "Build Boost based native player/web service app" OFF)
+option(VIDEO_PIPELINE_BUILD_INFERENCE "Build inference module under include/inference and src/inference" OFF)
 set(VIDEO_PIPELINE_BOOST_MIN_VERSION "1.91" CACHE STRING "Minimum Boost version for project Boost components")
 set(VIDEO_PIPELINE_DEFAULT_DEPS_ROOT "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
 set(VIDEO_PIPELINE_DEPS_ROOT "${VIDEO_PIPELINE_DEFAULT_DEPS_ROOT}" CACHE PATH "vcpkg installed prefix for Boost, spdlog, and runtime DLLs")
 set(VIDEO_PIPELINE_BOOST_ROOT "" CACHE PATH "Deprecated alias for VIDEO_PIPELINE_DEPS_ROOT")
+set(VIDEO_PIPELINE_OPENVINO_ROOT "C:/vcpkg_env/openvino_toolkit_windows_2026.2.1.21919.ede283a88e3_x86_64" CACHE PATH "OpenVINO toolkit root")
 option(VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST "Build manual ZLMediaKit process smoke test" ON)
 
 set(VIDEO_PIPELINE_VALID_PROFILES tauri native all custom)
@@ -75,6 +77,17 @@ endforeach()
 set(Boost_USE_MULTITHREADED ON)
 find_package(Boost ${VIDEO_PIPELINE_BOOST_MIN_VERSION} CONFIG REQUIRED COMPONENTS json process)
 find_package(spdlog CONFIG REQUIRED)
+
+if(VIDEO_PIPELINE_BUILD_INFERENCE)
+    if(WIN32 AND VIDEO_PIPELINE_OPENVINO_ROOT AND NOT OpenVINO_DIR)
+        set(VIDEO_PIPELINE_OPENVINO_CMAKE_DIR "${VIDEO_PIPELINE_OPENVINO_ROOT}/runtime/cmake")
+        if(EXISTS "${VIDEO_PIPELINE_OPENVINO_CMAKE_DIR}/OpenVINOConfig.cmake")
+            set(OpenVINO_DIR "${VIDEO_PIPELINE_OPENVINO_CMAKE_DIR}" CACHE PATH "OpenVINO CMake package directory")
+        endif()
+    endif()
+
+    find_package(OpenVINO REQUIRED COMPONENTS Runtime)
+endif()
 
 add_library(video_pipeline_boost INTERFACE)
 add_library(video-pipeline::boost ALIAS video_pipeline_boost)
@@ -161,6 +174,9 @@ if(NOT VIDEO_PIPELINE_RESOLVED_DEPS_ROOT AND Boost_DIR)
 endif()
 set(VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR "")
 set(VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR "")
+set(VIDEO_PIPELINE_OPENVINO_RELEASE_RUNTIME_DIR "")
+set(VIDEO_PIPELINE_OPENVINO_DEBUG_RUNTIME_DIR "")
+set(VIDEO_PIPELINE_OPENVINO_TBB_RUNTIME_DIR "")
 if(WIN32 AND VIDEO_PIPELINE_RESOLVED_DEPS_ROOT)
     set(VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR "${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}/bin")
     if(EXISTS "${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}/debug/bin")
@@ -168,6 +184,11 @@ if(WIN32 AND VIDEO_PIPELINE_RESOLVED_DEPS_ROOT)
     else()
         set(VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR "${VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR}")
     endif()
+endif()
+if(WIN32 AND VIDEO_PIPELINE_BUILD_INFERENCE AND VIDEO_PIPELINE_OPENVINO_ROOT)
+    set(VIDEO_PIPELINE_OPENVINO_RELEASE_RUNTIME_DIR "${VIDEO_PIPELINE_OPENVINO_ROOT}/runtime/bin/intel64/Release")
+    set(VIDEO_PIPELINE_OPENVINO_DEBUG_RUNTIME_DIR "${VIDEO_PIPELINE_OPENVINO_ROOT}/runtime/bin/intel64/Debug")
+    set(VIDEO_PIPELINE_OPENVINO_TBB_RUNTIME_DIR "${VIDEO_PIPELINE_OPENVINO_ROOT}/runtime/3rdparty/tbb/bin")
 endif()
 
 function(video_pipeline_copy_runtime_dlls target_name)
@@ -188,6 +209,26 @@ function(video_pipeline_copy_runtime_dlls target_name)
                         "$<IF:$<CONFIG:Debug>,${VIDEO_PIPELINE_VCPKG_DEBUG_RUNTIME_DIR},${VIDEO_PIPELINE_VCPKG_RELEASE_RUNTIME_DIR}>"
                         "$<TARGET_FILE_DIR:${target_name}>"
                     COMMENT "Copying vcpkg runtime DLLs"
+                )
+            endif()
+        endif()
+
+        if(VIDEO_PIPELINE_BUILD_INFERENCE)
+            if(EXISTS "${VIDEO_PIPELINE_OPENVINO_RELEASE_RUNTIME_DIR}")
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "$<IF:$<CONFIG:Debug>,${VIDEO_PIPELINE_OPENVINO_DEBUG_RUNTIME_DIR},${VIDEO_PIPELINE_OPENVINO_RELEASE_RUNTIME_DIR}>"
+                        "$<TARGET_FILE_DIR:${target_name}>"
+                    COMMENT "Copying OpenVINO runtime DLLs"
+                )
+            endif()
+
+            if(EXISTS "${VIDEO_PIPELINE_OPENVINO_TBB_RUNTIME_DIR}")
+                add_custom_command(TARGET ${target_name} POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                        "${VIDEO_PIPELINE_OPENVINO_TBB_RUNTIME_DIR}"
+                        "$<TARGET_FILE_DIR:${target_name}>"
+                    COMMENT "Copying OpenVINO TBB runtime DLLs"
                 )
             endif()
         endif()
@@ -233,6 +274,11 @@ if(NOT ENABLE_PCAP)
     list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\ethernet_capture\\.cpp$")
 endif()
 
+if(NOT VIDEO_PIPELINE_BUILD_INFERENCE)
+    list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*/inference/.*\\.cpp$")
+    list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\inference\\\\.*\\.cpp$")
+endif()
+
 add_library(video_pipeline_lib STATIC ${VIDEO_PIPELINE_SOURCES})
 add_library(video-pipeline::core ALIAS video_pipeline_lib)
 
@@ -265,8 +311,14 @@ endif()
 
 target_link_libraries(video_pipeline_lib PUBLIC Threads::Threads)
 
+if(VIDEO_PIPELINE_BUILD_INFERENCE)
+    target_compile_definitions(video_pipeline_lib PUBLIC VIDEO_PIPELINE_HAS_INFERENCE=1)
+    target_include_directories(video_pipeline_lib PUBLIC "${CMAKE_SOURCE_DIR}/include/inference")
+    target_link_libraries(video_pipeline_lib PUBLIC openvino::runtime)
+endif()
+
 if(MSVC)
-    target_compile_options(video_pipeline_lib PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+    target_compile_options(video_pipeline_lib PRIVATE /W3 /utf-8 /Zc:__cplusplus /FS)
 else()
     target_compile_options(video_pipeline_lib PRIVATE -Wall -Wextra)
 endif()
@@ -368,10 +420,13 @@ message(STATUS "Build tests: ${BUILD_TESTS}")
 message(STATUS "Build CLI: ${VIDEO_PIPELINE_BUILD_CLI}")
 message(STATUS "Build Tauri module: ${VIDEO_PIPELINE_BUILD_TAURI_MODULE}")
 message(STATUS "Build native player: ${VIDEO_PIPELINE_BUILD_NATIVE_PLAYER}")
+message(STATUS "Build inference: ${VIDEO_PIPELINE_BUILD_INFERENCE}")
 message(STATUS "Build common process: ${VIDEO_PIPELINE_BUILD_COMMON_PROCESS}")
 message(STATUS "Build ZLMediaKit test: ${VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST}")
 message(STATUS "Deps root: ${VIDEO_PIPELINE_DEPS_ROOT}")
 message(STATUS "Resolved deps root: ${VIDEO_PIPELINE_RESOLVED_DEPS_ROOT}")
+message(STATUS "OpenVINO root: ${VIDEO_PIPELINE_OPENVINO_ROOT}")
+message(STATUS "OpenVINO_DIR: ${OpenVINO_DIR}")
 message(STATUS "Enable pcap: ${ENABLE_PCAP}")
 message(STATUS "Runtime output: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "===========================================")
