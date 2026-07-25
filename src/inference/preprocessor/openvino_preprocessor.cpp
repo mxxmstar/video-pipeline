@@ -11,7 +11,7 @@
 #include "inference/inference_logger.h"
 
 namespace {
-/// @brief 媒体帧平面张量缓冲区（适配多种格式）
+/// @brief 濯掍綋甯у钩闈㈠紶閲忕紦鍐插尯锛堥€傞厤澶氱鏍煎紡锛?
 class MediaFramePlaneTensorBuffer : public TensorBuffer {
 public:
     MediaFramePlaneTensorBuffer(std::shared_ptr<IMediaBuffer> media_buffer,
@@ -40,11 +40,11 @@ private:
     size_t bytes_{0};
 };
 
-/// @brief 获取图像平面的偏移量
-/// @param frame 输入的原始 MediaFrame（包含buffer、尺寸、stride等信息）
-/// @param index 平面索引
-/// @param fallback 默认值
-/// @return 平面数据在buffer中的偏移量
+/// @brief 鑾峰彇鍥惧儚骞抽潰鐨勫亸绉婚噺
+/// @param frame 杈撳叆鐨勫師濮?MediaFrame锛堝寘鍚玝uffer銆佸昂瀵搞€乻tride绛変俊鎭級
+/// @param index 骞抽潰绱㈠紩
+/// @param fallback 榛樿鍊?
+/// @return 骞抽潰鏁版嵁鍦╞uffer涓殑鍋忕Щ閲?
 size_t PlaneOffset(const MediaFrame& frame, int index, size_t fallback) {
     if (frame.PlaneCount() > index && frame.PlaneOffset(index) > 0) {
         return static_cast<size_t>(frame.PlaneOffset(index));
@@ -52,10 +52,10 @@ size_t PlaneOffset(const MediaFrame& frame, int index, size_t fallback) {
     return fallback;
 }
 
-/// @brief 获取图像平面的跨度
-/// @param frame 输入的原始 MediaFrame（包含buffer、尺寸、stride等信息）
-/// @param index 平面索引
-/// @param fallback 默认值
+/// @brief 鑾峰彇鍥惧儚骞抽潰鐨勮法搴?
+/// @param frame 杈撳叆鐨勫師濮?MediaFrame锛堝寘鍚玝uffer銆佸昂瀵搞€乻tride绛変俊鎭級
+/// @param index 骞抽潰绱㈠紩
+/// @param fallback 榛樿鍊?
 int32_t PlaneStride(const MediaFrame& frame, int index, int32_t fallback) {
     if (frame.Stride(index) > 0) {
         return frame.Stride(index);
@@ -63,16 +63,16 @@ int32_t PlaneStride(const MediaFrame& frame, int index, int32_t fallback) {
     return fallback;
 }
 
-/// @brief 根据输入的图像平面参数，安全地指向/创建一个 TensorBuffer
-/// 上层自己提供offset，stride等，防止mediaframe中的数据不完整
-/// 从 buffer 的 offset 位置，取 rows 行数据，每行有效长度 row_bytes，实际步长 stride_bytes。
-/// 如果无 padding 则零拷贝共享，有 padding 则逐行去 padding 拷贝
-/// @param frame 输入的原始 MediaFrame（包含buffer、尺寸、stride等信息）
-/// @param offset 当前平面数据在buffer中的偏移量
-/// @param rows 当前平面的行数
-/// @param row_bytes 当前平面每行的字节数
-/// @param stride_bytes 当前平面的行跨度（字节数）
-/// @return 创建的 TensorBuffer 指针，或 nullptr 如果参数无效
+/// @brief 鏍规嵁杈撳叆鐨勫浘鍍忓钩闈㈠弬鏁帮紝瀹夊叏鍦版寚鍚?鍒涘缓涓€涓?TensorBuffer
+/// 涓婂眰鑷繁鎻愪緵offset锛宻tride绛夛紝闃叉mediaframe涓殑鏁版嵁涓嶅畬鏁?
+/// 浠?buffer 鐨?offset 浣嶇疆锛屽彇 rows 琛屾暟鎹紝姣忚鏈夋晥闀垮害 row_bytes锛屽疄闄呮闀?stride_bytes銆?
+/// 濡傛灉鏃?padding 鍒欓浂鎷疯礉鍏变韩锛屾湁 padding 鍒欓€愯鍘?padding 鎷疯礉
+/// @param frame 杈撳叆鐨勫師濮?MediaFrame锛堝寘鍚玝uffer銆佸昂瀵搞€乻tride绛変俊鎭級
+/// @param offset 褰撳墠骞抽潰鏁版嵁鍦╞uffer涓殑鍋忕Щ閲?
+/// @param rows 褰撳墠骞抽潰鐨勮鏁?
+/// @param row_bytes 褰撳墠骞抽潰姣忚鐨勫瓧鑺傛暟
+/// @param stride_bytes 褰撳墠骞抽潰鐨勮璺ㄥ害锛堝瓧鑺傛暟锛?
+/// @return 鍒涘缓鐨?TensorBuffer 鎸囬拡锛屾垨 nullptr 濡傛灉鍙傛暟鏃犳晥
 std::shared_ptr<TensorBuffer> MakePlaneBuffer(const MediaFrame& frame,
                                               size_t offset,
                                               size_t rows,
@@ -82,7 +82,7 @@ std::shared_ptr<TensorBuffer> MakePlaneBuffer(const MediaFrame& frame,
         return nullptr;
     }
     
-    // 空plane
+    // 绌簆lane
     if (rows == 0 || row_bytes == 0) {
         return std::make_shared<CpuTensorBuffer>(0);
     }
@@ -105,23 +105,23 @@ std::shared_ptr<TensorBuffer> MakePlaneBuffer(const MediaFrame& frame,
         return nullptr;
     }
 
-    // 行跨度等于行字节数，创建对应的MediaFramePlaneTensorBuffer
+    // 琛岃法搴︾瓑浜庤瀛楄妭鏁帮紝鍒涘缓瀵瑰簲鐨凪ediaFramePlaneTensorBuffer
     if (stride_bytes == row_bytes) {
         return std::make_shared<MediaFramePlaneTensorBuffer>(frame.buffer, offset, rows * row_bytes);
     }
     
-    // 行跨度不等于行字节数，分配一块紧凑的新内存，大小 = rows × row_bytes（不含 padding）
+    // 琛岃法搴︿笉绛変簬琛屽瓧鑺傛暟锛屽垎閰嶄竴鍧楃揣鍑戠殑鏂板唴瀛橈紝澶у皬 = rows 脳 row_bytes锛堜笉鍚?padding锛?
     auto compact = std::make_shared<CpuTensorBuffer>(rows * row_bytes);
     const auto* src = frame.buffer->Data() + offset;
     auto* dst = static_cast<uint8_t*>(compact->Data());
     for (size_t row = 0; row < rows; ++row) {
-        // 只拷贝每一行有效的数据
+        // 鍙嫹璐濇瘡涓€琛屾湁鏁堢殑鏁版嵁
         std::memcpy(dst + row * row_bytes, src + row * stride_bytes, row_bytes);
     }
     return compact;
 }
 
-/// @brief 创建一个 TensorPlane 实例，用于存储图像平面数据
+/// @brief 鍒涘缓涓€涓?TensorPlane 瀹炰緥锛岀敤浜庡瓨鍌ㄥ浘鍍忓钩闈㈡暟鎹?
 std::unique_ptr<TensorPlane> MakeTensor(const std::string& name,
                                        TensorShape shape,
                                        std::shared_ptr<TensorBuffer> buffer) {

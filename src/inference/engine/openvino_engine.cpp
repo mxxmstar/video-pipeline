@@ -1,4 +1,4 @@
-#include "inferenceengine/openvino_engine.h"
+#include "engine/openvino_engine.h"
 
 #include <algorithm>
 #include <chrono>
@@ -397,11 +397,11 @@ const TensorPlane* FindInputTensor(const TensorFrame& frame,
     return nullptr;
 }
 
-/// @brief 绑定推理请求的输入张量
-/// 将 TensorFrame 中的数据绑定到 OpenVINO 推理请求的输入端口
-/// @param request 推理请求
-/// @param compiled_model 编译后的模型，用于获取输入端口信息
-/// @param input 待绑定的输入张量包
+/// @brief 缁戝畾鎺ㄧ悊璇锋眰鐨勮緭鍏ュ紶閲?
+/// 灏?TensorFrame 涓殑鏁版嵁缁戝畾鍒?OpenVINO 鎺ㄧ悊璇锋眰鐨勮緭鍏ョ鍙?
+/// @param request 鎺ㄧ悊璇锋眰
+/// @param compiled_model 缂栬瘧鍚庣殑妯″瀷锛岀敤浜庤幏鍙栬緭鍏ョ鍙ｄ俊鎭?
+/// @param input 寰呯粦瀹氱殑杈撳叆寮犻噺鍖?
 void BindInputs(ov::InferRequest& request,
                 const ov::CompiledModel& compiled_model,
                 const TensorFrame& input) {
@@ -487,7 +487,7 @@ bool OpenVinoCpuEngine::LoadModel(const EngineLoadConfig& load_config) {
         config_.max_batch_size = static_cast<uint32_t>(std::max(1, config_.batch_size));
         auto raw_model = core_.read_model(config_.model_path);
 
-        // 设置 openvino 预处理器
+        // 璁剧疆 openvino 棰勫鐞嗗櫒
         if (load_config.preprocess.has_value()) {
             preprocess_config_ = ResolveOpenVinoPreprocessConfig(raw_model, *load_config.preprocess);
         } else {

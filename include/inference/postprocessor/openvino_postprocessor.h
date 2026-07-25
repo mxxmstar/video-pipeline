@@ -2,7 +2,7 @@
 
 #include <vector>
 
-#include "inferenceinfo/result.h"
+#include "info/result.h"
 #include "postprocessor/i_postprocessor.h"
 #include "tensordata/tensor_frame.h"
 

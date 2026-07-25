@@ -8,7 +8,7 @@
 
 #include "tensor_data.h"
 
-/// @brief Tensor 包，推理引擎输入/输出的统一容器
+/// @brief Tensor 鍖咃紝鎺ㄧ悊寮曟搸杈撳叆/杈撳嚭鐨勭粺涓€瀹瑰櫒
 class TensorFrame {
 public:
     TensorFrame() = default;
@@ -41,7 +41,7 @@ public:
     TensorFrame(TensorFrame&&) noexcept = default;
     TensorFrame& operator=(TensorFrame&&) noexcept = default;
 
-    /// @brief 添加 Tensor
+    /// @brief 娣诲姞 Tensor
     void AddTensor(std::unique_ptr<TensorPlane> tensor) {
         if (!tensor) {
             return;
@@ -51,45 +51,45 @@ public:
         tensors_[std::move(name)] = std::move(tensor);
     }
 
-    /// @brief 拷贝添加 Tensor
+    /// @brief 鎷疯礉娣诲姞 Tensor
     void AddTensor(const TensorPlane& tensor) {
         AddTensor(std::make_unique<TensorPlane>(tensor));
     }
 
-    /// @brief 根据名称查找 Tensor
+    /// @brief 鏍规嵁鍚嶇О鏌ユ壘 Tensor
     TensorPlane* FindTensor(const std::string& name) {
         auto it = tensors_.find(name);
         return it == tensors_.end() ? nullptr : it->second.get();
     }
 
-    /// @brief 根据名称查找只读 Tensor
+    /// @brief 鏍规嵁鍚嶇О鏌ユ壘鍙 Tensor
     const TensorPlane* FindTensor(const std::string& name) const {
         auto it = tensors_.find(name);
         return it == tensors_.end() ? nullptr : it->second.get();
     }
 
-    /// @brief 获取第一个 Tensor
+    /// @brief 鑾峰彇绗竴涓?Tensor
     TensorPlane* FirstTensor() {
         return tensors_.empty() ? nullptr : tensors_.begin()->second.get();
     }
 
-    /// @brief 获取第一个只读 Tensor
+    /// @brief 鑾峰彇绗竴涓彧璇?Tensor
     const TensorPlane* FirstTensor() const {
         return tensors_.empty() ? nullptr : tensors_.begin()->second.get();
     }
 
-    /// @brief 获取 Tensor 数量
+    /// @brief 鑾峰彇 Tensor 鏁伴噺
     size_t Size() const {
         return tensors_.size();
     }
 
-    /// @brief 判断 Tensor 包是否为空
+    /// @brief 鍒ゆ柇 Tensor 鍖呮槸鍚︿负绌?
     bool Empty() const {
         return tensors_.empty();
     }
 
-    /// @brief 张量包中的张量数据
+    /// @brief 寮犻噺鍖呬腑鐨勫紶閲忔暟鎹?
     std::unordered_map<std::string, std::unique_ptr<TensorPlane>> tensors_;
     
-    TensorMeta tensor_meta_;    ///< 转换相关的信息
+    TensorMeta tensor_meta_;    ///< 杞崲鐩稿叧鐨勪俊鎭?
 };

@@ -4,6 +4,12 @@
 #include "media/publisher/i_publisher.h"
 #include "media/simple_buffer.h"
 
+#if defined(VIDEO_PIPELINE_HAS_INFERENCE) && VIDEO_PIPELINE_HAS_INFERENCE
+#include "engine/openvino_engine.h"
+#include "model/yolo_model.h"
+#include "session/session.h"
+#endif
+
 #if defined(VIDEO_PIPELINE_HAS_COMMON_PROCESS) && VIDEO_PIPELINE_HAS_COMMON_PROCESS
 #include "common/process/process.h"
 #endif
@@ -60,6 +66,8 @@ constexpr unsigned short kZlmRtcSignalingSslPort = 13001;
 const std::filesystem::path kManualZlmMediaServerPath =
     std::filesystem::path{VIDEO_PIPELINE_SOURCE_DIR} /
     "third_apps/win32/zlmediakit/MediaServer.exe";
+const std::filesystem::path kYolov5ModelPath =
+    std::filesystem::path{VIDEO_PIPELINE_SOURCE_DIR} / "models/yolov5/yolov5s.xml";
 
 PublisherConfig MakeConfig(std::uint16_t port,
                            bool enable_udp,
@@ -671,6 +679,11 @@ struct CameraAvPipelineState {
     std::unique_ptr<FFmpegEncoder> audio_encoder;
     std::unique_ptr<IPublisher> zlm_publisher;
     std::unique_ptr<IPublisher> rtsp_server_publisher;
+#if defined(VIDEO_PIPELINE_HAS_INFERENCE) && VIDEO_PIPELINE_HAS_INFERENCE
+    std::shared_ptr<YoloModel> inference_model;
+    std::shared_ptr<OpenVinoCpuEngine> inference_engine;
+    std::unique_ptr<InferenceSession> inference_session;
+#endif
     std::deque<MediaPacket> pending_audio_packets;
 
     int fps{kManualFallbackFps};
@@ -688,7 +701,10 @@ struct CameraAvPipelineState {
     int published_zlm_audio_packets{0};
     int read_video_packets{0};
     int read_audio_packets{0};
+    int inferred_video_frames{0};
+    int detected_objects{0};
     bool initialized{false};
+    bool inference_initialized{false};
     bool failed{false};
     std::string error;
 };
@@ -763,6 +779,92 @@ bool FlushPendingCameraAudio(CameraAvPipelineState& state) {
     }
     return true;
 }
+
+#if defined(VIDEO_PIPELINE_HAS_INFERENCE) && VIDEO_PIPELINE_HAS_INFERENCE
+bool IsSupportedInferencePixelFormat(PixelFormat format) {
+    return format == PixelFormat::kI420 || format == PixelFormat::kNV12;
+}
+
+bool InitializeCameraInference(CameraAvPipelineState& state,
+                               const MediaFrame& first_frame) {
+    if (state.inference_initialized) {
+        return true;
+    }
+    if (!std::filesystem::exists(kYolov5ModelPath)) {
+        state.error = "YOLOv5 model path does not exist: " + kYolov5ModelPath.string();
+        return false;
+    }
+
+    const auto pixel_format = first_frame.GetPixelFormat();
+    if (!IsSupportedInferencePixelFormat(pixel_format)) {
+        state.error = "decoded video pixel format is not supported by inference";
+        return false;
+    }
+
+    auto model = std::make_shared<YoloModel>();
+    ModelConfig model_config;
+    model_config.name = "yolov5s";
+    model_config.class_count = 80;
+    model_config.options["input_width"] = "640";
+    model_config.options["input_height"] = "640";
+    if (!model->Initialize(model_config)) {
+        state.error = "failed to initialize YOLOv5 model";
+        return false;
+    }
+
+    auto engine = std::make_shared<OpenVinoCpuEngine>();
+    EngineLoadConfig load_config;
+    load_config.engine.model_path = kYolov5ModelPath.string();
+    load_config.engine.backend = "OPENVINO";
+    load_config.engine.device = "CPU";
+    load_config.engine.request_count = 1;
+
+    OpenVinoPreprocessConfig preprocess_config;
+    preprocess_config.enabled = true;
+    preprocess_config.input_pixel_format = pixel_format;
+    preprocess_config.model_pixel_format = PixelFormat::kRGB24;
+    preprocess_config.model_input_layout = "NCHW";
+    preprocess_config.scale = 255.0f;
+    load_config.preprocess = preprocess_config;
+
+    if (!engine->LoadModel(load_config)) {
+        state.error = "failed to load YOLOv5 OpenVINO model";
+        return false;
+    }
+
+    auto session = std::make_unique<InferenceSession>();
+    if (!session->Initialize(model, engine)) {
+        state.error = "failed to initialize YOLOv5 inference session";
+        engine->Release();
+        return false;
+    }
+
+    state.inference_model = std::move(model);
+    state.inference_engine = std::move(engine);
+    state.inference_session = std::move(session);
+    state.inference_initialized = true;
+    std::cout << "YOLOv5 inference initialized: " << kYolov5ModelPath << "\n";
+    return true;
+}
+
+bool RunCameraInference(CameraAvPipelineState& state,
+                        const MediaFrame& frame) {
+    if (!state.inference_initialized) {
+        if (!InitializeCameraInference(state, frame)) {
+            return false;
+        }
+    }
+
+    const auto result = state.inference_session->Infer(frame);
+    ++state.inferred_video_frames;
+    state.detected_objects += static_cast<int>(result.objects.size());
+    if (!result.objects.empty()) {
+        std::cout << "YOLOv5 frame pts=" << result.pts
+                  << ", objects=" << result.objects.size() << "\n";
+    }
+    return true;
+}
+#endif
 
 bool PublishCameraVideoPackets(CameraAvPipelineState& state,
                                std::vector<PacketPtr>& packets) {
@@ -1077,6 +1179,13 @@ void TestCameraAudioVideoDecodeEncodePublish() {
             return;
         }
 
+#if defined(VIDEO_PIPELINE_HAS_INFERENCE) && VIDEO_PIPELINE_HAS_INFERENCE
+        if (!RunCameraInference(state, *frame)) {
+            state.failed = true;
+            return;
+        }
+#endif
+
         std::vector<PacketPtr> encoded;
         if (!state.video_encoder->Encode(std::move(frame), encoded)) {
             state.failed = true;
@@ -1182,10 +1291,17 @@ void TestCameraAudioVideoDecodeEncodePublish() {
                       << ", published_audio=" << state.published_audio_packets
                       << ", encoded_aac=" << state.encoded_audio_packets
                       << ", published_zlm_audio="
-                      << state.published_zlm_audio_packets << "\n";
+                      << state.published_zlm_audio_packets
+                      << ", inferred_video=" << state.inferred_video_frames
+                      << ", detected_objects=" << state.detected_objects << "\n";
         }
     }
 
+#if defined(VIDEO_PIPELINE_HAS_INFERENCE) && VIDEO_PIPELINE_HAS_INFERENCE
+    if (state.inference_engine) {
+        state.inference_engine->Release();
+    }
+#endif
     if (state.zlm_publisher) {
         state.zlm_publisher->Stop();
     }
@@ -1206,6 +1322,10 @@ void TestCameraAudioVideoDecodeEncodePublish() {
         std::cerr << "Manual camera pipeline failed: " << state.error << "\n";
         assert(false);
     }
+
+    std::cout << "Manual camera pipeline stopped: inferred_video="
+              << state.inferred_video_frames
+              << ", detected_objects=" << state.detected_objects << "\n";
 }
 
 void TestTcpInterleavedPublisher() {

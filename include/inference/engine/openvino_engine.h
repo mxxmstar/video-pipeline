@@ -5,45 +5,45 @@
 
 #include <openvino/openvino.hpp>
 
-#include "inferenceengine/i_engine.h"
-#include "inferenceengine/openvino_request_pool.h"
+#include "engine/i_engine.h"
+#include "engine/openvino_request_pool.h"
 
-/// @brief OpenVINO CPU 推理引擎
+/// @brief OpenVINO CPU 鎺ㄧ悊寮曟搸
 class OpenVinoCpuEngine : public IInferenceEngine {
 public:
     OpenVinoCpuEngine();
     ~OpenVinoCpuEngine() override;
 
-    /// @brief 加载模型
+    /// @brief 鍔犺浇妯″瀷
     bool LoadModel(const EngineLoadConfig& config) override;
-    /// @brief 运行同步推理
+    /// @brief 杩愯鍚屾鎺ㄧ悊
     bool Infer(const TensorFrame& input, TensorFrame& output) override;
-    /// @brief 运行异步推理
+    /// @brief 杩愯寮傛鎺ㄧ悊
     bool InferAsync(const InferContext& ctx, const TensorFrame& input, InferCallback cb) override;
-    /// @brief 释放推理引擎资源
+    /// @brief 閲婃斁鎺ㄧ悊寮曟搸璧勬簮
     void Release() override;
-    /// @brief 获取引擎能力
+    /// @brief 鑾峰彇寮曟搸鑳藉姏
     EngineCapability Supports() const override;
-    /// @brief 获取模型输入/输出张量描述
+    /// @brief 鑾峰彇妯″瀷杈撳叆/杈撳嚭寮犻噺鎻忚堪
     TensorModelDesc GetModelDesc() const override;
-    /// @brief 获取推理引擎配置和信息
+    /// @brief 鑾峰彇鎺ㄧ悊寮曟搸閰嶇疆鍜屼俊鎭?
     EngineConfig GetEngineConfig() const override;
 
 private:
     /// @brief OpenVINO Core
     ov::Core core_;
-    /// @brief 编译模型
+    /// @brief 缂栬瘧妯″瀷
     ov::CompiledModel compiled_model_;
-    /// @brief 推理请求池
+    /// @brief 鎺ㄧ悊璇锋眰姹?
     std::shared_ptr<OpenVinoInferRequestPool> request_pool_;
-    /// @brief 引擎配置
+    /// @brief 寮曟搸閰嶇疆
     EngineConfig config_;
-    /// @brief 模型张量描述
+    /// @brief 妯″瀷寮犻噺鎻忚堪
     TensorModelDesc tensor_model_desc_;
-    /// @brief OpenVINO 预处理配置
+    /// @brief OpenVINO 棰勫鐞嗛厤缃?
     OpenVinoPreprocessConfig preprocess_config_;
-    /// @brief 初始化状态
+    /// @brief 鍒濆鍖栫姸鎬?
     bool initialized_{false};
-    /// @brief 是否接受新的异步推理请求
+    /// @brief 鏄惁鎺ュ彈鏂扮殑寮傛鎺ㄧ悊璇锋眰
     std::atomic<bool> accepting_async_{false};
 };

@@ -2,9 +2,9 @@
 #include <memory>
 #include <functional>
 #include "media/media_frame.h"
-#include "inferenceinfo/result.h"
+#include "info/result.h"
 
-/// @brief 推理任务
+/// @brief 鎺ㄧ悊浠诲姟
 struct InferTask {
     uint64_t frame_id;
     uint32_t stream_id;

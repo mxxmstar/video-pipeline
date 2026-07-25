@@ -8,19 +8,19 @@
 #include <vector>
 
 #include "tensor_buffer.h"
-#include "inferenceinfo/processor.h"
+#include "info/processor.h"
 
-/// @brief Tensor 形状
+/// @brief Tensor 褰㈢姸
 struct TensorShape {
-    /// @brief 维度列表
+    /// @brief 缁村害鍒楄〃
     std::vector<int64_t> dims;
 
-    /// @brief 获取 Tensor 维度数量
+    /// @brief 鑾峰彇 Tensor 缁村害鏁伴噺
     size_t Rank() const {
         return dims.size();
     }
 
-    /// @brief 获取 Tensor 元素数量
+    /// @brief 鑾峰彇 Tensor 鍏冪礌鏁伴噺
     size_t ElementCount() const {
         size_t count = 1;
         for (auto d : dims) {
@@ -33,7 +33,7 @@ struct TensorShape {
     }
 };
 
-/// @brief Tensor 数据类型
+/// @brief Tensor 鏁版嵁绫诲瀷
 enum class TensorType {
     UNKNOWN,
 
@@ -49,7 +49,7 @@ enum class TensorType {
     BOOL
 };
 
-/// @brief Tensor 内存类型
+/// @brief Tensor 鍐呭瓨绫诲瀷
 enum class TensorMemoryType {
     UNKNOWN,
     OPENVINO_CPU,
@@ -61,7 +61,7 @@ enum class TensorMemoryType {
     SHARED_MEMORY
 };
 
-/// @brief Tensor 推理框架之间交换的数据格式
+/// @brief Tensor 鎺ㄧ悊妗嗘灦涔嬮棿浜ゆ崲鐨勬暟鎹牸寮?
 class TensorPlane {
 public:
     TensorPlane()
@@ -69,7 +69,7 @@ public:
           memory_type(TensorMemoryType::UNKNOWN) {
     }
 
-    /// @brief 构造 Tensor 数据
+    /// @brief 鏋勯€?Tensor 鏁版嵁
     TensorPlane(std::string tensor_name,
                TensorType tensor_type,
                TensorShape tensor_shape,
@@ -110,19 +110,19 @@ public:
     TensorPlane(TensorPlane&&) noexcept = default;
     TensorPlane& operator=(TensorPlane&&) noexcept = default;
 
-    /// @brief 获取指定类型的可写数据指针
+    /// @brief 鑾峰彇鎸囧畾绫诲瀷鐨勫彲鍐欐暟鎹寚閽?
     template <typename T>
     T* Data() {
         return reinterpret_cast<T*>(data);
     }
 
-    /// @brief 获取指定类型的只读数据指针
+    /// @brief 鑾峰彇鎸囧畾绫诲瀷鐨勫彧璇绘暟鎹寚閽?
     template <typename T>
     const T* Data() const {
         return reinterpret_cast<const T*>(data);
     }
 
-    /// @brief 设置 Tensor 持有的缓冲区
+    /// @brief 璁剧疆 Tensor 鎸佹湁鐨勭紦鍐插尯
     void SetBuffer(std::shared_ptr<TensorBuffer> tensor_buffer,
                    TensorMemoryType tensor_memory_type = TensorMemoryType::OPENVINO_CPU) {
         buffer = std::move(tensor_buffer);
@@ -131,23 +131,23 @@ public:
         bytes = buffer ? buffer->Size() : 0;
     }
 
-    /// @brief Tensor 名称
+    /// @brief Tensor 鍚嶇О
     std::string name;
-    /// @brief Tensor 数据类型
+    /// @brief Tensor 鏁版嵁绫诲瀷
     TensorType type{TensorType::UNKNOWN};
-    /// @brief Tensor 形状
+    /// @brief Tensor 褰㈢姸
     TensorShape shape;
-    /// @brief Tensor 内存类型
+    /// @brief Tensor 鍐呭瓨绫诲瀷
     TensorMemoryType memory_type{TensorMemoryType::UNKNOWN};
-    /// @brief Tensor 持有的缓冲区
+    /// @brief Tensor 鎸佹湁鐨勭紦鍐插尯
     std::shared_ptr<TensorBuffer> buffer;
-    /// @brief Tensor 数据指针
+    /// @brief Tensor 鏁版嵁鎸囬拡
     void* data{nullptr};
-    /// @brief Tensor 数据字节数
+    /// @brief Tensor 鏁版嵁瀛楄妭鏁?
     size_t bytes{0};
 
 private:
-    /// @brief 深拷贝另一个 Tensor 的缓冲区数据
+    /// @brief 娣辨嫹璐濆彟涓€涓?Tensor 鐨勭紦鍐插尯鏁版嵁
     void CloneBufferFrom(const TensorPlane& other) {
         if (other.data && other.bytes > 0) {
             buffer = std::make_shared<CpuTensorBuffer>(other.data, other.bytes);
@@ -158,13 +158,13 @@ private:
     }
 };
 
-/// @brief TensorFrame携带的转换相关的信息
+/// @brief TensorFrame鎼哄甫鐨勮浆鎹㈢浉鍏崇殑淇℃伅
 struct TensorMeta {
-    int src_width{0}; ///< 图片原始宽度
-    int src_height{0};  ///< 图片原始高度
+    int src_width{0}; ///< 鍥剧墖鍘熷瀹藉害
+    int src_height{0};  ///< 鍥剧墖鍘熷楂樺害
 
-    int input_width{0}; ///<模型输入宽度
-    int input_height{0}; ///<模型输入高度
+    int input_width{0}; ///<妯″瀷杈撳叆瀹藉害
+    int input_height{0}; ///<妯″瀷杈撳叆楂樺害
 
-    LetterBoxInfo letterbox;    ///<转换信息
+    LetterBoxInfo letterbox;    ///<杞崲淇℃伅
 };

@@ -8,7 +8,7 @@ else()
 endif()
 add_test(NAME test_spdlog COMMAND test_spdlog)
 
-add_executable(test_publisher_protocol test_publisher_protocol.cpp)
+add_executable(test_publisher_protocol media/test_publisher_protocol.cpp)
 target_link_libraries(test_publisher_protocol PRIVATE video_pipeline_lib)
 video_pipeline_copy_runtime_dlls(test_publisher_protocol)
 if(MSVC)
@@ -19,7 +19,7 @@ endif()
 add_test(NAME test_publisher_protocol COMMAND test_publisher_protocol)
 
 if(VIDEO_PIPELINE_BUILD_INFERENCE)
-    add_executable(test_inference_smoke test_inference_smoke.cpp)
+    add_executable(test_inference_smoke inference/test_inference_smoke.cpp)
     target_link_libraries(test_inference_smoke PRIVATE video_pipeline_lib)
     video_pipeline_copy_runtime_dlls(test_inference_smoke)
     if(MSVC)
@@ -28,9 +28,23 @@ if(VIDEO_PIPELINE_BUILD_INFERENCE)
         target_compile_options(test_inference_smoke PRIVATE -Wall -Wextra)
     endif()
     add_test(NAME test_inference_smoke COMMAND test_inference_smoke)
+
+    add_executable(test_yolov5_inference inference/test_yolov5_inference.cpp)
+    target_link_libraries(test_yolov5_inference PRIVATE video_pipeline_lib)
+    target_compile_definitions(test_yolov5_inference
+        PRIVATE
+            VIDEO_PIPELINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    )
+    video_pipeline_copy_runtime_dlls(test_yolov5_inference)
+    if(MSVC)
+        target_compile_options(test_yolov5_inference PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(test_yolov5_inference PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME test_yolov5_inference COMMAND test_yolov5_inference)
 endif()
 
-add_executable(test_ffmpeg_audio_encoder test_ffmpeg_audio_encoder.cpp)
+add_executable(test_ffmpeg_audio_encoder media/test_ffmpeg_audio_encoder.cpp)
 target_link_libraries(test_ffmpeg_audio_encoder PRIVATE video_pipeline_lib)
 video_pipeline_copy_runtime_dlls(test_ffmpeg_audio_encoder)
 if(MSVC)
@@ -40,7 +54,7 @@ else()
 endif()
 add_test(NAME test_ffmpeg_audio_encoder COMMAND test_ffmpeg_audio_encoder)
 
-add_executable(test_rtsp_server_publisher test_rtsp_server_publisher.cpp)
+add_executable(test_rtsp_server_publisher media/test_rtsp_server_publisher.cpp)
 target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_lib)
 target_compile_definitions(test_rtsp_server_publisher
     PRIVATE
@@ -59,7 +73,7 @@ if(MSVC)
 else()
     target_compile_options(test_rtsp_server_publisher PRIVATE -Wall -Wextra)
 endif()
-add_executable(test_local_mp4_decode_rtsp_publisher test_local_mp4_decode_rtsp_publisher.cpp)
+add_executable(test_local_mp4_decode_rtsp_publisher media/test_local_mp4_decode_rtsp_publisher.cpp)
 target_link_libraries(test_local_mp4_decode_rtsp_publisher PRIVATE video_pipeline_lib)
 target_compile_definitions(test_local_mp4_decode_rtsp_publisher
     PRIVATE
@@ -82,7 +96,7 @@ add_test(
         --no-realtime
 )
 
-add_executable(test_stream_decode test_stream_decode.cpp)
+add_executable(test_stream_decode media/test_stream_decode.cpp)
 target_link_libraries(test_stream_decode PRIVATE video_pipeline_lib)
 video_pipeline_copy_runtime_dlls(test_stream_decode)
 if(MSVC)
@@ -92,7 +106,7 @@ else()
 endif()
 
 if(TARGET video_pipeline_common_process)
-    add_executable(test_zlmediakit_process test_zlmediakit_process.cpp)
+    add_executable(test_zlmediakit_process media/test_zlmediakit_process.cpp)
     target_link_libraries(test_zlmediakit_process PRIVATE video_pipeline_common_process)
     video_pipeline_copy_runtime_dlls(test_zlmediakit_process)
     if(MSVC)
@@ -101,7 +115,7 @@ if(TARGET video_pipeline_common_process)
         target_compile_options(test_zlmediakit_process PRIVATE -Wall -Wextra)
     endif()
 
-    add_executable(test_rtsp_decode_encode_push_zlm test_rtsp_decode_encode_push_zlm.cpp)
+    add_executable(test_rtsp_decode_encode_push_zlm media/test_rtsp_decode_encode_push_zlm.cpp)
     target_link_libraries(test_rtsp_decode_encode_push_zlm
         PRIVATE
             video_pipeline_lib

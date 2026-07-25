@@ -28,7 +28,7 @@ set_property(CACHE VIDEO_PIPELINE_PROFILE PROPERTY STRINGS tauri native all cust
 option(VIDEO_PIPELINE_BUILD_CLI "Build standalone C++ CLI/demo executable" ON)
 option(VIDEO_PIPELINE_BUILD_TAURI_MODULE "Build embeddable Tauri C ABI module when src/c_api sources exist" OFF)
 option(VIDEO_PIPELINE_BUILD_NATIVE_PLAYER "Build Boost based native player/web service app" OFF)
-option(VIDEO_PIPELINE_BUILD_INFERENCE "Build inference module under include/inference and src/inference" OFF)
+option(VIDEO_PIPELINE_BUILD_INFERENCE "Build inference module under include/inference and src/inference" ON)
 set(VIDEO_PIPELINE_BOOST_MIN_VERSION "1.91" CACHE STRING "Minimum Boost version for project Boost components")
 set(VIDEO_PIPELINE_DEFAULT_DEPS_ROOT "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
 set(VIDEO_PIPELINE_DEPS_ROOT "${VIDEO_PIPELINE_DEFAULT_DEPS_ROOT}" CACHE PATH "vcpkg installed prefix for Boost, spdlog, and runtime DLLs")

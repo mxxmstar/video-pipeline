@@ -126,9 +126,9 @@ FrameResult YoloPostprocessor::Process(const TensorFrame& output) {
 
     const auto& meta = output.tensor_meta_;
 
-    // 从 TensorFrame 中复制完整的元信息
+    // 浠?TensorFrame 涓鍒跺畬鏁寸殑鍏冧俊鎭?
     tensor_meta_ = meta;
-    // 如果原始尺寸未设置，默认回退到模型输入尺寸
+    // 濡傛灉鍘熷灏哄鏈缃紝榛樿鍥為€€鍒版ā鍨嬭緭鍏ュ昂瀵?
     if (tensor_meta_.src_width <= 0) {
         tensor_meta_.src_width = tensor_meta_.input_width;
     }

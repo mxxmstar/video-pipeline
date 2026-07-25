@@ -7,22 +7,22 @@
 #include <vector>
 
 #include "media/media_frame.h"
-#include "inferenceinfo/result.h"
+#include "info/result.h"
 #include "tensordata/tensor_frame.h"
 
-/// @brief 模型配置结构体，仅描述模型语义层通用配置
+/// @brief 妯″瀷閰嶇疆缁撴瀯浣擄紝浠呮弿杩版ā鍨嬭涔夊眰閫氱敤閰嶇疆
 struct ModelConfig {
-    /// @brief 模型名称
+    /// @brief 妯″瀷鍚嶇О
     std::string name{""};
-    /// @brief 是否支持动态形状
+    /// @brief 鏄惁鏀寔鍔ㄦ€佸舰鐘?
     bool dynamic_shape{false};
-    /// @brief 类别数量
+    /// @brief 绫诲埆鏁伴噺
     int class_count{80};
-    /// @brief 业务参数
+    /// @brief 涓氬姟鍙傛暟
     std::map<std::string, std::string> options;
 };
 
-/// @brief 任务类型枚举
+/// @brief 浠诲姟绫诲瀷鏋氫妇
 enum class TaskType {
     DETECT,
     SEGMENT,
@@ -31,43 +31,43 @@ enum class TaskType {
     CLASSIFY
 };
 
-/// @brief 模型元信息
+/// @brief 妯″瀷鍏冧俊鎭?
 struct ModelMeta {
-    /// @brief 模型名称
+    /// @brief 妯″瀷鍚嶇О
     std::string name;
-    /// @brief 任务类型
+    /// @brief 浠诲姟绫诲瀷
     TaskType task{TaskType::DETECT};
-    /// @brief 输入宽度
+    /// @brief 杈撳叆瀹藉害
     int input_width{0};
-    /// @brief 输入高度
+    /// @brief 杈撳叆楂樺害
     int input_height{0};
-    /// @brief 输入像素格式
+    /// @brief 杈撳叆鍍忕礌鏍煎紡
     PixelFormat input_format{PixelFormat::kUnknown};
-    /// @brief 是否动态输入
+    /// @brief 鏄惁鍔ㄦ€佽緭鍏?
     bool dynamic_shape{false};
-    /// @brief 类别数量
+    /// @brief 绫诲埆鏁伴噺
     int class_count{80};
 };
 
-/// @brief 模型语义层接口
+/// @brief 妯″瀷璇箟灞傛帴鍙?
 class IModel {
 public:
     virtual ~IModel() = default;
 
-    /// @brief 初始化模型资源
+    /// @brief 鍒濆鍖栨ā鍨嬭祫婧?
     virtual bool Initialize(const ModelConfig& config) = 0;
-    /// @brief 获取模型元信息
+    /// @brief 鑾峰彇妯″瀷鍏冧俊鎭?
     virtual const ModelMeta& GetModelMeta() const = 0;
-    /// @brief 更新模型元信息，用于推理引擎解析后回写输入形状
+    /// @brief 鏇存柊妯″瀷鍏冧俊鎭紝鐢ㄤ簬鎺ㄧ悊寮曟搸瑙ｆ瀽鍚庡洖鍐欒緭鍏ュ舰鐘?
     virtual bool UpdateModelMeta(const ModelMeta& meta) {
         model_meta_ = meta;
         return true;
     }
-    /// @brief 预处理媒体帧
+    /// @brief 棰勫鐞嗗獟浣撳抚
     virtual TensorFrame Preprocess(const MediaFrame& frame) = 0;
-    /// @brief 后处理模型输出张量
+    /// @brief 鍚庡鐞嗘ā鍨嬭緭鍑哄紶閲?
     virtual FrameResult Postprocess(const TensorFrame& output) = 0;
 
 protected:
-    ModelMeta model_meta_;  ///< 模型参数
+    ModelMeta model_meta_;  ///< 妯″瀷鍙傛暟
 };

@@ -5,7 +5,7 @@
 #include <utility>
 
 #include "inference/inference_logger.h"
-#include "inferenceinfo/result.h"
+#include "info/result.h"
 #include "postprocessor/openvino_postprocessor.h"
 #include "preprocessor/openvino_preprocessor.h"
 

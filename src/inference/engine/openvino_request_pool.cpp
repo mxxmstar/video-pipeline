@@ -1,4 +1,4 @@
-#include "inferenceengine/openvino_request_pool.h"
+#include "engine/openvino_request_pool.h"
 #include "inference/inference_logger.h"
 
 bool OpenVinoInferRequestPool::Initialize(ov::CompiledModel& model, uint32_t request_count) {
