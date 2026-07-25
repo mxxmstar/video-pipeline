@@ -10,6 +10,8 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 }
 
+struct AVAudioFifo;
+
 class FFmpegEncoder : public IEncoder {
 public:
     FFmpegEncoder() = default;
@@ -35,6 +37,9 @@ public:
 private:
     // 从编码器中循环取出所有已编码包
     bool ReceivePackets(std::vector<PacketPtr>& packets);
+    bool EncodeAudioFrame(FramePtr frame, std::vector<PacketPtr>& packets);
+    bool SendFrameToEncoder(AVFrame* frame, std::vector<PacketPtr>& packets);
+    AVFrame* AllocateAudioEncoderFrame(int nb_samples) const;
     // 查找视频编码器
     const AVCodec* FindVideoEncoder(AVCodecID codec_id, AVPixelFormat input_fmt,
                                     const std::string& encoder_name,
@@ -51,6 +56,7 @@ private:
     AVFrame* BuildInputFrame(const FramePtr& frame);
     // 将一个 AVFrame 拷贝到另一个 AVFrame（支持格式转换）
     bool CopyAVFrameToAVFrame(const AVFrame* src, AVFrame* dst) const;
+    bool ConvertAudioFrameToAVFrame(const AVFrame* src, AVFrame* dst) const;
     // 将 MediaFrame 的数据拷贝到 AVFrame（视频）
     bool CopyPackedFrameToAVFrame(const MediaFrame& src, AVFrame* dst) const;
     // 将 MediaFrame 的数据拷贝到 AVFrame（音频）
@@ -65,4 +71,6 @@ private:
     AVSampleFormat input_sample_fmt_{AV_SAMPLE_FMT_NONE};   // 输入采样格式（音频）
     AVSampleFormat encoder_sample_fmt_{AV_SAMPLE_FMT_NONE};  // 编码器实际使用的采样格式（音频）
     int64_t next_pts_{0};                // 自动递增的 PTS 计数器
+    AVAudioFifo* audio_fifo_{nullptr};
+    int64_t next_audio_pts_{-1};
 };

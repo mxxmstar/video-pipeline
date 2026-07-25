@@ -18,6 +18,16 @@ else()
 endif()
 add_test(NAME test_publisher_protocol COMMAND test_publisher_protocol)
 
+add_executable(test_ffmpeg_audio_encoder test_ffmpeg_audio_encoder.cpp)
+target_link_libraries(test_ffmpeg_audio_encoder PRIVATE video_pipeline_lib)
+video_pipeline_copy_runtime_dlls(test_ffmpeg_audio_encoder)
+if(MSVC)
+    target_compile_options(test_ffmpeg_audio_encoder PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_ffmpeg_audio_encoder PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_ffmpeg_audio_encoder COMMAND test_ffmpeg_audio_encoder)
+
 add_executable(test_rtsp_server_publisher test_rtsp_server_publisher.cpp)
 target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_lib)
 target_compile_definitions(test_rtsp_server_publisher

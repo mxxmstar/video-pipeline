@@ -106,7 +106,6 @@ PublisherConfig MakeAudioVideoConfig(std::uint16_t port,
     audio_track.channels = 2;
     audio_track.time_base_num = 1;
     audio_track.time_base_den = 1000000;
-    audio_track.rtp_payload_type = 97;
     audio_track.rtp_clock_rate = 48000;
     // AAC-LC, 48kHz, stereo AudioSpecificConfig。
     audio_track.extra_data = {0x11, 0x90};
@@ -669,6 +668,7 @@ private:
 // 摄像头链路同时发布到两个目标，状态集中放在这里，便于回调和主循环共享。
 struct CameraAvPipelineState {
     std::unique_ptr<FFmpegEncoder> video_encoder;
+    std::unique_ptr<FFmpegEncoder> audio_encoder;
     std::unique_ptr<IPublisher> zlm_publisher;
     std::unique_ptr<IPublisher> rtsp_server_publisher;
     std::deque<MediaPacket> pending_audio_packets;
@@ -676,11 +676,16 @@ struct CameraAvPipelineState {
     int fps{kManualFallbackFps};
     int64_t frame_duration_us{1'000'000 / kManualFallbackFps};
     int64_t next_audio_pts_us{0};
+    int64_t next_zlm_audio_pts_us{0};
+    int64_t next_zlm_audio_packet_pts_us{0};
+    int64_t zlm_audio_packet_duration_us{0};
     int decoded_video_frames{0};
     int decoded_audio_frames{0};
     int encoded_video_packets{0};
+    int encoded_audio_packets{0};
     int published_video_packets{0};
     int published_audio_packets{0};
+    int published_zlm_audio_packets{0};
     int read_video_packets{0};
     int read_audio_packets{0};
     bool initialized{false};
@@ -786,8 +791,36 @@ bool PublishCameraVideoPackets(CameraAvPipelineState& state,
     return true;
 }
 
+bool PublishCameraZlmAudioPackets(CameraAvPipelineState& state,
+                                  std::vector<PacketPtr>& packets,
+                                  int64_t fallback_duration_us) {
+    for (auto& packet : packets) {
+        if (!packet) {
+            continue;
+        }
+
+        packet->stream_index = 1;
+        packet->time_base = Rational{1, 1'000'000};
+        packet->pts = state.next_zlm_audio_packet_pts_us;
+        packet->dts = packet->pts;
+        packet->duration = state.zlm_audio_packet_duration_us > 0
+            ? state.zlm_audio_packet_duration_us
+            : (fallback_duration_us > 0 ? fallback_duration_us : 20'000);
+        state.next_zlm_audio_packet_pts_us += packet->duration;
+
+        if (!state.zlm_publisher->Publish(*packet)) {
+            state.error = "failed to publish encoded AAC audio packet to ZLMediaKit";
+            return false;
+        }
+        ++state.encoded_audio_packets;
+        ++state.published_zlm_audio_packets;
+    }
+    return true;
+}
+
 PublisherConfig MakeCameraZlmPublisherConfig(const std::string& zlm_push_url,
-                                             const MediaTrackConfig& video_track) {
+                                             const MediaTrackConfig& video_track,
+                                             const MediaTrackConfig& audio_track) {
     PublisherConfig config;
     config.mode = PublishMode::PushClient;
     config.protocol = PublishProtocol::FfmpegMux;
@@ -795,6 +828,7 @@ PublisherConfig MakeCameraZlmPublisherConfig(const std::string& zlm_push_url,
     config.ffmpeg.format_name = "rtsp";
     config.ffmpeg.rtsp_transport = "tcp";
     config.tracks.push_back(video_track);
+    config.tracks.push_back(audio_track);
     return config;
 }
 
@@ -869,22 +903,59 @@ bool InitializeCameraAvPublishers(CameraAvPipelineState& state,
     video_track.rtp_clock_rate = 90000;
 
     const auto& audio_info = audio_stream_info.get_detail<AudioStreamInfo>();
-    MediaTrackConfig audio_track;
-    audio_track.track_id = 1;
-    audio_track.media_type = MediaType::AUDIO;
-    audio_track.codec_type = audio_stream_info.codec_type;
-    audio_track.sample_rate = audio_info.sample_rate;
-    audio_track.channels = audio_info.channels;
-    audio_track.time_base_num = 1;
-    audio_track.time_base_den = 1'000'000;
-    // 16k PCMA/PCMU 不能使用 RTP 静态负载类型 8/0，这里固定使用动态负载类型。
-    audio_track.rtp_payload_type = 97;
-    audio_track.rtp_clock_rate = static_cast<std::uint32_t>(audio_info.sample_rate);
+    EncoderConfig audio_encoder_config;
+    audio_encoder_config.media_type = MediaType::AUDIO;
+    audio_encoder_config.codec_type = CodecType::AAC;
+    audio_encoder_config.audio.sample_rate = audio_info.sample_rate;
+    audio_encoder_config.audio.channels = audio_info.channels;
+    audio_encoder_config.audio.channel_layout = audio_info.channel_layout;
+    audio_encoder_config.audio.sample_format = SampleFormat::S16;
+    audio_encoder_config.bitrate = 64'000;
+    audio_encoder_config.time_base_num = 1;
+    audio_encoder_config.time_base_den = 1'000'000;
+    audio_encoder_config.encoder_name = "aac";
+    audio_encoder_config.global_header = true;
+
+    state.audio_encoder = std::make_unique<FFmpegEncoder>();
+    if (!state.audio_encoder->Open(audio_encoder_config)) {
+        state.error = "failed to open AAC audio encoder";
+        return false;
+    }
+    // 16 kHz PCMA/PCMU cannot use static payload type 8/0.
+    MediaTrackConfig local_audio_track;
+    local_audio_track.track_id = 1;
+    local_audio_track.media_type = MediaType::AUDIO;
+    local_audio_track.codec_type = audio_stream_info.codec_type;
+    local_audio_track.sample_rate = audio_info.sample_rate;
+    local_audio_track.channels = audio_info.channels;
+    local_audio_track.time_base_num = 1;
+    local_audio_track.time_base_den = 1'000'000;
+    // 16 kHz PCMA/PCMU cannot use static payload type 8/0.
+    local_audio_track.rtp_payload_type = 97;
+    local_audio_track.rtp_clock_rate =
+        static_cast<std::uint32_t>(audio_info.sample_rate);
+
+    MediaTrackConfig zlm_audio_track;
+    zlm_audio_track.track_id = 1;
+    zlm_audio_track.media_type = MediaType::AUDIO;
+    zlm_audio_track.codec_type = CodecType::AAC;
+    zlm_audio_track.sample_rate = audio_info.sample_rate;
+    zlm_audio_track.channels = audio_info.channels;
+    zlm_audio_track.time_base_num = audio_encoder_config.time_base_num;
+    zlm_audio_track.time_base_den = audio_encoder_config.time_base_den;
+    zlm_audio_track.extra_data = state.audio_encoder->GetExtraData();
+    state.zlm_audio_packet_duration_us =
+        audio_info.sample_rate > 0
+            ? 1024LL * 1'000'000LL / audio_info.sample_rate
+            : 64'000;
 
     const std::string zlm_push_url =
         "rtsp://127.0.0.1:" + std::to_string(kZlmRtspPort) + kManualZlmStreamPath;
-    auto zlm_config = MakeCameraZlmPublisherConfig(zlm_push_url, video_track);
-    auto rtsp_config = MakeCameraRtspServerPublisherConfig(video_track, audio_track);
+    auto zlm_config = MakeCameraZlmPublisherConfig(zlm_push_url,
+                                                   video_track,
+                                                   zlm_audio_track);
+    auto rtsp_config =
+        MakeCameraRtspServerPublisherConfig(video_track, local_audio_track);
 
     state.zlm_publisher = IPublisher::Create(zlm_config);
     if (!state.zlm_publisher || !state.zlm_publisher->Start(zlm_config)) {
@@ -902,10 +973,10 @@ bool InitializeCameraAvPublishers(CameraAvPipelineState& state,
     state.initialized = true;
     std::cout << "Manual camera pipeline initialized: video="
               << width << "x" << height << " @" << state.fps
-              << "fps, audio=G711 "
+              << "fps, local_audio=G711, zlm_audio=AAC "
               << audio_info.sample_rate << "Hz/" << audio_info.channels
               << "ch\n";
-    std::cout << "Pushing video to ZLMediaKit: " << zlm_push_url << "\n";
+    std::cout << "Pushing audio/video to ZLMediaKit: " << zlm_push_url << "\n";
     std::cout << "Local RTSP play URL: "
               << state.rtsp_server_publisher->GetPlayUrl() << "\n";
     return FlushPendingCameraAudio(state);
@@ -1019,8 +1090,37 @@ void TestCameraAudioVideoDecodeEncodePublish() {
     });
 
     audio_decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
-        if (!state.failed && frame && frame->type == MediaType::AUDIO) {
-            ++state.decoded_audio_frames;
+        if (state.failed || !frame || frame->type != MediaType::AUDIO) {
+            return;
+        }
+
+        ++state.decoded_audio_frames;
+        if (!state.initialized || !state.audio_encoder) {
+            return;
+        }
+
+        const int sample_rate = frame->SampleRate() > 0
+            ? frame->SampleRate()
+            : audio_detail.sample_rate;
+        const int nb_samples = frame->NbSamples() > 0
+            ? frame->NbSamples()
+            : sample_rate / 50;
+        const int64_t duration_us = sample_rate > 0
+            ? static_cast<int64_t>(nb_samples) * 1'000'000LL / sample_rate
+            : 20'000;
+        frame->time.pts_us = state.next_zlm_audio_pts_us;
+        frame->time.dts_us = frame->time.pts_us;
+        frame->time.duration_us = duration_us;
+        state.next_zlm_audio_pts_us += duration_us;
+
+        std::vector<PacketPtr> encoded;
+        if (!state.audio_encoder->Encode(std::move(frame), encoded)) {
+            state.failed = true;
+            state.error = "failed to encode AAC audio frame";
+            return;
+        }
+        if (!PublishCameraZlmAudioPackets(state, encoded, duration_us)) {
+            state.failed = true;
         }
     });
 
@@ -1079,7 +1179,10 @@ void TestCameraAudioVideoDecodeEncodePublish() {
                       << ", decoded_video=" << state.decoded_video_frames
                       << ", decoded_audio=" << state.decoded_audio_frames
                       << ", published_video=" << state.published_video_packets
-                      << ", published_audio=" << state.published_audio_packets << "\n";
+                      << ", published_audio=" << state.published_audio_packets
+                      << ", encoded_aac=" << state.encoded_audio_packets
+                      << ", published_zlm_audio="
+                      << state.published_zlm_audio_packets << "\n";
         }
     }
 
@@ -1091,6 +1194,9 @@ void TestCameraAudioVideoDecodeEncodePublish() {
     }
     if (state.video_encoder) {
         state.video_encoder->Close();
+    }
+    if (state.audio_encoder) {
+        state.audio_encoder->Close();
     }
     audio_decoder.Close();
     video_decoder.Close();
