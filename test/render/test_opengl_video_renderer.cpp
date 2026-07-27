@@ -14,6 +14,7 @@
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/puller/ffmpeg_puller.h"
 #include "media/simple_buffer.h"
+#include "render/audio/wasapi_audio_renderer.h"
 
 namespace {
 
@@ -31,6 +32,7 @@ struct CameraAvRenderState {
     std::unique_ptr<FFmpegEncoder> video_encoder;
     std::unique_ptr<FFmpegEncoder> audio_encoder;
     std::unique_ptr<render::OpenGLVideoRenderer> renderer;
+    std::unique_ptr<render::audio::WasapiAudioRenderer> audio_renderer;
 
     int fps{kManualFallbackFps};
     int64_t frame_duration_us{1'000'000 / kManualFallbackFps};
@@ -40,6 +42,7 @@ struct CameraAvRenderState {
     int encoded_video_packets{0};
     int encoded_audio_packets{0};
     int rendered_video_frames{0};
+    int rendered_audio_frames{0};
     int read_video_packets{0};
     int read_audio_packets{0};
     bool initialized{false};
@@ -142,6 +145,17 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
     state.renderer = std::make_unique<render::OpenGLVideoRenderer>();
     if (!state.renderer->Init(render_config)) {
         state.error = "failed to initialize OpenGL renderer";
+        return false;
+    }
+
+    render::audio::AudioRenderConfig audio_render_config;
+    audio_render_config.buffer_duration_ms = 100;
+    audio_render_config.fail_if_device_unavailable = true;
+
+    state.audio_renderer = std::make_unique<render::audio::WasapiAudioRenderer>();
+    if (!state.audio_renderer->Init(audio_render_config)) {
+        state.error = "failed to initialize WASAPI audio renderer: " +
+                      state.audio_renderer->LastError();
         return false;
     }
 
@@ -352,6 +366,16 @@ int TestCameraAudioVideoDecodeEncodeRender() {
         frame->time.duration_us = duration_us;
         state.next_audio_pts_us += duration_us;
 
+        if (!state.audio_renderer || !state.audio_renderer->Render(*frame)) {
+            state.failed = true;
+            state.error = state.audio_renderer
+                ? "failed to render decoded audio frame: " +
+                      state.audio_renderer->LastError()
+                : "audio renderer is not initialized";
+            return;
+        }
+        ++state.rendered_audio_frames;
+
         std::vector<PacketPtr> encoded;
         if (!state.audio_encoder->Encode(std::move(frame), encoded)) {
             state.failed = true;
@@ -416,6 +440,7 @@ int TestCameraAudioVideoDecodeEncodeRender() {
                       << ", decoded_video=" << state.decoded_video_frames
                       << ", decoded_audio=" << state.decoded_audio_frames
                       << ", rendered_video=" << state.rendered_video_frames
+                      << ", rendered_audio=" << state.rendered_audio_frames
                       << ", encoded_video_packets=" << state.encoded_video_packets
                       << ", encoded_audio_packets=" << state.encoded_audio_packets
                       << "\n";
@@ -424,6 +449,9 @@ int TestCameraAudioVideoDecodeEncodeRender() {
 
     if (state.renderer) {
         state.renderer->Shutdown();
+    }
+    if (state.audio_renderer) {
+        state.audio_renderer->Shutdown();
     }
     if (state.video_encoder) {
         state.video_encoder->Close();
@@ -442,6 +470,7 @@ int TestCameraAudioVideoDecodeEncodeRender() {
 
     std::cout << "Camera decode/encode/render stopped: rendered_video="
               << state.rendered_video_frames
+              << ", rendered_audio=" << state.rendered_audio_frames
               << ", encoded_video_packets=" << state.encoded_video_packets
               << ", encoded_audio_packets=" << state.encoded_audio_packets << "\n";
     return 0;
