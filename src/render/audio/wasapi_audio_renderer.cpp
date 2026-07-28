@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <system_error>
 #include <string>
+#include <thread>
 #include <utility>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -89,12 +91,18 @@ WasapiAudioRenderer::~WasapiAudioRenderer() {
 bool WasapiAudioRenderer::Init(const AudioRenderConfig& config) {
     Shutdown();
     config_ = config;
-    last_error_.clear();
+    {
+        std::lock_guard<std::mutex> lock(error_mutex_);
+        last_error_.clear();
+    }
 
     if (!InitializeCom() || !InitializeDevice() || !InitializeResampler()) {
         ReleaseResources();
         return false;
     }
+
+    pcm_queue_ = std::make_unique<BoundedMpmcQueue<PcmChunk>>(
+        static_cast<std::size_t>(std::max(2, config_.queue_capacity_chunks)));
 
     std::uint8_t* silence = nullptr;
     HRESULT hr = render_client_->GetBuffer(buffer_frame_count_, &silence);
@@ -106,6 +114,11 @@ bool WasapiAudioRenderer::Init(const AudioRenderConfig& config) {
     hr = render_client_->ReleaseBuffer(buffer_frame_count_, AUDCLNT_BUFFERFLAGS_SILENT);
     if (FAILED(hr)) {
         SetError("IAudioRenderClient::ReleaseBuffer failed: " + HResultString(hr));
+        ReleaseResources();
+        return false;
+    }
+
+    if (!StartAudioThread()) {
         ReleaseResources();
         return false;
     }
@@ -135,14 +148,15 @@ bool WasapiAudioRenderer::Render(const MediaFrame& frame) {
     }
 
     if (!first_pts_set_) {
-        first_pts_us_ = pcm.pts_us;
-        first_pts_set_ = true;
+        first_pts_us_.store(pcm.pts_us);
+        first_pts_set_.store(true);
     }
-    return WritePcm(pcm);
+    return EnqueuePcm(std::move(pcm));
 }
 
 void WasapiAudioRenderer::Shutdown() {
     ReleaseResources();
+    std::lock_guard<std::mutex> lock(error_mutex_);
     last_error_.clear();
 }
 
@@ -152,8 +166,27 @@ int64_t WasapiAudioRenderer::PlayedPtsUs() const {
     }
 
     const auto padding = CurrentPaddingFrames();
-    const auto played_frames = std::max<int64_t>(0, submitted_frames_.load() - padding);
-    return first_pts_us_ + played_frames * 1'000'000LL / sample_rate_;
+    const auto device_played_frames =
+        std::max<int64_t>(0, played_frames_.load() - std::max(0, padding));
+    return first_pts_us_.load() + device_played_frames * 1'000'000LL / sample_rate_;
+}
+
+AudioRenderStats WasapiAudioRenderer::GetStats() const {
+    AudioRenderStats stats;
+    stats.submitted_pcm_frames = submitted_frames_.load();
+    stats.queued_pcm_frames = std::max<int64_t>(0, queued_frames_.load());
+    stats.played_pcm_frames = played_frames_.load();
+    stats.dropped_pcm_frames = dropped_frames_.load();
+    stats.dropped_pcm_chunks = dropped_chunks_.load();
+    stats.underruns = underruns_.load();
+    stats.queued_pcm_chunks =
+        static_cast<std::size_t>(std::max<int64_t>(0, queued_chunks_.load()));
+    return stats;
+}
+
+std::string WasapiAudioRenderer::LastError() const {
+    std::lock_guard<std::mutex> lock(error_mutex_);
+    return last_error_;
 }
 
 bool WasapiAudioRenderer::InitializeCom() {
@@ -264,55 +297,171 @@ bool WasapiAudioRenderer::InitializeResampler() {
     return resampler_.Open(config);
 }
 
-bool WasapiAudioRenderer::WritePcm(const filter::audio::PcmFrame& pcm) {
+bool WasapiAudioRenderer::StartAudioThread() {
+    stop_audio_thread_.store(false);
+    try {
+        audio_thread_ = std::thread(&WasapiAudioRenderer::AudioThreadMain, this);
+    } catch (const std::system_error& error) {
+        SetError(std::string("failed to start WASAPI audio thread: ") + error.what());
+        return false;
+    }
+    return true;
+}
+
+void WasapiAudioRenderer::StopAudioThread() {
+    stop_audio_thread_.store(true);
+    WakeAudioThread();
+    if (audio_thread_.joinable()) {
+        audio_thread_.join();
+    }
+}
+
+void WasapiAudioRenderer::AudioThreadMain() {
+    const HRESULT com_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool thread_com_initialized = SUCCEEDED(com_hr);
+
+    PcmChunk active_chunk;
+    std::uint32_t active_frame_offset = 0;
+    while (!stop_audio_thread_.load()) {
+        WaitForSingleObject(static_cast<HANDLE>(buffer_event_), 20);
+        if (stop_audio_thread_.load()) {
+            break;
+        }
+        if (!FillWasapiBuffer(active_chunk, active_frame_offset)) {
+            break;
+        }
+    }
+
+    if (thread_com_initialized) {
+        CoUninitialize();
+    }
+}
+
+bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
+                                           std::uint32_t& active_frame_offset) {
+    const auto padding = CurrentPaddingFrames();
+    if (padding < 0) {
+        SetError("IAudioClient::GetCurrentPadding failed");
+        return false;
+    }
+    const auto available_frames =
+        buffer_frame_count_ > static_cast<std::uint32_t>(padding)
+            ? buffer_frame_count_ - static_cast<std::uint32_t>(padding)
+            : 0;
+    if (available_frames == 0) {
+        return true;
+    }
+
+    std::uint8_t* dst = nullptr;
+    HRESULT hr = render_client_->GetBuffer(available_frames, &dst);
+    if (FAILED(hr)) {
+        SetError("IAudioRenderClient::GetBuffer failed: " + HResultString(hr));
+        return false;
+    }
+
+    std::uint32_t written_frames = 0;
+    bool wrote_silence = false;
+    while (written_frames < available_frames) {
+        if (active_frame_offset >= active_chunk.nb_samples) {
+            active_chunk = {};
+            active_frame_offset = 0;
+            if (pcm_queue_ && pcm_queue_->pop(active_chunk)) {
+                queued_frames_ -= active_chunk.nb_samples;
+                queued_chunks_ -= 1;
+            }
+        }
+
+        if (active_frame_offset < active_chunk.nb_samples) {
+            const auto frames_from_chunk = std::min<std::uint32_t>(
+                available_frames - written_frames,
+                active_chunk.nb_samples - active_frame_offset);
+            std::memcpy(
+                dst + static_cast<std::size_t>(written_frames) * bytes_per_frame_,
+                active_chunk.data.data() +
+                    static_cast<std::size_t>(active_frame_offset) * bytes_per_frame_,
+                static_cast<std::size_t>(frames_from_chunk) * bytes_per_frame_);
+            active_frame_offset += frames_from_chunk;
+            written_frames += frames_from_chunk;
+            continue;
+        }
+
+        const auto silence_frames = available_frames - written_frames;
+        std::memset(dst + static_cast<std::size_t>(written_frames) * bytes_per_frame_,
+                    0,
+                    static_cast<std::size_t>(silence_frames) * bytes_per_frame_);
+        written_frames += silence_frames;
+        wrote_silence = true;
+        ++underruns_;
+    }
+
+    hr = render_client_->ReleaseBuffer(available_frames, 0);
+    if (FAILED(hr)) {
+        SetError("IAudioRenderClient::ReleaseBuffer failed: " + HResultString(hr));
+        return false;
+    }
+
+    played_frames_ += available_frames;
+    if (wrote_silence) {
+        WakeAudioThread();
+    }
+    return true;
+}
+
+bool WasapiAudioRenderer::EnqueuePcm(filter::audio::PcmFrame&& pcm) {
     if (pcm.Empty() || pcm.sample_rate != sample_rate_ ||
         pcm.channels != channels_ || pcm.BytesPerFrame() != bytes_per_frame_) {
         SetError("PCM frame does not match WASAPI mix format");
         return false;
     }
 
-    const auto* src = pcm.data.data();
-    std::uint32_t remaining_frames = static_cast<std::uint32_t>(pcm.nb_samples);
-    std::uint32_t frame_offset = 0;
+    PcmChunk chunk;
+    chunk.data = std::move(pcm.data);
+    chunk.nb_samples = static_cast<std::uint32_t>(pcm.nb_samples);
+    chunk.pts_us = pcm.pts_us;
+    chunk.duration_us = pcm.duration_us;
+    const auto chunk_frames = chunk.nb_samples;
 
-    while (remaining_frames > 0) {
-        const auto padding = CurrentPaddingFrames();
-        if (padding < 0) {
-            return false;
-        }
-        const auto available_frames =
-            buffer_frame_count_ > static_cast<std::uint32_t>(padding)
-                ? buffer_frame_count_ - static_cast<std::uint32_t>(padding)
-                : 0;
+    submitted_frames_ += chunk_frames;
 
-        if (available_frames == 0) {
-            WaitForSingleObject(static_cast<HANDLE>(buffer_event_), 20);
-            continue;
-        }
-
-        const auto frames_to_write = std::min(remaining_frames, available_frames);
-        std::uint8_t* dst = nullptr;
-        HRESULT hr = render_client_->GetBuffer(frames_to_write, &dst);
-        if (FAILED(hr)) {
-            SetError("IAudioRenderClient::GetBuffer failed: " + HResultString(hr));
-            return false;
-        }
-
-        std::memcpy(dst,
-                    src + static_cast<std::size_t>(frame_offset) * bytes_per_frame_,
-                    static_cast<std::size_t>(frames_to_write) * bytes_per_frame_);
-
-        hr = render_client_->ReleaseBuffer(frames_to_write, 0);
-        if (FAILED(hr)) {
-            SetError("IAudioRenderClient::ReleaseBuffer failed: " + HResultString(hr));
-            return false;
-        }
-
-        submitted_frames_ += frames_to_write;
-        frame_offset += frames_to_write;
-        remaining_frames -= frames_to_write;
+    if (!pcm_queue_) {
+        DropUnqueuedChunkStats(chunk);
+        return true;
     }
+
+    if (pcm_queue_->try_push(chunk)) {
+        queued_frames_ += chunk_frames;
+        queued_chunks_ += 1;
+        WakeAudioThread();
+        return true;
+    }
+
+    PcmChunk dropped;
+    if (pcm_queue_->pop(dropped)) {
+        DropQueuedChunkStats(dropped);
+    }
+
+    if (pcm_queue_->try_push(std::move(chunk))) {
+        queued_frames_ += chunk_frames;
+        queued_chunks_ += 1;
+        WakeAudioThread();
+        return true;
+    }
+
+    dropped_frames_ += chunk_frames;
+    dropped_chunks_ += 1;
     return true;
+}
+
+void WasapiAudioRenderer::DropQueuedChunkStats(const PcmChunk& chunk) {
+    dropped_frames_ += chunk.nb_samples;
+    dropped_chunks_ += 1;
+    queued_frames_ -= chunk.nb_samples;
+    queued_chunks_ -= 1;
+}
+
+void WasapiAudioRenderer::DropUnqueuedChunkStats(const PcmChunk& chunk) {
+    dropped_frames_ += chunk.nb_samples;
+    dropped_chunks_ += 1;
 }
 
 int WasapiAudioRenderer::CurrentPaddingFrames() const {
@@ -327,11 +476,19 @@ int WasapiAudioRenderer::CurrentPaddingFrames() const {
     return static_cast<int>(padding);
 }
 
+void WasapiAudioRenderer::WakeAudioThread() {
+    if (buffer_event_) {
+        SetEvent(static_cast<HANDLE>(buffer_event_));
+    }
+}
+
 void WasapiAudioRenderer::SetError(std::string message) {
+    std::lock_guard<std::mutex> lock(error_mutex_);
     last_error_ = std::move(message);
 }
 
 void WasapiAudioRenderer::ReleaseResources() {
+    StopAudioThread();
     if (audio_client_ && started_) {
         audio_client_->Stop();
     }
@@ -356,7 +513,17 @@ void WasapiAudioRenderer::ReleaseResources() {
         com_initialized_ = false;
     }
 
+    if (pcm_queue_) {
+        pcm_queue_->clear();
+        pcm_queue_.reset();
+    }
     submitted_frames_ = 0;
+    queued_frames_ = 0;
+    queued_chunks_ = 0;
+    played_frames_ = 0;
+    dropped_frames_ = 0;
+    dropped_chunks_ = 0;
+    underruns_ = 0;
     first_pts_us_ = 0;
     first_pts_set_ = false;
     sample_rate_ = 0;

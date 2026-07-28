@@ -80,6 +80,7 @@ struct FakeAudioState {
     std::vector<std::int64_t> rendered_pts;
     std::thread::id init_thread;
     std::thread::id shutdown_thread;
+    render::audio::AudioRenderStats stats;
     bool shutdown{false};
 };
 
@@ -98,6 +99,11 @@ public:
     bool Render(const MediaFrame& frame) override {
         std::lock_guard<std::mutex> lock(state_->mutex);
         state_->rendered_pts.push_back(frame.time.pts_us);
+        state_->stats.submitted_pcm_frames += 160;
+        state_->stats.queued_pcm_frames = 80;
+        state_->stats.dropped_pcm_frames = 40;
+        state_->stats.underruns = 2;
+        state_->stats.queued_pcm_chunks = 1;
         state_->cv.notify_all();
         return true;
     }
@@ -112,6 +118,11 @@ public:
     std::int64_t PlayedPtsUs() const override {
         std::lock_guard<std::mutex> lock(state_->mutex);
         return state_->rendered_pts.empty() ? 0 : state_->rendered_pts.back();
+    }
+
+    render::audio::AudioRenderStats GetStats() const override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        return state_->stats;
     }
 
 private:
@@ -280,6 +291,10 @@ bool TestPauseResumeAndAudioDispatch() {
     return resumed && closed &&
            stats.submitted_audio_frames == 1 &&
            stats.rendered_audio_frames == 1 &&
+           stats.audio_underruns == 2 &&
+           stats.audio_dropped_pcm_frames == 40 &&
+           stats.audio_renderer_queue_size == 1 &&
+           stats.audio_renderer_queued_frames == 80 &&
            stats.submitted_video_frames == 1 &&
            stats.rendered_video_frames == 1 &&
            audio_state->shutdown && audio_thread_affinity_ok;

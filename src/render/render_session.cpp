@@ -249,6 +249,13 @@ public:
         RenderStats snapshot = stats_;
         snapshot.video_queue_size = video_queue_.size();
         snapshot.audio_queue_size = audio_queue_.size();
+        if (audio_renderer_ && audio_available_) {
+            const auto audio_stats = audio_renderer_->GetStats();
+            snapshot.audio_underruns = audio_stats.underruns;
+            snapshot.audio_dropped_pcm_frames = audio_stats.dropped_pcm_frames;
+            snapshot.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
+            snapshot.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
+        }
         snapshot.playback_pts_us = clock_.PositionUs();
         return snapshot;
     }
@@ -335,6 +342,11 @@ private:
             } else if (audio_frame) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.rendered_audio_frames;
+                const auto audio_stats = audio_renderer_->GetStats();
+                stats_.audio_underruns = audio_stats.underruns;
+                stats_.audio_dropped_pcm_frames = audio_stats.dropped_pcm_frames;
+                stats_.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
+                stats_.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
                 stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
                 clock_.SetPositionUs(stats_.playback_pts_us);
             }

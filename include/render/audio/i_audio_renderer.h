@@ -4,6 +4,7 @@
 
 #include "media/media_frame.h"
 #include "render/audio/audio_render_config.h"
+#include "render/audio/audio_render_stats.h"
 
 namespace render::audio {
 
@@ -16,6 +17,9 @@ public:
     virtual void Shutdown() = 0;
 
     virtual int64_t PlayedPtsUs() const = 0;
+    virtual AudioRenderStats GetStats() const {
+        return {};
+    }
 };
 
 } // namespace render::audio

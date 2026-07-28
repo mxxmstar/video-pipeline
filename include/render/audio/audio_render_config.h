@@ -8,6 +8,7 @@ namespace render::audio {
 /// WASAPI mix format 决定，filter/audio 会负责把解码帧转换到该格式。
 struct AudioRenderConfig {
     int buffer_duration_ms{100};
+    int queue_capacity_chunks{16};
     bool fail_if_device_unavailable{false};
 };
 

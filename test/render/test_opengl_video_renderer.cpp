@@ -141,6 +141,7 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
     render_config.video.vsync = false;
     render_config.video.close_on_escape = true;
     render_config.audio.buffer_duration_ms = 100;
+    render_config.audio.queue_capacity_chunks = 16;
     render_config.audio.fail_if_device_unavailable = true;
     render_config.enable_video = true;
     render_config.enable_audio = true;
@@ -465,8 +466,12 @@ int TestCameraAudioVideoDecodeEncodeRender() {
                       << ", rendered_audio=" << stats.rendered_audio_frames
                       << ", dropped_video=" << stats.dropped_video_frames
                       << ", dropped_audio=" << stats.dropped_audio_frames
+                      << ", audio_underruns=" << stats.audio_underruns
+                      << ", audio_pcm_dropped=" << stats.audio_dropped_pcm_frames
                       << ", video_queue=" << stats.video_queue_size
                       << ", audio_queue=" << stats.audio_queue_size
+                      << ", audio_renderer_queue=" << stats.audio_renderer_queue_size
+                      << ", audio_renderer_frames=" << stats.audio_renderer_queued_frames
                       << ", encoded_video_packets=" << state.encoded_video_packets
                       << ", encoded_audio_packets=" << state.encoded_audio_packets
                       << "\n";
@@ -498,6 +503,8 @@ int TestCameraAudioVideoDecodeEncodeRender() {
               << ", rendered_audio=" << render_stats.rendered_audio_frames
               << ", dropped_video=" << render_stats.dropped_video_frames
               << ", dropped_audio=" << render_stats.dropped_audio_frames
+              << ", audio_underruns=" << render_stats.audio_underruns
+              << ", audio_pcm_dropped=" << render_stats.audio_dropped_pcm_frames
               << ", encoded_video_packets=" << state.encoded_video_packets
               << ", encoded_audio_packets=" << state.encoded_audio_packets << "\n";
     return 0;

@@ -19,6 +19,14 @@ public:
         return queue_.enqueue(std::move(item));
     }
 
+    bool try_push(const T& item) {
+        return queue_.try_enqueue(item);
+    }
+
+    bool try_push(T&& item) {
+        return queue_.try_enqueue(std::move(item));
+    }
+
     bool pop(T& item) {
         return queue_.try_dequeue(item);
     }
@@ -33,6 +41,11 @@ public:
 
     size_t capacity() const {
         return capacity_;
+    }
+
+    void clear() {
+        T item;
+        while (queue_.try_dequeue(item)) {}
     }
 
 private:

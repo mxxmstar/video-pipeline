@@ -446,3 +446,24 @@ P3：
 2. 让 `IAudioRenderer::Render()` 快速入队，避免同步等待声卡 buffer。
 3. 增加 queued frames、underrun、dropped samples 和稳定 played PTS 统计。
 4. 保持 `RenderSession` 的公开提交接口不变，只替换音频 renderer 内部实现。
+
+## 阶段 3 实施记录
+
+实施状态：已完成第一版落地（2026-07-28）。
+
+本阶段实际完成内容：
+1. `WasapiAudioRenderer::Render()` 已从同步写 WASAPI 改为“重采样后快速写入内部 PCM 队列”。
+2. WASAPI 写声卡动作移动到 renderer 内部音频线程，由 event callback 节奏驱动。
+3. PCM 队列复用 `common/queue` 中的 moodycamel 队列封装，并为 `BoundedMpmcQueue` 增加 `try_push()` 和 `clear()`，用于有界入队与停机清理。
+4. 队列满时优先丢弃旧 PCM chunk，再尝试写入新 chunk，预览场景下优先控制实时性。
+5. 声卡可写但 PCM 数据不足时写入静音，并累计 `audio_underruns`。
+6. 新增 `AudioRenderStats`，把 `queued_pcm_frames`、`queued_pcm_chunks`、`dropped_pcm_frames`、`underruns` 等内部状态汇总到 `RenderSession::GetStats()`。
+7. `test_opengl_video_renderer --camera` 的周期日志增加音频内部队列、PCM 丢弃和 underrun 统计，便于定位声音异常。
+8. `test_render_session` 使用 fake audio renderer 覆盖音频 renderer 内部统计向 session 汇总的行为。
+
+本阶段仍需真实设备手动确认：
+1. 使用 `test_opengl_video_renderer --camera` 观察声音是否从明显卡顿/爆音改善为稳定播放。
+2. 观察 `audio_underruns` 是否持续增长；如果持续增长，下一步应调整 camera 测试中的编码覆盖耗时、WASAPI buffer 时长或队列容量。
+3. 长时间预览时观察 `audio_renderer_queue_size` 是否稳定在较低范围，避免延迟持续累积。
+
+推荐下一步：进入阶段 4，实现以音频播放时钟为 master 的视频 PTS 调度、晚帧丢弃和早帧等待。

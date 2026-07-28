@@ -16,9 +16,12 @@ struct RenderStats {
     std::int64_t dropped_video_frames{0};
     std::int64_t dropped_audio_frames{0};
     std::int64_t audio_underruns{0};
+    std::int64_t audio_dropped_pcm_frames{0};
     std::int64_t playback_pts_us{0};
     std::size_t video_queue_size{0};
     std::size_t audio_queue_size{0};
+    std::size_t audio_renderer_queue_size{0};
+    std::int64_t audio_renderer_queued_frames{0};
 };
 
 } // namespace render
