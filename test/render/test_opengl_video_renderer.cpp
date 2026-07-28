@@ -1,12 +1,14 @@
-#include "render/opengl_video_renderer.h"
+#include "render/render_session.h"
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -14,7 +16,6 @@
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/puller/ffmpeg_puller.h"
 #include "media/simple_buffer.h"
-#include "render/audio/wasapi_audio_renderer.h"
 
 namespace {
 
@@ -31,8 +32,7 @@ constexpr int kManualTargetBitrate = 2'000'000;
 struct CameraAvRenderState {
     std::unique_ptr<FFmpegEncoder> video_encoder;
     std::unique_ptr<FFmpegEncoder> audio_encoder;
-    std::unique_ptr<render::OpenGLVideoRenderer> renderer;
-    std::unique_ptr<render::audio::WasapiAudioRenderer> audio_renderer;
+    std::unique_ptr<render::RenderSession> render_session;
 
     int fps{kManualFallbackFps};
     int64_t frame_duration_us{1'000'000 / kManualFallbackFps};
@@ -41,10 +41,9 @@ struct CameraAvRenderState {
     int decoded_audio_frames{0};
     int encoded_video_packets{0};
     int encoded_audio_packets{0};
-    int rendered_video_frames{0};
-    int rendered_audio_frames{0};
     int read_video_packets{0};
     int read_audio_packets{0};
+    int reported_video_frames{0};
     bool initialized{false};
     bool failed{false};
     bool closed{false};
@@ -134,28 +133,27 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
         return false;
     }
 
-    render::RenderConfig render_config;
-    render_config.window_width = width;
-    render_config.window_height = height;
-    render_config.title = "video-pipeline camera render test";
-    render_config.visible = true;
-    render_config.vsync = false;
-    render_config.close_on_escape = true;
+    render::RenderSessionConfig render_config;
+    render_config.video.window_width = width;
+    render_config.video.window_height = height;
+    render_config.video.title = "video-pipeline camera render test";
+    render_config.video.visible = true;
+    render_config.video.vsync = false;
+    render_config.video.close_on_escape = true;
+    render_config.audio.buffer_duration_ms = 100;
+    render_config.audio.fail_if_device_unavailable = true;
+    render_config.enable_video = true;
+    render_config.enable_audio = true;
+    render_config.max_video_queue_frames = 6;
+    render_config.max_audio_queue_frames = 50;
 
-    state.renderer = std::make_unique<render::OpenGLVideoRenderer>();
-    if (!state.renderer->Init(render_config)) {
-        state.error = "failed to initialize OpenGL renderer";
-        return false;
-    }
-
-    render::audio::AudioRenderConfig audio_render_config;
-    audio_render_config.buffer_duration_ms = 100;
-    audio_render_config.fail_if_device_unavailable = true;
-
-    state.audio_renderer = std::make_unique<render::audio::WasapiAudioRenderer>();
-    if (!state.audio_renderer->Init(audio_render_config)) {
-        state.error = "failed to initialize WASAPI audio renderer: " +
-                      state.audio_renderer->LastError();
+    // OpenGL context 与 WASAPI/COM 都由 RenderSession 的工作线程创建和释放。
+    // decoder callback 从这里开始只负责投递 shared_ptr，不再直接碰窗口和声卡。
+    state.render_session = std::make_unique<render::RenderSession>();
+    if (!state.render_session->Init(render_config) ||
+        !state.render_session->Start()) {
+        state.error = "failed to start render session: " +
+                      state.render_session->LastError();
         return false;
     }
 
@@ -192,61 +190,78 @@ MediaFrame MakeRgbFrame() {
 }
 
 int TestStaticRgbRenderLoop() {
-    render::RenderConfig config;
-    config.window_width = 640;
-    config.window_height = 480;
-    config.title = "video-pipeline OpenGL render test";
-    config.visible = true;
-    config.vsync = false;
-    config.close_on_escape = true;
+    render::RenderSessionConfig config;
+    config.video.window_width = 640;
+    config.video.window_height = 480;
+    config.video.title = "video-pipeline OpenGL render test";
+    config.video.visible = true;
+    config.video.vsync = false;
+    config.video.close_on_escape = true;
+    config.enable_video = true;
+    config.enable_audio = false;
 
-    render::OpenGLVideoRenderer renderer;
-    if (!renderer.Init(config)) {
-        std::cerr << "OpenGL renderer init unavailable; skipping render smoke test\n";
+    render::RenderSession session;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "RenderSession init unavailable; skipping render loop: "
+                  << session.LastError() << '\n';
         return kSkipTest;
     }
 
-    auto frame = MakeRgbFrame();
-    if (!renderer.Render(frame)) {
-        std::cerr << "OpenGL renderer failed to render a valid RGB frame\n";
-        renderer.Shutdown();
+    auto frame = std::make_shared<MediaFrame>(MakeRgbFrame());
+    if (!session.SubmitFrame(frame)) {
+        std::cerr << "RenderSession failed to accept a valid RGB frame\n";
+        session.Stop();
         return 1;
     }
 
     std::cout << "Rendering static RGB frame. Press ESC to close.\n";
-    while (!renderer.ShouldClose()) {
-        renderer.Render(frame);
-        renderer.PollEvents();
+    while (session.IsRunning() && !session.ShouldClose()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    renderer.Shutdown();
+    session.Stop();
     return 0;
 }
 
 int TestStaticRgbRenderSmoke() {
-    render::RenderConfig config;
-    config.window_width = 64;
-    config.window_height = 64;
-    config.title = "video-pipeline hidden OpenGL smoke test";
-    config.visible = false;
-    config.vsync = false;
-    config.close_on_escape = false;
+    render::RenderSessionConfig config;
+    config.video.window_width = 64;
+    config.video.window_height = 64;
+    config.video.title = "video-pipeline hidden OpenGL smoke test";
+    config.video.visible = false;
+    config.video.vsync = false;
+    config.video.close_on_escape = false;
+    config.enable_video = true;
+    config.enable_audio = false;
 
-    render::OpenGLVideoRenderer renderer;
-    if (!renderer.Init(config)) {
-        std::cerr << "OpenGL renderer init unavailable; skipping render smoke test\n";
+    render::RenderSession session;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "RenderSession init unavailable; skipping render smoke test: "
+                  << session.LastError() << '\n';
         return kSkipTest;
     }
 
-    auto frame = MakeRgbFrame();
-    if (!renderer.Render(frame)) {
-        std::cerr << "OpenGL renderer failed to render a valid RGB frame\n";
-        renderer.Shutdown();
+    if (!session.SubmitFrame(std::make_shared<MediaFrame>(MakeRgbFrame()))) {
+        std::cerr << "RenderSession failed to accept a valid RGB frame\n";
+        session.Stop();
         return 1;
     }
 
-    renderer.PollEvents();
-    renderer.Shutdown();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (session.GetStats().rendered_video_frames == 0 &&
+           session.IsRunning() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    const auto stats = session.GetStats();
+    session.Stop();
+    if (stats.rendered_video_frames != 1) {
+        std::cerr << "RenderSession did not render the submitted RGB frame: "
+                  << session.LastError() << '\n';
+        return 1;
+    }
     return 0;
 }
 
@@ -319,18 +334,19 @@ int TestCameraAudioVideoDecodeEncodeRender() {
             return;
         }
 
-        if (state.renderer && state.renderer->ShouldClose()) {
+        if (state.render_session && state.render_session->ShouldClose()) {
             state.closed = true;
             return;
         }
 
-        if (!state.renderer || !state.renderer->Render(*frame)) {
+        if (!state.render_session || !state.render_session->SubmitFrame(frame)) {
             state.failed = true;
-            state.error = "failed to render decoded video frame";
+            state.error = state.render_session
+                ? "failed to submit decoded video frame: " +
+                      state.render_session->LastError()
+                : "render session is not initialized";
             return;
         }
-        ++state.rendered_video_frames;
-        state.renderer->PollEvents();
 
         // 编码只用于沿用原函数的 DecodeEncode 覆盖面，编码后的 packet 不再发布。
         std::vector<PacketPtr> encoded;
@@ -366,15 +382,14 @@ int TestCameraAudioVideoDecodeEncodeRender() {
         frame->time.duration_us = duration_us;
         state.next_audio_pts_us += duration_us;
 
-        if (!state.audio_renderer || !state.audio_renderer->Render(*frame)) {
+        if (!state.render_session || !state.render_session->SubmitFrame(frame)) {
             state.failed = true;
-            state.error = state.audio_renderer
-                ? "failed to render decoded audio frame: " +
-                      state.audio_renderer->LastError()
-                : "audio renderer is not initialized";
+            state.error = state.render_session
+                ? "failed to submit decoded audio frame: " +
+                      state.render_session->LastError()
+                : "render session is not initialized";
             return;
         }
-        ++state.rendered_audio_frames;
 
         std::vector<PacketPtr> encoded;
         if (!state.audio_encoder->Encode(std::move(frame), encoded)) {
@@ -398,10 +413,15 @@ int TestCameraAudioVideoDecodeEncodeRender() {
     }
 
     while (!state.failed && !state.closed) {
-        if (state.renderer) {
-            state.renderer->PollEvents();
-            if (state.renderer->ShouldClose()) {
+        if (state.render_session) {
+            if (state.render_session->ShouldClose()) {
                 state.closed = true;
+                break;
+            }
+            if (!state.render_session->IsRunning()) {
+                state.failed = true;
+                state.error = "render session stopped unexpectedly: " +
+                              state.render_session->LastError();
                 break;
             }
         }
@@ -432,26 +452,31 @@ int TestCameraAudioVideoDecodeEncodeRender() {
             }
         }
 
-        if (state.rendered_video_frames > 0 &&
-            state.rendered_video_frames % 120 == 0) {
+        if (state.render_session &&
+            state.decoded_video_frames >= state.reported_video_frames + 120) {
+            state.reported_video_frames = state.decoded_video_frames;
+            const auto stats = state.render_session->GetStats();
             std::cout << "camera render pipeline: read_video="
                       << state.read_video_packets
                       << ", read_audio=" << state.read_audio_packets
                       << ", decoded_video=" << state.decoded_video_frames
                       << ", decoded_audio=" << state.decoded_audio_frames
-                      << ", rendered_video=" << state.rendered_video_frames
-                      << ", rendered_audio=" << state.rendered_audio_frames
+                      << ", rendered_video=" << stats.rendered_video_frames
+                      << ", rendered_audio=" << stats.rendered_audio_frames
+                      << ", dropped_video=" << stats.dropped_video_frames
+                      << ", dropped_audio=" << stats.dropped_audio_frames
+                      << ", video_queue=" << stats.video_queue_size
+                      << ", audio_queue=" << stats.audio_queue_size
                       << ", encoded_video_packets=" << state.encoded_video_packets
                       << ", encoded_audio_packets=" << state.encoded_audio_packets
                       << "\n";
         }
     }
 
-    if (state.renderer) {
-        state.renderer->Shutdown();
-    }
-    if (state.audio_renderer) {
-        state.audio_renderer->Shutdown();
+    render::RenderStats render_stats;
+    if (state.render_session) {
+        state.render_session->Stop();
+        render_stats = state.render_session->GetStats();
     }
     if (state.video_encoder) {
         state.video_encoder->Close();
@@ -469,8 +494,10 @@ int TestCameraAudioVideoDecodeEncodeRender() {
     }
 
     std::cout << "Camera decode/encode/render stopped: rendered_video="
-              << state.rendered_video_frames
-              << ", rendered_audio=" << state.rendered_audio_frames
+              << render_stats.rendered_video_frames
+              << ", rendered_audio=" << render_stats.rendered_audio_frames
+              << ", dropped_video=" << render_stats.dropped_video_frames
+              << ", dropped_audio=" << render_stats.dropped_audio_frames
               << ", encoded_video_packets=" << state.encoded_video_packets
               << ", encoded_audio_packets=" << state.encoded_audio_packets << "\n";
     return 0;
