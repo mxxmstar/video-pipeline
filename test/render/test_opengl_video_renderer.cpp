@@ -140,8 +140,11 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
     render_config.video.visible = true;
     render_config.video.vsync = false;
     render_config.video.close_on_escape = true;
-    render_config.audio.buffer_duration_ms = 100;
-    render_config.audio.queue_capacity_chunks = 16;
+    // 真实 RTSP 摄像头的音频包不是严格按 20ms 匀速到达，当前手动测试还保留
+    // H264/AAC 编码覆盖，会额外制造 CPU 抖动。这里给 WASAPI shared buffer 和
+    // renderer 内部 PCM 队列多留一些余量，避免短时突发导致“刚满就丢、刚空就补静音”。
+    render_config.audio.buffer_duration_ms = 200;
+    render_config.audio.queue_capacity_chunks = 64;
     render_config.audio.fail_if_device_unavailable = true;
     render_config.enable_video = true;
     render_config.enable_audio = true;

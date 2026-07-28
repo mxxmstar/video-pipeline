@@ -300,6 +300,82 @@ bool TestPauseResumeAndAudioDispatch() {
            audio_state->shutdown && audio_thread_affinity_ok;
 }
 
+bool TestAudioDispatchDoesNotWaitForSlowVideo() {
+    auto video_state = std::make_shared<FakeVideoState>();
+    auto audio_state = std::make_shared<FakeAudioState>();
+    video_state->block_first_render = true;
+
+    render::RenderSession session(
+        std::make_unique<FakeVideoRenderer>(video_state),
+        std::make_unique<FakeAudioRenderer>(audio_state));
+
+    render::RenderSessionConfig config;
+    config.enable_video = true;
+    config.enable_audio = true;
+    config.max_audio_queue_frames = 8;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "audio/video decouple test session start failed: "
+                  << session.LastError() << '\n';
+        return false;
+    }
+
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 0))) {
+        session.Stop();
+        return false;
+    }
+    {
+        std::unique_lock<std::mutex> lock(video_state->mutex);
+        if (!video_state->cv.wait_for(
+                lock, 1s, [&] { return video_state->first_render_entered; })) {
+            std::cerr << "fake video renderer did not block on first Render call\n";
+            video_state->release_first_render = true;
+            video_state->cv.notify_all();
+            lock.unlock();
+            session.Stop();
+            return false;
+        }
+    }
+
+    // 这个测试复现真实摄像头问题的核心条件：视频渲染线程被首帧阻塞，
+    // 但音频帧仍持续到达。修复前 session 单线程一次只取一帧音频和一帧视频，
+    // 此处 rendered_audio_frames 会一直停在 0；修复后音频喂帧线程应能独立推进。
+    for (int i = 0; i < 5; ++i) {
+        if (!session.SubmitFrame(MakeFrame(MediaType::AUDIO, 1000 + i * 20'000))) {
+            std::cerr << "audio/video decouple test failed to submit audio frame\n";
+            {
+                std::lock_guard<std::mutex> lock(video_state->mutex);
+                video_state->release_first_render = true;
+                video_state->cv.notify_all();
+            }
+            session.Stop();
+            return false;
+        }
+    }
+
+    const bool audio_rendered = WaitUntil([&] {
+        return session.GetStats().rendered_audio_frames >= 5;
+    });
+
+    {
+        std::lock_guard<std::mutex> lock(video_state->mutex);
+        video_state->release_first_render = true;
+        video_state->cv.notify_all();
+    }
+
+    const bool video_rendered = WaitUntil([&] {
+        return session.GetStats().rendered_video_frames == 1;
+    });
+    session.Stop();
+
+    const auto stats = session.GetStats();
+    std::lock_guard<std::mutex> audio_lock(audio_state->mutex);
+    return audio_rendered && video_rendered &&
+           stats.submitted_audio_frames == 5 &&
+           stats.rendered_audio_frames >= 5 &&
+           stats.rendered_video_frames == 1 &&
+           audio_state->rendered_pts.size() >= 5;
+}
+
 } // namespace
 
 int main() {
@@ -309,6 +385,10 @@ int main() {
     }
     if (!TestPauseResumeAndAudioDispatch()) {
         std::cerr << "TestPauseResumeAndAudioDispatch failed\n";
+        return 1;
+    }
+    if (!TestAudioDispatchDoesNotWaitForSlowVideo()) {
+        std::cerr << "TestAudioDispatchDoesNotWaitForSlowVideo failed\n";
         return 1;
     }
 

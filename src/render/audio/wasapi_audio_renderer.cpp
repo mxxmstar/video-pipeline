@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <system_error>
 #include <string>
 #include <thread>
@@ -352,16 +353,54 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
         return true;
     }
 
+    // 只向 WASAPI 申请当前确实能写出的帧数。旧实现会申请全部 available_frames，
+    // PCM 不足时把剩余空间一次性填静音；当 shared buffer 比单个音频包大很多时，
+    // 一个很短的输入抖动会被扩展成较长静音，听感上就是断续或“声音很怪”。
+    const auto active_remaining =
+        active_frame_offset < active_chunk.nb_samples
+            ? active_chunk.nb_samples - active_frame_offset
+            : 0;
+    const auto queued_available = std::max<int64_t>(0, queued_frames_.load());
+    auto frames_to_request = std::min<std::uint32_t>(
+        available_frames,
+        active_remaining + static_cast<std::uint32_t>(
+            std::min<int64_t>(queued_available,
+                              std::numeric_limits<std::uint32_t>::max())));
+
+    bool silence_only = false;
+    if (frames_to_request == 0) {
+        // 完全没有 PCM 时仍写入一个很短的静音片段，避免设备 buffer 彻底饿住
+        // 并造成线程忙等。这里不填满整个 available 区域，给随后到达的真实 PCM
+        // 留出尽快进入声卡 buffer 的机会。
+        const auto silence_quantum =
+            static_cast<std::uint32_t>(std::max(1, sample_rate_ / 100));
+        frames_to_request = std::min(available_frames, silence_quantum);
+        silence_only = true;
+        ++underruns_;
+    }
+
     std::uint8_t* dst = nullptr;
-    HRESULT hr = render_client_->GetBuffer(available_frames, &dst);
+    HRESULT hr = render_client_->GetBuffer(frames_to_request, &dst);
     if (FAILED(hr)) {
         SetError("IAudioRenderClient::GetBuffer failed: " + HResultString(hr));
         return false;
     }
 
+    if (silence_only) {
+        hr = render_client_->ReleaseBuffer(frames_to_request,
+                                           AUDCLNT_BUFFERFLAGS_SILENT);
+        if (FAILED(hr)) {
+            SetError("IAudioRenderClient::ReleaseBuffer failed: " + HResultString(hr));
+            return false;
+        }
+        played_frames_ += frames_to_request;
+        WakeAudioThread();
+        return true;
+    }
+
     std::uint32_t written_frames = 0;
     bool wrote_silence = false;
-    while (written_frames < available_frames) {
+    while (written_frames < frames_to_request) {
         if (active_frame_offset >= active_chunk.nb_samples) {
             active_chunk = {};
             active_frame_offset = 0;
@@ -373,7 +412,7 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
 
         if (active_frame_offset < active_chunk.nb_samples) {
             const auto frames_from_chunk = std::min<std::uint32_t>(
-                available_frames - written_frames,
+                frames_to_request - written_frames,
                 active_chunk.nb_samples - active_frame_offset);
             std::memcpy(
                 dst + static_cast<std::size_t>(written_frames) * bytes_per_frame_,
@@ -385,7 +424,10 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
             continue;
         }
 
-        const auto silence_frames = available_frames - written_frames;
+        // queued_frames_ 是跨线程统计值，极端竞争下可能比实际可 pop 的 chunk
+        // 略乐观。若已经向 WASAPI 申请了 buffer，就把尾部补零保证本次提交有效，
+        // 但这只覆盖本次申请的小范围，不再吞掉整个设备可写空间。
+        const auto silence_frames = frames_to_request - written_frames;
         std::memset(dst + static_cast<std::size_t>(written_frames) * bytes_per_frame_,
                     0,
                     static_cast<std::size_t>(silence_frames) * bytes_per_frame_);
@@ -394,13 +436,13 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
         ++underruns_;
     }
 
-    hr = render_client_->ReleaseBuffer(available_frames, 0);
+    hr = render_client_->ReleaseBuffer(frames_to_request, 0);
     if (FAILED(hr)) {
         SetError("IAudioRenderClient::ReleaseBuffer failed: " + HResultString(hr));
         return false;
     }
 
-    played_frames_ += available_frames;
+    played_frames_ += frames_to_request;
     if (wrote_silence) {
         WakeAudioThread();
     }

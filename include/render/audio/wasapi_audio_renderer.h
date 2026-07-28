@@ -21,9 +21,9 @@ namespace render::audio {
 
 /// @brief Windows WASAPI shared-mode 音频播放器。
 ///
-/// 第一版是同步写入模型：Render(frame) 内部完成重采样并把 PCM 写入 WASAPI
-/// shared buffer；当设备缓冲满时最多短暂等待可写事件。后续需要更低延迟或更强
-/// 抗抖动时，可以把 Render 改成入队，另起音频线程消费 ring buffer。
+/// Render(frame) 在调用线程中完成重采样，然后把 PCM chunk 快速写入内部有界队列；
+/// 真正写入 WASAPI shared buffer 的动作由 renderer 内部音频线程完成。这样上层
+/// RenderSession 的音频喂帧线程不会被声卡 buffer 状态阻塞，也不会被视频渲染耗时拖慢。
 class WasapiAudioRenderer final : public IAudioRenderer {
 public:
     WasapiAudioRenderer() = default;

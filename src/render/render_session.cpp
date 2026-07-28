@@ -6,6 +6,7 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <utility>
 
@@ -87,6 +88,11 @@ public:
         close_requested_ = false;
         startup_done_ = false;
         startup_success_ = false;
+        video_startup_done_ = false;
+        audio_startup_done_ = false;
+        video_startup_success_ = false;
+        audio_startup_success_ = false;
+        video_available_ = false;
         audio_available_ = false;
         last_error_.clear();
         clock_.Reset();
@@ -110,25 +116,67 @@ public:
             close_requested_ = false;
             startup_done_ = false;
             startup_success_ = false;
+            video_startup_done_ = !config_.enable_video;
+            audio_startup_done_ = !config_.enable_audio;
+            video_startup_success_ = !config_.enable_video;
+            audio_startup_success_ = !config_.enable_audio;
+            video_available_ = false;
+            audio_available_ = false;
             paused_ = false;
             last_error_.clear();
         }
 
-        // 窗口自行关闭后 worker 已经退出，但 std::thread 仍处于 joinable 状态。
+        // 窗口自行关闭后工作线程已经退出，但 std::thread 仍处于 joinable 状态。
         // 重新 Start 前先回收旧线程对象，避免给 joinable thread 重新赋值。
-        if (worker_.joinable()) {
-            worker_.join();
+        if (video_worker_.joinable()) {
+            video_worker_.join();
         }
-        worker_ = std::thread(&Impl::RenderLoop, this);
+        if (audio_worker_.joinable()) {
+            audio_worker_.join();
+        }
 
-        // Start 必须把设备初始化结果同步返回给调用者，避免后续 SubmitFrame 悄悄丢帧。
+        try {
+            // OpenGL/GLFW 要求 context 在创建它的线程中使用和释放，所以视频
+            // renderer 独占 video_worker_。摄像头 1080p Debug 路径里 CPU RGBA
+            // 转换和纹理上传可能很慢，不能再让它顺手驱动音频。
+            if (config_.enable_video) {
+                video_worker_ = std::thread(&Impl::VideoRenderLoop, this);
+            }
+            // audio_worker_ 只负责把解码后的音频帧重采样并提交给 IAudioRenderer。
+            // 对 WASAPI 后端来说，真正写声卡的是 WasapiAudioRenderer 内部的
+            // event-driven 线程；这里的独立线程用于保证“喂 PCM”不被视频渲染拖慢。
+            if (config_.enable_audio) {
+                audio_worker_ = std::thread(&Impl::AudioRenderLoop, this);
+            }
+        } catch (const std::system_error& error) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                last_error_ = std::string("failed to start RenderSession worker: ") +
+                              error.what();
+                stop_requested_ = true;
+                startup_done_ = true;
+                startup_success_ = false;
+            }
+            queue_cv_.notify_all();
+            startup_cv_.notify_all();
+            JoinWorkers();
+            return false;
+        }
+
+        // Start 必须等视频/音频两个 worker 都完成初始化判定，再把结果同步返回给调用者。
+        // 其中音频设备可按配置降级为非致命错误，但视频初始化失败一定不能继续运行。
         std::unique_lock<std::mutex> lock(mutex_);
         startup_cv_.wait(lock, [this] { return startup_done_; });
         const bool success = startup_success_;
         lock.unlock();
 
-        if (!success && worker_.joinable()) {
-            worker_.join();
+        if (!success) {
+            {
+                std::lock_guard<std::mutex> stop_lock(mutex_);
+                stop_requested_ = true;
+            }
+            queue_cv_.notify_all();
+            JoinWorkers();
         }
         return success;
     }
@@ -186,7 +234,9 @@ public:
             return false;
         }
 
-        queue_cv_.notify_one();
+        // 同一个 condition_variable 同时服务音频和视频 worker。这里唤醒全部线程，
+        // 由各自的等待谓词判断是否真的有活要做，避免提交音频帧时只唤醒视频线程。
+        queue_cv_.notify_all();
         return true;
     }
 
@@ -194,14 +244,14 @@ public:
         std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_);
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            // Stop 会同时唤醒视频和音频 worker。两个线程看到 stop_requested_
+            // 后各自在自己的线程中 Shutdown renderer，保持设备资源的线程归属清晰。
             stop_requested_ = true;
             paused_ = false;
         }
         queue_cv_.notify_all();
 
-        if (worker_.joinable()) {
-            worker_.join();
-        }
+        JoinWorkers();
 
         std::lock_guard<std::mutex> lock(mutex_);
         video_queue_.clear();
@@ -210,6 +260,7 @@ public:
         stats_.audio_queue_size = 0;
         running_ = false;
         startup_done_ = true;
+        video_available_ = false;
         audio_available_ = false;
         clock_.Reset(stats_.playback_pts_us);
     }
@@ -266,54 +317,39 @@ public:
     }
 
 private:
-    void RenderLoop() {
-        bool video_initialized = false;
-        bool audio_initialized = false;
-        bool video_init_attempted = false;
-        bool audio_init_attempted = false;
-        std::string startup_error;
-
-        if (config_.enable_video) {
-            video_init_attempted = true;
-            video_initialized = video_renderer_->Init(config_.video);
-            if (!video_initialized) {
-                startup_error = "视频 renderer 初始化失败";
-            }
-        }
-
-        if (startup_error.empty() && config_.enable_audio) {
-            audio_init_attempted = true;
-            audio_initialized = audio_renderer_->Init(config_.audio);
-            if (!audio_initialized && config_.audio.fail_if_device_unavailable) {
-                startup_error = "音频 renderer 初始化失败";
-            }
-        }
-
+    void VideoRenderLoop() {
+        // 视频 renderer 的完整生命周期固定在 video_worker_ 中：
+        // Init 创建窗口和 OpenGL context，Render/PollEvents 使用 context，
+        // Shutdown 再在同一线程释放它。
+        const bool initialized = video_renderer_->Init(config_.video);
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            audio_available_ = audio_initialized;
-            startup_success_ = startup_error.empty();
-            startup_done_ = true;
-            running_ = startup_success_;
-            if (!startup_success_) {
-                last_error_ = std::move(startup_error);
-                stop_requested_ = true;
+            video_available_ = initialized;
+            video_startup_success_ = initialized;
+            video_startup_done_ = true;
+            if (!initialized) {
+                last_error_ = "视频 renderer 初始化失败";
             }
-            if (startup_success_) {
-                clock_.Start();
-            }
+            CompleteStartupLocked();
         }
         startup_cv_.notify_all();
+        queue_cv_.notify_all();
+
+        if (!initialized) {
+            video_renderer_->Shutdown();
+            return;
+        }
 
         while (true) {
-            std::shared_ptr<MediaFrame> audio_frame;
             std::shared_ptr<MediaFrame> video_frame;
 
             {
                 std::unique_lock<std::mutex> lock(mutex_);
+                // 视频线程只等待视频队列。音频队列不参与这个谓词，避免视频帧
+                // 转换/上传变慢时把音频消费也锁在同一个循环节奏里。
                 queue_cv_.wait_for(lock, kIdlePollInterval, [this] {
                     return stop_requested_ ||
-                           (!paused_ && (!audio_queue_.empty() || !video_queue_.empty()));
+                           (!paused_ && !video_queue_.empty());
                 });
 
                 if (stop_requested_) {
@@ -322,33 +358,12 @@ private:
 
                 // 暂停时不消费队列，但循环仍会继续 PollEvents，窗口不会失去响应。
                 if (!paused_) {
-                    if (audio_available_ && !audio_queue_.empty()) {
-                        audio_frame = std::move(audio_queue_.front());
-                        audio_queue_.pop_front();
-                        stats_.audio_queue_size = audio_queue_.size();
-                    }
-                    if (config_.enable_video && !video_queue_.empty()) {
+                    if (!video_queue_.empty()) {
                         video_frame = std::move(video_queue_.front());
                         video_queue_.pop_front();
                         stats_.video_queue_size = video_queue_.size();
                     }
                 }
-            }
-
-            // 第一版先在同一个 session 线程串行驱动音频和视频。WASAPI 的异步
-            // ring buffer 会在阶段 3 拆出独立消费线程。
-            if (audio_frame && !audio_renderer_->Render(*audio_frame)) {
-                FailAndRequestStop("音频帧渲染失败");
-            } else if (audio_frame) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                ++stats_.rendered_audio_frames;
-                const auto audio_stats = audio_renderer_->GetStats();
-                stats_.audio_underruns = audio_stats.underruns;
-                stats_.audio_dropped_pcm_frames = audio_stats.dropped_pcm_frames;
-                stats_.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
-                stats_.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
-                stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
-                clock_.SetPositionUs(stats_.playback_pts_us);
             }
 
             if (video_frame && !video_renderer_->Render(*video_frame)) {
@@ -362,35 +377,143 @@ private:
                 }
             }
 
-            if (video_initialized) {
-                video_renderer_->PollEvents();
-                if (video_renderer_->ShouldClose()) {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    close_requested_ = true;
-                    stop_requested_ = true;
-                    queue_cv_.notify_all();
-                }
+            video_renderer_->PollEvents();
+            if (video_renderer_->ShouldClose()) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                close_requested_ = true;
+                stop_requested_ = true;
+                running_ = false;
+                queue_cv_.notify_all();
             }
         }
 
-        // renderer 的 Init/Render/PollEvents/Shutdown 全部位于同一线程，满足
-        // GLFW/OpenGL context 和 COM/WASAPI 资源的线程归属要求。
-        if (audio_init_attempted) {
-            audio_renderer_->Shutdown();
-        }
-        if (video_init_attempted) {
-            video_renderer_->Shutdown();
-        }
+        // OpenGL renderer 的 Init/Render/PollEvents/Shutdown 全部位于同一线程，
+        // 满足 GLFW/OpenGL context 的线程归属要求。
+        video_renderer_->Shutdown();
 
         std::lock_guard<std::mutex> lock(mutex_);
-        running_ = false;
+        video_available_ = false;
+    }
+
+    void AudioRenderLoop() {
+        // 音频 renderer 的 Init/Render/Shutdown 固定在 audio_worker_ 中。
+        // WASAPI 后端内部还会启动一个设备写入线程，但外层 session 不直接碰声卡 buffer。
+        const bool initialized = audio_renderer_->Init(config_.audio);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            audio_available_ = initialized;
+            audio_startup_success_ = initialized;
+            audio_startup_done_ = true;
+            if (!initialized &&
+                (config_.audio.fail_if_device_unavailable || !config_.enable_video)) {
+                last_error_ = "音频 renderer 初始化失败";
+            }
+            CompleteStartupLocked();
+        }
+        startup_cv_.notify_all();
+        queue_cv_.notify_all();
+
+        if (!initialized) {
+            audio_renderer_->Shutdown();
+            return;
+        }
+
+        while (true) {
+            std::shared_ptr<MediaFrame> audio_frame;
+
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                // 音频线程只等待音频队列，因此摄像头音频约 50fps 到达时可以持续
+                // 喂入 WASAPI PCM 队列，不再受视频渲染帧率影响。
+                queue_cv_.wait_for(lock, kIdlePollInterval, [this] {
+                    return stop_requested_ ||
+                           (!paused_ && !audio_queue_.empty());
+                });
+
+                if (stop_requested_) {
+                    break;
+                }
+
+                if (!paused_ && !audio_queue_.empty()) {
+                    audio_frame = std::move(audio_queue_.front());
+                    audio_queue_.pop_front();
+                    stats_.audio_queue_size = audio_queue_.size();
+                }
+            }
+
+            // 音频喂帧与视频渲染解耦：视频 CPU 转 RGBA 或 OpenGL 上传变慢时，
+            // 音频仍能按输入节奏重采样并送入 WASAPI 内部 PCM 队列。
+            if (audio_frame && !audio_renderer_->Render(*audio_frame)) {
+                FailAndRequestStop("音频帧渲染失败");
+            } else if (audio_frame) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++stats_.rendered_audio_frames;
+                UpdateAudioStatsLocked();
+                stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
+                clock_.SetPositionUs(stats_.playback_pts_us);
+            }
+        }
+
+        audio_renderer_->Shutdown();
+
+        std::lock_guard<std::mutex> lock(mutex_);
         audio_available_ = false;
+    }
+
+    void CompleteStartupLocked() {
+        // 两个 worker 并行启动。只有当已启用的 worker 都给出初始化结果后，
+        // Start() 才能返回；这样调用方不会在半初始化状态下提交帧。
+        if (startup_done_ || !video_startup_done_ || !audio_startup_done_) {
+            return;
+        }
+
+        const bool video_ok = !config_.enable_video || video_startup_success_;
+        // 预览场景中音频设备可能缺失。只要同时启用了视频并且配置允许降级，
+        // 音频初始化失败不会阻止视频预览；后续提交的音频帧会计入 dropped_audio_frames。
+        const bool audio_optional =
+            config_.enable_video && config_.enable_audio &&
+            !config_.audio.fail_if_device_unavailable;
+        const bool audio_ok =
+            !config_.enable_audio || audio_startup_success_ || audio_optional;
+
+        startup_success_ = video_ok && audio_ok;
+        startup_done_ = true;
+        running_ = startup_success_;
+        if (startup_success_) {
+            clock_.Start();
+        } else {
+            stop_requested_ = true;
+        }
+    }
+
+    void UpdateAudioStatsLocked() {
+        // WASAPI 的内部队列和 underrun 统计来自 audio renderer。这里在 session
+        // 统计里做一份快照，便于手动摄像头测试直接看到音频是否还在挨饿。
+        if (!audio_renderer_ || !audio_available_) {
+            return;
+        }
+
+        const auto audio_stats = audio_renderer_->GetStats();
+        stats_.audio_underruns = audio_stats.underruns;
+        stats_.audio_dropped_pcm_frames = audio_stats.dropped_pcm_frames;
+        stats_.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
+        stats_.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
+    }
+
+    void JoinWorkers() {
+        if (video_worker_.joinable()) {
+            video_worker_.join();
+        }
+        if (audio_worker_.joinable()) {
+            audio_worker_.join();
+        }
     }
 
     void FailAndRequestStop(std::string message) {
         std::lock_guard<std::mutex> lock(mutex_);
         last_error_ = std::move(message);
         stop_requested_ = true;
+        running_ = false;
         queue_cv_.notify_all();
     }
 
@@ -403,7 +526,8 @@ private:
     std::mutex lifecycle_mutex_;
     std::condition_variable queue_cv_;
     std::condition_variable startup_cv_;
-    std::thread worker_;
+    std::thread video_worker_;
+    std::thread audio_worker_;
 
     RenderSessionConfig config_;
     RenderStats stats_;
@@ -420,6 +544,11 @@ private:
     bool close_requested_{false};
     bool startup_done_{false};
     bool startup_success_{false};
+    bool video_startup_done_{false};
+    bool audio_startup_done_{false};
+    bool video_startup_success_{false};
+    bool audio_startup_success_{false};
+    bool video_available_{false};
     bool audio_available_{false};
     std::string last_error_;
 };

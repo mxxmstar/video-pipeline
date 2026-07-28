@@ -467,3 +467,69 @@ P3：
 3. 长时间预览时观察 `audio_renderer_queue_size` 是否稳定在较低范围，避免延迟持续累积。
 
 推荐下一步：进入阶段 4，实现以音频播放时钟为 master 的视频 PTS 调度、晚帧丢弃和早帧等待。
+
+## 摄像头音频异常问题记录
+
+记录时间：2026-07-28。
+
+现象：
+1. 运行 `test_opengl_video_renderer --camera`，摄像头在线，视频源为 1920x1080、25fps H264，音频源为 G711A、16000 Hz、mono。
+2. 周期日志中 `rendered_audio` 与 `rendered_video` 长时间保持完全相同，例如 `rendered_video=285`、`rendered_audio=285`。
+3. 同期 `read_audio`/`decoded_audio` 明显高于视频帧数，说明音频输入持续到达；但 `audio_queue=50` 长期满队列，`dropped_audio` 持续增长。
+4. `audio_renderer_queue=0`、`audio_renderer_frames=0`，并且 `audio_underruns` 快速增长到数千，说明 WASAPI 内部 PCM 队列长期没有被及时喂满。
+5. 体感声音表现为片段化、断续、带静音填充，听起来像跳帧或异常变调。
+
+根因：
+1. 阶段 3 虽然已经把 WASAPI 写声卡动作移动到 renderer 内部线程，但 `RenderSession` 仍在同一个 `RenderLoop()` 中串行消费一帧音频和一帧视频。
+2. 1080p Debug 路径中，视频帧 CPU RGBA 转换和 OpenGL 纹理上传耗时较高，导致 session 循环实际只以较低频率推进。
+3. 摄像头音频约 50fps 到达，但 session 每轮最多只取一帧音频；当视频渲染循环低于音频帧率时，音频消费被硬性限制到视频渲染速度。
+4. 最终结果是 session 音频队列满并丢帧，而 WASAPI 内部 PCM 队列又拿不到足够数据，只能不断写静音补 underrun。
+
+修复方案：
+1. `RenderSession` 拆分为独立视频 worker 和独立音频 worker。
+2. 视频 worker 独占 OpenGL/GLFW renderer 的 `Init()`、`Render()`、`PollEvents()`、`Shutdown()`，保持 OpenGL context 线程归属正确。
+3. 音频 worker 独立消费 session 音频队列，并调用 `IAudioRenderer::Render()` 完成重采样与 PCM 入队。
+4. WASAPI 后端继续保留内部 event-driven 写声卡线程，形成 `session audio queue -> audio worker -> WASAPI PCM queue -> device thread` 的播放链路。
+5. `Start()` 等待已启用的 worker 都完成初始化判定后再返回；音频设备不可用时仍按 `fail_if_device_unavailable` 支持视频预览降级。
+6. 新增无设备回归测试：故意阻塞 fake video renderer 首帧，连续提交多帧音频，验证音频消费不再等待视频渲染释放。
+7. WASAPI 写入策略调整为按当前实际 PCM 量申请 buffer；当 PCM 完全为空时只补一个短静音片段，避免把一次短缺口扩展成整段 shared buffer 静音。
+8. `test_opengl_video_renderer --camera` 的音频 buffer 和 PCM chunk 队列适当加深，用于抵消 RTSP 抖动以及同进程 H264/AAC 编码覆盖带来的调度波动。
+
+小版本策略记录：
+
+1. V0：原始阶段 3 实现
+   - 策略：`WasapiAudioRenderer::Render()` 已异步入 PCM 队列，WASAPI 写声卡由内部线程完成；但 `RenderSession` 仍用单个 `RenderLoop()` 串行取一帧音频和一帧视频。
+   - 验证现象：真实 camera 下 `rendered_audio` 与 `rendered_video` 长期 1:1，`audio_queue=50` 满队列，`dropped_audio` 和 `audio_underruns` 持续增长。
+   - 结论：WASAPI 层已经异步，但 session 喂帧仍被视频渲染耗时拖慢，需要拆线程。
+
+2. V1：拆分 `RenderSession` 音视频 worker
+   - 策略：新增独立 video worker 和 audio worker。video worker 只负责 OpenGL 生命周期和视频帧；audio worker 只负责音频队列消费与 `IAudioRenderer::Render()`。
+   - 验证现象：camera 下 `rendered_audio` 明显高于 `rendered_video`，例如 `rendered_video=196`、`rendered_audio=1429`；`audio_queue=0`，`dropped_audio=0`。
+   - 结论：session 层 1:1 拖慢问题已解决，音频帧可以追上解码输入。
+
+3. V2：仅加深 camera 测试音频缓冲
+   - 策略：保持库默认低延迟配置不变，仅在 `test_opengl_video_renderer --camera` 中把 `audio.buffer_duration_ms` 调到 200，把 `audio.queue_capacity_chunks` 调到 64。
+   - 验证现象：`audio_pcm_dropped` 从持续增长变为 0，WASAPI 内部队列出现 960/1920 等稳定波动；但 `audio_underruns` 仍会慢速增长。
+   - 结论：加深队列能吸收 RTSP 抖动和同进程编码负载，但不能单独解决“缺口被长静音放大”的问题。
+
+4. V3：WASAPI 按实际 PCM 量申请 buffer
+   - 策略：`FillWasapiBuffer()` 不再一次申请全部 `available_frames`。有多少 PCM 就申请多少；完全没有 PCM 时只写一个约 10ms 的短静音片段，避免把短时缺口扩展成整段 shared buffer 静音。
+   - 验证现象：camera 下 `audio_pcm_dropped=0`，`audio_queue=0`，`rendered_audio` 持续按音频节奏推进；`audio_underruns` 只在队列短暂见底时小幅增长。
+   - 结论：保留此策略。它对听感更自然，且不会引入额外的大块重缓冲延迟。
+
+5. V4：尝试启动/见底预缓冲门槛
+   - 策略：WASAPI 内部队列攒到若干 PCM chunk 后再开始写真实 PCM；队列见底后重新进入短暂预缓冲。
+   - 验证现象：`audio_pcm_dropped=0`，但日志出现周期性的“队列攒到 6-7 个 chunk，再逐步降到 1-2 个 chunk”的重缓冲波动，`audio_underruns` 会按重缓冲周期跳变。
+   - 结论：已撤回。这个策略牺牲了低延迟，且可能让声音呈现周期性停顿；当前阶段不作为默认实现。
+
+6. V5：当前保留版本
+   - 策略：保留 V1 的 session 音视频 worker 解耦、V2 的 camera 手动测试缓冲加深、V3 的 WASAPI 短静音/部分写入策略；撤回 V4 的预缓冲门槛；`SubmitFrame()` 改为 `notify_all()`，避免同一个条件变量偶发唤醒到非目标 worker。
+   - 预期指标：`rendered_audio` 不再与 `rendered_video` 1:1；`audio_queue` 不长期满；`dropped_audio=0`；`audio_pcm_dropped=0`；`audio_underruns` 可有启动期或短时抖动增长，但不应像 V0 那样快速累计到数千。
+   - 实测结果：camera 运行多轮后，`decoded_video=1560`、`rendered_video=451` 时 `rendered_audio=3097`，音频不再被视频渲染帧率限制；`audio_queue=0`、`dropped_audio=0`、`audio_pcm_dropped=0`；`audio_underruns` 从启动期 12 缓慢增长到 35，仍需后续用纯 decode/render 测试排除编码覆盖造成的调度抖动。
+   - 后续方向：如果 V5 仍有可闻异常，优先把 camera 测试里的 encode 覆盖拆出去，再进入阶段 4 做音频 master clock 与视频 PTS 调度。
+
+后续仍需观察：
+1. 真实摄像头运行时 `rendered_audio` 应按音频输入节奏增长，不应再与 `rendered_video` 固定 1:1。
+2. `audio_queue` 不应长期满在 50，`audio_renderer_queue_size` 和 `audio_renderer_queued_frames` 应出现稳定的非零波动。
+3. 启动初期可以有少量 `audio_underruns`，但稳定播放后不应持续快速增长。
+4. 如果解耦后仍有声音异常，下一步重点检查 G711A 解码输出样本格式、首批 RTSP 音频突发、以及 camera 测试中同步编码覆盖带来的 CPU 压力。
