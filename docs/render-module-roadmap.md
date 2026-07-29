@@ -528,6 +528,48 @@ P3：
    - 实测结果：camera 运行多轮后，`decoded_video=1560`、`rendered_video=451` 时 `rendered_audio=3097`，音频不再被视频渲染帧率限制；`audio_queue=0`、`dropped_audio=0`、`audio_pcm_dropped=0`；`audio_underruns` 从启动期 12 缓慢增长到 35，仍需后续用纯 decode/render 测试排除编码覆盖造成的调度抖动。
    - 后续方向：如果 V5 仍有可闻异常，优先把 camera 测试里的 encode 覆盖拆出去，再进入阶段 4 做音频 master clock 与视频 PTS 调度。
 
+## 阶段 3.5：音频渲染策略解耦
+
+背景：
+1. `learn-media` 工程中 `filter` 下存在 OSD、帧率控制等模块，其中部分类直接继承 `runtime::TransformNode`。
+2. 这种模式把“纯处理能力”和“runtime 节点包装”混在同一个模块内，短期方便，长期会导致 `filter` 成为算法、节点、pipeline 状态、设备策略的大杂烩。
+3. 当前工程采用更清晰的三层边界：
+   - `filter`：只放纯数据变换，例如 `AudioResampleFilter`、后续 `PixelConvertFilter`、scale、音量、混音。
+   - `render/audio`：放播放相关策略和设备适配，例如 PCM 队列、underrun 策略、播放进度、WASAPI。
+   - `pipeline/runtime_nodes`：后续再放 `runtime::TransformNode` / `SinkNode` 包装，不在算法类里直接继承 runtime。
+
+本阶段实际拆分：
+1. 新增 `PcmChunk`，作为 render/audio 内部“已转换到设备格式的 PCM 数据块”。
+2. 新增 `AudioPcmQueue`，独立负责：
+   - 有界 PCM chunk 队列。
+   - 队列满时丢弃最旧 chunk。
+   - submitted/queued/played/dropped/underrun 统计。
+   - 基于首帧 PTS、已提交设备帧数和 device padding 估算 `PlayedPtsUs()`。
+3. 新增 `AudioBufferFillPolicy`，独立负责：
+   - 根据设备可写帧数、活跃 chunk 剩余帧数、队列帧数决定本轮申请多少设备 buffer。
+   - PCM 完全不足时只申请短静音片段，避免把短时缺口扩展成整段设备 buffer 静音。
+4. `WasapiAudioRenderer` 改为组合以上两个策略类：
+   - 保留 WASAPI COM、默认设备、mix format、event callback、`IAudioRenderClient::GetBuffer/ReleaseBuffer` 等设备细节。
+   - 不再直接持有 PCM 队列统计原子变量，也不再内联队列满丢弃策略。
+5. 新增 `test_audio_render_strategy`，不依赖声卡或 OpenGL，直接验证队列满丢旧、played PTS 估算和短静音填充策略。
+6. `AudioBufferFillPolicy::Plan()` 的输入收拢为 `AudioBufferFillContext`，为后续增加目标延迟、时钟偏差、追帧模式等策略输入预留接口空间。
+
+小版本策略记录：
+1. V3.5.0：策略从 WASAPI 类中拆出
+   - 策略：先拆出具体类 `AudioPcmQueue` 和 `AudioBufferFillPolicy`，不立即引入策略基类和继承体系。
+   - 原因：当前只有一种低延迟预览策略，过早抽象会增加文件数量和调用复杂度；先让 WASAPI 只组合策略对象，已经能解除设备 API 与播放策略的耦合。
+   - 验证：`test_audio_render_strategy` 覆盖队列满丢旧、播放 PTS 估算和短静音填充决策。
+2. V3.5.1：策略输入改为 context
+   - 策略：保留单个 `AudioBufferFillPolicy` 具体类，但把 `Plan()` 的多个独立参数收拢为 `AudioBufferFillContext`。
+   - 原因：后续如果要支持多种策略，真正稳定的接口不是“越来越长的参数列表”，而是一份可演进的决策上下文；等出现第二种真实策略时，再把 `AudioBufferFillPolicy` 提取为接口或基类。
+   - 预期演进：可以先增加 `target_latency_frames`、`clock_drift_us`、`allow_catch_up` 等 context 字段；若文件播放、低延迟预览、强同步预览的行为明显分化，再拆出 `IAudioBufferFillPolicy` 和多个实现类。
+
+当前保留边界原则：
+1. `AudioResampleFilter` 仍在 `filter/audio`，因为它是纯格式转换，不知道播放设备。
+2. `AudioPcmQueue` 和 `AudioBufferFillPolicy` 留在 `render/audio`，因为它们服务播放延迟、underrun 和设备节奏。
+3. `WasapiAudioRenderer` 只做 Windows WASAPI 后端组装和设备调用。
+4. 后续接 runtime 时，新增薄包装节点，例如 `RenderSinkNode` 或 `AudioRenderNode`，不要让 filter/render 核心类直接继承 `runtime::TransformNode`。
+
 后续仍需观察：
 1. 真实摄像头运行时 `rendered_audio` 应按音频输入节奏增长，不应再与 `rendered_video` 固定 1:1。
 2. `audio_queue` 不应长期满在 50，`audio_renderer_queue_size` 和 `audio_renderer_queued_frames` 应出现稳定的非零波动。
