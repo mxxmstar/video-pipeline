@@ -58,8 +58,8 @@ MediaServer.exe: E:\share\project\video-pipeline\third_apps\win32\zlmediakit\Med
 
 - `include/media/publisher/publisher_config.h`
 - `src/media/protocol/rtsp_server_protocol.cpp`
-- `test/test_rtsp_server_publisher.cpp`
-- `test/test_local_mp4_decode_rtsp_publisher.cpp`
+- `test/media/test_rtsp_server_publisher.cpp`
+- `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 
 当前建议：
 
@@ -123,7 +123,7 @@ puller.SetRtspTransport("tcp");
 
 相关文件：
 
-- `test/test_rtsp_server_publisher.cpp`
+- `test/media/test_rtsp_server_publisher.cpp`
 
 当前建议：
 
@@ -172,11 +172,11 @@ vlc rtsp://127.0.0.1/live/video_pipeline_av_test
 
 ## 后续事项
 
-- ZLMediaKit 推流目前建议先走 video-only；如果要完整 AV 推到 ZLM，建议把源 G711 16 kHz 音频转成 AAC 后再进入 FFmpeg RTSP mux。
-- 本机 RTSP 可以继续支持 H264 + G711/AAC 双 track。
+- ZLMediaKit 推流已使用 H264 + AAC 双 track；摄像头 G711 音频先解码，再编码为 AAC 后进入 FFmpeg RTSP mux。
+- 本机 RTSP 使用 H264 + 源 G711 双 track，也可配置 H264 + AAC。
 - multicast 音频暂未实现，开启 `enable_multicast` 前需要明确客户端只订阅 video 或补齐 audio multicast。
 
-## ZLMediaKit 推流无声音
+## ZLMediaKit 推流无声音（已解决）
 
 现象：
 
@@ -188,19 +188,20 @@ rtsp://127.0.0.1:554/live/video_pipeline_av_test
 
 - 视频正常，但没有声音。
 
-当前结论：
+历史结论：
 
-- 这是当前测试链路的已知限制，不是 RTSP server 底层完全不支持音频。
+- 这个问题来自当时的测试链路只向 ZLM publisher 注册了视频轨，不是本机 RTSP server 底层不支持音频。
 - 本机 RTSP server 路径已经支持 `AAC / G711A / G711U`。
-- ZLMediaKit 推流路径当前只注册并发布了 H264 video track，没有把摄像头音频 track 加入 `FfmpegMuxProtocol`。
+- 摄像头源音频是 16 kHz G711，直接推送时还存在服务端和播放器兼容性风险。
 
-当前代码位置：
+当前修复：
 
-- `test/test_rtsp_server_publisher.cpp`
-  - `MakeCameraZlmPublisherConfig()` 只加入 `video_track`。
-  - `MakeCameraRtspServerPublisherConfig()` 加入 `video_track + audio_track`，因此本机 RTSP 路径可以发布音频。
+- `test/media/test_rtsp_server_publisher.cpp` 中已经创建 AAC audio encoder。
+- 摄像头 G711 packet 先解码为 PCM，再编码为 AAC packet。
+- `MakeCameraZlmPublisherConfig()` 同时加入 H264 video track 和 AAC audio track。
+- `MakeCameraRtspServerPublisherConfig()` 使用 H264 video track 和源 G711 audio track。
 
-为什么暂时不直接加 G711：
+为什么 ZLM 路径不直接使用 G711：
 
 - 摄像头源音频是 G711 16 kHz 单声道。
 - 本机 RTSP server 可以直接按 G711 RTP payload 发布。
@@ -229,7 +230,7 @@ rtsp://127.0.0.1:554/live/video_pipeline_av_test
    - AAC 被广泛支持（VLC、浏览器、移动端等）
    - AAC 压缩率更高（128kbps 音质优于 G711 64kbps）
 
-建议后续实现方式：
+当前实现链路：
 
 ```text
 Camera G711
@@ -241,14 +242,14 @@ Camera G711
   -> ZLMediaKit
 ```
 
-实现前置条件：
+实现要点：
 
-- `FFmpegEncoder` 的音频路径需要补齐采样格式转换，至少支持 `S16/S16P -> FLTP`。
-- 如源音频采样率不是目标采样率，还需要引入 `libswresample` 做重采样。
-- ZLM publisher 配置中再加入 AAC audio track，并使用 AAC encoder 的 `extra_data` 作为 AudioSpecificConfig。
+- 音频 encoder 输出的 packet 使用独立 `track_id=1`，并按 AAC 帧长推进时间戳。
+- ZLM publisher 使用 AAC encoder 的 `extra_data` 作为 AudioSpecificConfig。
+- FFmpeg muxer 在写出前将音频 packet 时间戳换算到输出 `AVStream::time_base`。
 
 当前建议：
 
-- 在视频链路稳定前，ZLMediaKit 继续保持 video-only。
-- 本机 RTSP 继续用于验证 `H264 + G711` 的音视频拉流能力。
-- 等推理模块接入后，再把音频 AAC 转码作为独立小任务补齐，避免一次性扩大排障面。
+- ZLMediaKit 使用 `H264 + AAC` 验证通用播放器兼容性。
+- 本机 RTSP 使用 `H264 + G711` 验证源音频直通能力。
+- 若更换摄像头采样率或 sample format，需要重新验证 AAC encoder 的输入格式和重采样路径。

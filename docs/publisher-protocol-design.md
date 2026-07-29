@@ -1,96 +1,146 @@
-# Publisher / Protocol 设计文档
+# Publisher 模块设计与扩展计划
 
-本文档说明当前 `publisher` 与 `protocol` 分层的实现、职责边界、调用关系和后续扩展方式。当前实现已删除旧的 `media/pusher` 体系，发布出口统一收敛到 `IPublisher`。
+本文档说明当前 Publisher 模块的架构、接口契约、协议实现、测试现状和后续改进计划。文档以当前代码为准，覆盖 FFmpeg 复用推流和本机 RTSP Server 两条发布链路。
 
-## 设计目标
+最后更新：2026-07-29。
 
-1. 用一个统一出口承接 pipeline 的发布需求。
-2. 区分“发布策略”和“协议运行时”，避免把 RTSP server、FFmpeg muxer、RTP packetizer 混在一个类里。
-3. 支持两类发布角色：
-   - Push client：主动推到远端媒体服务器，例如 RTMP/RTSP 推到 ZLMediaKit。
-   - Pull server：本机监听端口，客户端直接拉流，例如本机 RTSP server。
-4. 让后续扩展协议、编码格式、发布策略时有明确落点。
+## 1. 模块定位
 
-## 总体结构
+Publisher 位于编码器和网络协议之间，接收已经编码完成的 `MediaPacket`，将它发布到远端媒体服务器，或者在本机提供可供客户端拉流的服务。
+
+当前支持两种发布角色：
+
+| 发布角色 | 配置 | 当前实现 | 使用场景 |
+|---|---|---|---|
+| Push Client | `PublishMode::PushClient` | `FfmpegMuxProtocol` | 主动向 ZLMediaKit 等服务器推送 RTSP/RTMP 流 |
+| Pull Server | `PublishMode::PullServer` | `RtspServerProtocol` | 本机监听 RTSP 端口，VLC 等客户端直接拉流 |
+
+Publisher 不负责拉流、解码、推理和编码。这些步骤由 pipeline 上游完成。Publisher 的输入必须是编码后的 packet，并且 packet 的 codec、track、时间基和 extradata 应与 `PublisherConfig::tracks` 一致。
+
+## 2. 总体架构
 
 ```mermaid
 flowchart TD
-    Pipeline["Pipeline / Encoder / MediaStreamSource"] --> Publisher["IPublisher"]
-    Publisher --> DefaultPublisher["DefaultPublisher"]
-    DefaultPublisher --> AdapterFactory["CreateProtocolAdapter"]
-    AdapterFactory --> FfmpegAdapter["FfmpegProtocolAdapter"]
-    AdapterFactory --> RtspAdapter["RtspServerProtocolAdapter"]
-    FfmpegAdapter --> FfmpegProtocol["FfmpegMuxProtocol"]
-    RtspAdapter --> RtspProtocol["RtspServerProtocol"]
-    RtspAdapter --> H264Parser["H264Bitstream"]
-    RtspProtocol --> H264Packetizer["H264RtpPacketizer"]
+    Pipeline["Pipeline / Encoder"] --> Packet["MediaPacket"]
+    Packet --> API["IPublisher"]
+    API --> Default["DefaultPublisher"]
+    Default --> Factory["CreateProtocolAdapter"]
+
+    Factory --> FA["FfmpegProtocolAdapter"]
+    FA --> FM["FfmpegMuxProtocol"]
+    FM --> Remote["ZLMediaKit / 远端媒体服务器"]
+
+    Factory --> RA["RtspServerProtocolAdapter"]
+    RA --> H264["H264Bitstream"]
+    RA --> RS["RtspServerProtocol"]
+    RS --> Packetizer["H264RtpPacketizer / Audio RTP packetizer"]
+    RS --> Client["VLC / RTSP Client"]
 ```
 
-核心规则：
+模块按职责分为四层：
 
-- `IPublisher` 面向业务和 pipeline。
-- `IProtocolAdapter` 面向项目内部数据模型，负责把 `MediaPacket` 转成协议需要的数据。
-- `IProtocol` 面向协议运行时，不直接依赖 pipeline 的复杂上下文。
-- codec 级别的解析、分片和打包放在独立工具或 packetizer 中。
+| 层级 | 核心类型 | 职责 | 不应承担的职责 |
+|---|---|---|---|
+| 业务入口 | `IPublisher` | 为 pipeline 提供统一生命周期和发布接口 | RTP 分片、RTSP 会话、FFmpeg API 调用 |
+| 发布编排 | `DefaultPublisher` | 解析配置、选择 adapter、转发生命周期 | 具体协议实现、数据格式解析 |
+| 模型适配 | `IProtocolAdapter` | 将 `MediaPacket` 转成协议层的 `EncodedAccessUnit` | socket 会话、协议状态机 |
+| 协议运行时 | `IProtocol` | 管理协议资源，启动、写入、停止和统计 | 依赖具体 pipeline 或编码器 |
 
-## 配置模型
+codec 解析和 RTP 分片放在独立工具或 packetizer 中，避免 `DefaultPublisher` 和协议会话类继续膨胀。
 
-配置定义在 `include/media/publisher/publisher_config.h`。
+## 3. 核心数据模型
 
-### PublisherConfig
+### 3.1 PublisherConfig
 
-`PublisherConfig` 描述一次发布任务。
+`PublisherConfig` 描述一次发布任务：
 
-关键字段：
+```cpp
+struct PublisherConfig {
+    PublishMode mode;
+    PublishProtocol protocol;
 
-- `mode`：发布角色。
-  - `PublishMode::PushClient`：主动连接远端服务器。
-  - `PublishMode::PullServer`：本机监听，客户端来拉。
-- `protocol`：协议实现。
-  - `Auto`：由 `DefaultPublisher` 根据 `mode` 推断。
-  - `FfmpegMux`：使用 FFmpeg muxer 推流。
-  - `RtspServer`：本机 RTSP server。
-  - `RtpUdp`：预留，当前校验中暂不支持。
-- `url`：Push client 的目标地址，也可作为 Pull server 的显示地址。
-- `listen_host` / `listen_port` / `stream_path`：Pull server 监听参数。
-- `tracks`：媒体 track 元数据。
-- `ffmpeg`：FFmpeg muxer 选项。
-- `rtsp`：RTSP server 选项。
-  - `enable_tcp_interleaved`：是否接受 `RTP/AVP/TCP`。
-  - `enable_udp`：是否接受 UDP unicast 和 UDP multicast。
-  - `multicast_address` / `multicast_rtp_port` / `multicast_rtcp_port` / `multicast_ttl`：客户端 SETUP multicast 时未指定目标信息，则使用这些默认值。
-  - `max_payload_size`：H264 RTP payload 最大分片大小。
+    std::string url;
+    std::string listen_host;
+    std::uint16_t listen_port;
+    std::string stream_path;
 
-### MediaTrackConfig
+    std::vector<MediaTrackConfig> tracks;
+    FfmpegPublishOptions ffmpeg;
+    RtspServerOptions rtsp;
+};
+```
 
-`MediaTrackConfig` 描述一条媒体轨道。
+主要字段：
 
-关键字段：
+| 字段 | 含义 |
+|---|---|
+| `mode` | 网络角色，主动推流或本机等待拉流 |
+| `protocol` | 显式选择协议，或者使用 `Auto` |
+| `url` | Push Client 的目标地址；Pull Server 也可将其作为输出地址 |
+| `listen_host` / `listen_port` | RTSP Server 的监听地址和端口 |
+| `stream_path` | RTSP Server 对外暴露的流路径，应以 `/` 开头 |
+| `tracks` | 本次发布的所有音视频轨道 |
+| `ffmpeg` | FFmpeg 输出格式和 RTSP transport 选项 |
+| `rtsp` | 本机 RTSP Server 的 TCP、UDP、组播和 RTP 包大小配置 |
 
-- `track_id`：内部 track id。
-- `media_type`：视频、音频等。
-- `codec_type`：H264、H265、AAC 等。
-- `width` / `height` / `fps`：视频参数。
-- `sample_rate` / `channels`：音频参数。
-- `time_base_num` / `time_base_den`：packet 时间基。
-- `extra_data`：编码参数，例如 H264 SPS/PPS、AAC AudioSpecificConfig。
-- `rtp_payload_type` / `rtp_clock_rate`：RTP track 参数。
+`Auto` 当前只有两条推断规则：
 
-当前 RTSP server 支持 H264 视频 track，以及 AAC/G711A/G711U 音频 track。视频 RTP clock rate 为 90000；音频 RTP clock rate 使用采样率。
+```text
+PullServer -> RtspServer
+PushClient -> FfmpegMux
+```
 
-## Publisher 层
+建议生产代码显式填写 `protocol`。这样新增协议后不会因为默认推断规则改变而产生行为漂移。
 
-### IPublisher
+### 3.2 MediaTrackConfig
 
-定义在 `include/media/publisher/i_publisher.h`。
+`MediaTrackConfig` 是 Publisher 的静态轨道描述：
 
-职责：
+| 字段 | 约束和用途 |
+|---|---|
+| `track_id` | Publisher 内唯一的轨道编号，也是 RTSP `trackN` 和协议写入时的路由键 |
+| `media_type` / `codec_type` | 媒体类型和编码格式 |
+| `width` / `height` / `fps` | 视频参数 |
+| `sample_rate` / `channels` | 音频参数 |
+| `time_base_num` / `time_base_den` | 上游 packet 的时间基描述 |
+| `extra_data` | H264 SPS/PPS、AAC AudioSpecificConfig 等初始化数据 |
+| `rtp_payload_type` | SDP 和 RTP header 中使用的 payload type |
+| `rtp_clock_rate` | RTP timestamp 的时钟频率；H264 通常为 90000，音频使用采样率 |
 
-- 提供 pipeline 侧统一发布接口。
-- 管理发布生命周期。
-- 对外暴露播放地址和统计信息。
+多轨发布时，当前 adapter 使用 `MediaPacket::stream_index` 匹配 `track_id`。因此上游必须保证二者一致。单轨发布会直接映射到唯一 track，不依赖 `stream_index`。
 
-接口：
+### 3.3 MediaPacket 与 EncodedAccessUnit
+
+`MediaPacket` 是 pipeline 对外的编码包模型，`EncodedAccessUnit` 是 protocol 内部使用的模型。两者之间的转换由 adapter 完成。
+
+`EncodedAccessUnit` 保留以下协议必需信息：
+
+- `track_id`、媒体类型和 codec。
+- `pts`、`dts`、`duration` 和时间基。
+- keyframe 标记。
+- 编码数据 buffer 和可选的 FFmpeg backend handle。
+- H264 拆分后的 NAL unit 列表。
+
+FFmpeg 路径保留源 packet 的时间基，写入前转换到 `AVStream::time_base`。RTSP Server 路径则由 adapter 先把 PTS 转换为对应 track 的 RTP timestamp。
+
+### 3.4 PublisherStats
+
+当前公开统计如下：
+
+| 字段 | 含义 |
+|---|---|
+| `packets_published` | protocol 接受并发布的 access unit 数量，不是 RTP 分片数量 |
+| `bytes_published` | 编码 access unit 字节数或 FFmpeg packet 字节数 |
+| `clients_connected` | RTSP Server 当前有效客户端会话数 |
+| `rtcp_receiver_reports_received` | 收到且匹配本端 SSRC 的 RTCP report block 数量 |
+
+当前统计用于基本可观测性，尚不能表达每个 track、客户端和传输模式的质量情况。
+
+## 4. Publisher 层
+
+### 4.1 IPublisher
+
+`IPublisher` 是 pipeline 唯一应该依赖的发布接口：
 
 ```cpp
 class IPublisher {
@@ -106,56 +156,58 @@ public:
 };
 ```
 
-`IPublisher` 不关心具体协议，也不负责 H264 拆包、RTSP 会话、FFmpeg muxer 这些细节。
+接口语义：
 
-### DefaultPublisher
+- `Start()` 创建协议资源。重复调用时，当前默认实现会先停止旧任务。
+- `Publish()` 只接受已编码 packet；未启动或发送失败时返回 `false`。
+- `Stop()` 可以重复调用，析构函数也会执行停止。
+- `GetPlayUrl()` 返回协议输出地址。对 Push Client 来说是推流地址，对 Pull Server 来说是客户端播放地址。
+- `GetStats()` 返回当前统计快照。
 
-定义在 `include/media/publisher/default_publisher.h`，实现位于 `src/media/publisher/default_publisher.cpp`。
+当前接口没有错误码、状态回调、异步结果和背压语义。调用方只能通过布尔返回值和日志判断失败原因。
 
-职责：
+### 4.2 DefaultPublisher
 
-- 作为默认 `IPublisher` 实现。
-- 根据 `PublisherConfig` 选择协议 adapter。
-- 管理 adapter 的生命周期。
-- 将 `Publish()` 转发给 adapter。
+`DefaultPublisher` 是当前唯一的 `IPublisher` 实现。它是单目标、单 adapter 的发布编排器，而不是一种协议。
 
-它不是协议实现，也不直接处理 RTP/RTSP/FFmpeg。
-
-协议推断规则：
-
-```text
-protocol != Auto       -> 使用显式 protocol
-mode == PullServer     -> RtspServer
-mode == PushClient     -> FfmpegMux
-```
-
-调用链：
+调用链如下：
 
 ```text
 IPublisher::Create(config)
-  -> DefaultPublisher
+  -> DefaultPublisher(config)
+
 DefaultPublisher::Start(config)
+  -> Stop()
   -> ResolveProtocol(config)
+  -> PublisherConfig::IsValid()
   -> CreateProtocolAdapter(protocol)
   -> adapter->Open(config)
+
 DefaultPublisher::Publish(packet)
   -> adapter->Send(packet)
+
+DefaultPublisher::Stop()
+  -> adapter->Close()
+  -> destroy adapter
 ```
 
-## Protocol Adapter 层
+`DefaultPublisher` 适合当前的单目标发布，但后续仍可增加其他 `IPublisher` 实现。是否新增实现应由“发布策略是否变化”决定，而不是由“协议是否变化”决定：
 
-### IProtocolAdapter
+| 需求 | 扩展位置 |
+|---|---|
+| 新增 SRT、WebRTC、裸 RTP 等协议 | `IProtocolAdapter` + `IProtocol` |
+| 同时发布到多个目标 | `MultiPublisher : IPublisher` |
+| 网络写入与 pipeline 解耦 | `QueuedPublisher : IPublisher` 或统一异步编排层 |
+| 主备目标自动切换 | `FailoverPublisher : IPublisher` |
+| 自动重连、健康检查和状态事件 | `ManagedPublisher : IPublisher`，或作为通用装饰器 |
 
-定义在 `include/media/protocol/i_protocol_adapter.h`。
+不要为每一种协议都新增一个 `IPublisher`。协议差异应留在 adapter/protocol 层。
 
-职责：
+## 5. Protocol Adapter 层
 
-- 连接项目内部数据模型和协议运行时。
-- 接收 `MediaPacket`。
-- 完成协议需要的格式转换。
-- 持有或创建一个 `IProtocol`。
+### 5.1 IProtocolAdapter
 
-接口：
+Adapter 是项目数据模型与协议运行时的边界：
 
 ```cpp
 class IProtocolAdapter {
@@ -169,60 +221,47 @@ public:
 };
 ```
 
-扩展协议时，通常先新增一个 adapter，再新增一个 protocol。
+Adapter 应负责：
 
-### FfmpegProtocolAdapter
+- 校验协议支持的 track 和 codec。
+- 将 `stream_index` 映射成 `track_id`。
+- 处理 packet 时间基和协议时间戳转换。
+- 解析协议需要的 bitstream 元数据。
+- 创建并持有对应的 `IProtocol`。
 
-定义在 `include/media/protocol/ffmpeg_protocol_adapter.h`，实现位于 `src/media/protocol/ffmpeg_protocol_adapter.cpp`。
+Adapter 不应负责 socket 收发、客户端会话和 FFmpeg muxer 的资源生命周期。
 
-职责：
+### 5.2 FfmpegProtocolAdapter
 
-- 面向 FFmpeg muxer 的 adapter。
-- 将 `MediaPacket` 映射为 `EncodedAccessUnit`。
-- 单 track 发布时，强制映射到配置里的 `track_id`，避免编码器输出包的 `stream_index` 不稳定导致写入失败。
+`FfmpegProtocolAdapter` 的转换较薄：
+
+- 单轨时直接使用唯一的 `track_id`。
+- 多轨时使用 `MediaPacket::stream_index` 作为 `track_id`。
+- 保留 packet 的 PTS/DTS/duration/time base、buffer 和 FFmpeg backend handle。
 - 调用 `FfmpegMuxProtocol::Write()`。
 
-它不直接调用 `avformat_write_header` 或 `av_write_frame`，这些属于 `FfmpegMuxProtocol`。
+它不解析 H264 NAL，也不修改 bitstream。目标 muxer 是否要求 Annex-B、AVCC 或额外 bitstream filter，当前由上游和 FFmpeg muxer 的兼容性共同保证。
 
-### RtspServerProtocolAdapter
+### 5.3 RtspServerProtocolAdapter
 
-定义在 `include/media/protocol/rtsp_server_protocol_adapter.h`，实现位于 `src/media/protocol/rtsp_server_protocol_adapter.cpp`。
+`RtspServerProtocolAdapter` 当前支持 H264 视频和 AAC/G711 音频，负责：
 
-职责：
+- 校验 RTSP Server 支持的 codec。
+- 按 `track_id`、媒体类型和 codec 查找目标 track。
+- 将音频 `rtp_clock_rate` 规范为采样率。
+- 识别 Annex-B 和 AVCC H264 packet，并拆成 NAL units。
+- 从 H264 extradata 中解析 AVCC NAL length size 和 SPS/PPS。
+- 在关键帧缺少 SPS/PPS 时补入已知参数集。
+- 为每个 track 建立独立时间戳原点，将 packet PTS 转换成从 0 开始的 RTP timestamp。
+- 将音频编码数据原样交给 RTSP protocol 做 RTP payload 封装。
 
-- 面向本机 RTSP server 的 adapter。
-- 支持 H264 video 与 AAC/G711 audio。
-- 按 `MediaPacket.stream_index` / media type / codec 映射到 `MediaTrackConfig.track_id`。
-- H264 会拆成 NAL units，支持 Annex-B 和 AVCC 两类 H264 packet。
-- AAC/G711 直接保留 encoded payload，由 `RtspServerProtocol` 做 RTP audio payload 封装。
-- 从 `extra_data` 识别 AVCC NAL length size。
-- 按每个 track 的 RTP clock rate 换算 timestamp；音频使用 sample rate。
-- 将结果写入 `RtspServerProtocol`。
+这里的 RTP timestamp 使用无符号 32 位回绕语义。当前没有处理输入 PTS 大幅回退、跨 discontinuity 重建时间戳原点等异常流场景。
 
-关键转换：
+## 6. Protocol 层
 
-```text
-MediaPacket
-  -> H264Bitstream::SplitPacket() 或 audio encoded payload
-  -> EncodedAccessUnit{track_id, nals/audio payload, rtp timestamp, keyframe}
-  -> RtspServerProtocol::Write()
-```
+### 6.1 IProtocol
 
-注意：`EncodedAccessUnit.pts` 在 RTSP server 路径中已经被 adapter 转换成对应 track 的 RTP timestamp，`time_base` 会被设置为 `1/rtp_clock_rate`。
-
-## Protocol 层
-
-### IProtocol
-
-定义在 `include/media/protocol/i_protocol.h`。
-
-职责：
-
-- 表示协议运行时。
-- 负责启动、写入、停止协议资源。
-- 不直接依赖业务 pipeline。
-
-接口：
+`IProtocol` 表示一个协议运行时实例：
 
 ```cpp
 class IProtocol {
@@ -237,57 +276,41 @@ public:
 };
 ```
 
-### FfmpegMuxProtocol
+它管理网络、muxer、线程和会话等运行时资源，但不依赖解码器、编码器或 pipeline。
 
-定义在 `include/media/protocol/ffmpeg_mux_protocol.h`，实现位于 `src/media/protocol/ffmpeg_mux_protocol.cpp`。
+### 6.2 FfmpegMuxProtocol
 
-职责：
-
-- 封装 FFmpeg muxer 生命周期。
-- 创建 `AVFormatContext`。
-- 根据 `MediaTrackConfig` 创建 `AVStream`。
-- 写 header、写 packet、写 trailer。
-- 管理 FFmpeg output URL。
-
-内部对应 FFmpeg 调用：
+`FfmpegMuxProtocol` 封装 FFmpeg 输出复用器：
 
 ```text
-Start()
+Start
   -> avformat_alloc_output_context2
-  -> avformat_new_stream
+  -> 为每个 MediaTrackConfig 创建 AVStream
+  -> 写入 codec parameters 和 extradata
   -> avio_open2
   -> avformat_write_header
 
-Write()
-  -> av_packet_ref / av_new_packet
+Write
+  -> 引用 FFmpeg AVPacket 或复制编码 buffer
+  -> track_id 映射到 AVStream index
+  -> av_packet_rescale_ts 到输出 stream time base
   -> av_write_frame
 
-Stop()
+Stop
   -> av_write_trailer
   -> avio_closep
   -> avformat_free_context
 ```
 
-适用场景：
+代码中的 codec 映射包括 H264、H265、AAC、Opus、G711A 和 G711U。最终能否发布还取决于所选容器、FFmpeg muxer 和远端服务器是否接受该 codec 组合。
 
-- RTMP 推到 ZLMediaKit。
-- RTSP publish client 推到媒体服务器。
-- 其它 FFmpeg 支持的 muxer 输出。
+当前 `Write()` 是同步调用。远端拥塞、断网或 muxer 阻塞可能直接拖慢调用它的 pipeline 线程。
 
-### RtspServerProtocol
+### 6.3 RtspServerProtocol
 
-定义在 `include/media/protocol/rtsp_server_protocol.h`，实现位于 `src/media/protocol/rtsp_server_protocol.cpp`。
+`RtspServerProtocol` 使用 Boost.Asio 实现本机 RTSP Server。它拥有一个 `io_context` 线程，并为每个 RTSP TCP 连接创建 `ClientSession`。
 
-职责：
-
-- 本机启动 RTSP server。
-- 使用 Boost.Asio 监听 TCP 端口。
-- 管理 RTSP client session。
-- 处理 RTSP 方法。
-- 在 PLAY 状态下给客户端发送 RTP packet，当前支持 TCP interleaved、UDP unicast 和 UDP multicast。
-- 生成 SDP。
-
-当前支持的 RTSP 方法：
+已实现的 RTSP 方法：
 
 - `OPTIONS`
 - `DESCRIBE`
@@ -297,101 +320,90 @@ Stop()
 - `TEARDOWN`
 - `GET_PARAMETER`
 
-当前 RTP 传输：
+已实现的传输模式：
 
-- 支持 `RTP/AVP/TCP;unicast;interleaved=0-1`
-- 支持 `RTP/AVP;unicast;client_port=RTP-RTCP`
-- 支持 `RTP/AVP;multicast;destination=239.x.x.x;port=RTP-RTCP;source=server-ip;ttl=N`
-- 支持 RTCP sender report：TCP interleaved 使用 RTCP channel，UDP unicast 使用客户端 RTCP 端口，UDP multicast 使用共享组播 RTCP 端口
-- 支持解析客户端 RTCP receiver report：TCP interleaved、UDP unicast 和 UDP multicast 都会消费 compound RTCP，并提取 RR report block 的丢包、最高序列号、jitter、LSR/DLSR
-- `PublisherStats.rtcp_receiver_reports_received` 会累计已接收的 RTCP receiver report block 数量
+| 模式 | SETUP Transport 示例 | 视频 | 音频 | RTCP |
+|---|---|---:|---:|---:|
+| TCP interleaved | `RTP/AVP/TCP;unicast;interleaved=0-1` | 支持 | 支持 | SR 发送、RR 接收 |
+| UDP unicast | `RTP/AVP;unicast;client_port=5000-5001` | 支持 | 支持 | SR 发送、RR 接收 |
+| UDP multicast | `RTP/AVP;multicast;destination=239.x.x.x;port=5004-5005` | 仅 H264 | 暂不支持 | 共享 SR 发送、RR 接收 |
 
-写入链路：
+`RtspTransportSpec` 独立负责解析 Transport 候选项，以及生成 SETUP 响应。RTSP protocol 根据配置决定是否接受 TCP、UDP 和 multicast。
+
+### 6.4 RTP 与 SDP
+
+当前 RTSP Server codec 能力：
+
+| Codec | SDP | RTP payload |
+|---|---|---|
+| H264 | `H264/90000`，包含 profile-level-id 和可选 sprop-parameter-sets | 单 NAL 或 FU-A 分片 |
+| AAC | RFC 3640 `MPEG4-GENERIC`，包含 AAC-hbr fmtp 和 AudioSpecificConfig | AU header + raw AAC access unit；输入带 ADTS 时会去掉 ADTS header |
+| G711A | `PCMA/<sample_rate>/<channels>` | 编码数据直接作为 RTP payload |
+| G711U | `PCMU/<sample_rate>/<channels>` | 编码数据直接作为 RTP payload |
+
+H264 packetizer 只负责生成 RTP payload 和 marker，不负责 RTP header、sequence、SSRC 或 socket。后者由 session 或共享 multicast sender 管理。
+
+多轨 RTSP 会话按 track 维护独立的 payload type、SSRC、sequence 和 RTCP 状态。multicast 目前仍是 protocol 级共享的单 H264 sender，所以尚不能承载音频或多个视频 track。
+
+### 6.5 RTCP
+
+当前行为：
+
+- 每个 TCP/UDP unicast track 在发送首个 RTP 后发送 Sender Report，后续有媒体写入时每 5 秒补发。
+- multicast 使用共享 SSRC、packet count 和 octet count 生成 Sender Report。
+- TCP interleaved、UDP unicast 和 UDP multicast 都可以解析 compound RTCP。
+- Receiver Report 中的 fraction lost、cumulative lost、highest sequence、jitter、LSR 和 DLSR 会被解析。
+- multicast 按 reporter SSRC 聚合反馈。
+- SDES、BYE 和 APP 当前仅识别并忽略。
+
+Sender Report 目前由媒体发送路径触发，不是独立定时器。因此流暂停或长时间没有新 packet 时，不会单独周期发送 SR。
+
+## 7. 两条典型数据链路
+
+### 7.1 推送到 ZLMediaKit
 
 ```text
-RtspServerProtocol::Write(access_unit)
-  -> H264: H264RtpPacketizer::Packetize(access_unit)
-  -> AAC: RFC 3640 MPEG4-GENERIC AU header + raw AAC access unit
-  -> G711A/G711U: RTP payload 直载
-  -> snapshot current sessions
-  -> TCP interleaved / UDP unicast: 逐个 PLAYING client session 发送
-  -> UDP multicast: 当前只对 H264 video 通过 protocol 级共享 sender 发送一份 RTP
-  -> 首个 RTP 包后发送 RTCP sender report，后续每 5 秒补发
-  -> TCP interleaved / UDP unicast: 按 session 接收并解析客户端 RTCP receiver report
-  -> UDP multicast: protocol 级接收组播 RTCP receiver report，并按 reporter SSRC 聚合
-  -> TCP interleaved RTP/RTCP frame 或 UDP RTP/RTCP datagram
+MediaPacket(H264/AAC)
+  -> DefaultPublisher
+  -> FfmpegProtocolAdapter
+  -> EncodedAccessUnit
+  -> FfmpegMuxProtocol
+  -> FFmpeg RTSP muxer over TCP
+  -> ZLMediaKit
 ```
 
-RTSP server 和 FFmpeg muxer 的角色差异：
-
-| Protocol | 网络角色 | 行为 |
-|---|---|---|
-| `FfmpegMuxProtocol` | Push client | 主动连接远端服务器并写入 |
-| `RtspServerProtocol` | Pull server | 本机监听端口，等待客户端拉流 |
-
-## H264 工具与 RTP packetizer
-
-### H264Bitstream
-
-定义在 `include/media/protocol/h264_bitstream.h`，实现位于 `src/media/protocol/h264_bitstream.cpp`。
-
-职责：
-
-- 判断 packet 是否 Annex-B。
-- 拆 Annex-B NAL。
-- 拆 AVCC length-prefixed NAL。
-- 解析 AVCC extradata 中的 NAL length size。
-- 从 extradata 或 NAL 列表中提取 SPS/PPS。
-- base64 编码 SPS/PPS，用于 SDP 的 `sprop-parameter-sets`。
-
-当前支持：
-
-- Annex-B start code：`00 00 01` 和 `00 00 00 01`
-- AVCC length size：1 到 4 字节
-- H264 SPS/PPS 提取
-
-### H264RtpPacketizer
-
-定义在 `include/media/protocol/h264_rtp_packetizer.h`，实现位于 `src/media/protocol/h264_rtp_packetizer.cpp`。
-
-职责：
-
-- 将 H264 NAL units 转成 RTP payload。
-- 小 NAL 直接单包发送。
-- 大 NAL 使用 FU-A 分片。
-- 设置 RTP marker bit。
-
-它只生成 RTP payload，不写 RTP header，也不写 socket。RTP header 和 TCP interleaved header 由 `RtspServerProtocol::ClientSession` 生成。
-
-## 典型使用方式
-
-### 推到远端媒体服务器
+示例配置：
 
 ```cpp
 PublisherConfig config;
 config.mode = PublishMode::PushClient;
 config.protocol = PublishProtocol::FfmpegMux;
-config.url = "rtmp://127.0.0.1/live/main";
-config.ffmpeg.format_name = "flv";
-
-MediaTrackConfig track;
-track.track_id = 0;
-track.media_type = MediaType::VIDEO;
-track.codec_type = CodecType::H264;
-track.width = 1920;
-track.height = 1080;
-track.time_base_num = 1;
-track.time_base_den = 1000000;
-track.extra_data = encoder.GetExtraData();
-config.tracks.push_back(track);
+config.url = "rtsp://127.0.0.1:554/live/main";
+config.ffmpeg.format_name = "rtsp";
+config.ffmpeg.rtsp_transport = "tcp";
+config.tracks = {video_track, aac_audio_track};
 
 auto publisher = IPublisher::Create(config);
-publisher->Start(config);
-publisher->Publish(packet);
-publisher->Stop();
+if (!publisher || !publisher->Start(config)) {
+    // 启动失败。
+}
 ```
 
-### 本机 RTSP server 发布
+当前摄像头手动测试会把视频编码为 H264、把音频编码为 AAC，然后同时注册到 ZLM publisher。
+
+### 7.2 本机 RTSP Server
+
+```text
+MediaPacket(H264/AAC/G711)
+  -> DefaultPublisher
+  -> RtspServerProtocolAdapter
+  -> NAL split / RTP timestamp conversion
+  -> RtspServerProtocol
+  -> SDP + RTSP session + RTP/RTCP
+  -> VLC
+```
+
+示例配置：
 
 ```cpp
 PublisherConfig config;
@@ -400,150 +412,344 @@ config.protocol = PublishProtocol::RtspServer;
 config.listen_host = "0.0.0.0";
 config.listen_port = 8554;
 config.stream_path = "/live/main";
-
-MediaTrackConfig track;
-track.track_id = 0;
-track.media_type = MediaType::VIDEO;
-track.codec_type = CodecType::H264;
-track.width = 1920;
-track.height = 1080;
-track.time_base_num = 1;
-track.time_base_den = 1000000;
-track.extra_data = encoder.GetExtraData();
-config.tracks.push_back(track);
+config.rtsp.enable_tcp_interleaved = true;
+config.rtsp.enable_udp = true;
+config.rtsp.enable_multicast = false;
+config.tracks = {video_track, audio_track};
 
 auto publisher = IPublisher::Create(config);
 publisher->Start(config);
-
-// Client can play:
-// rtsp://127.0.0.1:8554/live/main
-publisher->Publish(packet);
+// 播放地址：rtsp://127.0.0.1:8554/live/main
 ```
 
-## 扩展指南
+multicast 默认关闭。只有确实需要组播且客户端只订阅当前支持的 H264 track 时才应开启。
 
-### 新增一种协议
+## 8. 生命周期、并发与错误边界
 
-例如新增裸 RTP UDP 发布。
+当前约束：
 
-步骤：
+- `DefaultPublisher` 本身没有锁，不应在多个线程并发调用 `Start()`、`Publish()` 和 `Stop()`。
+- `FfmpegMuxProtocol::Write()` 是同步的，也没有内部并发保护，应由单一发布线程调用。
+- `RtspServerProtocol` 的网络事件运行在内部 Asio 线程；`Write()` 可读取 session 快照并把发送任务交给会话，但调用方仍应串行发布同一 track，保证 packet 顺序。
+- `Stop()` 会关闭协议资源。调用方必须先停止上游继续产生 packet，避免 `Publish()` 与 `Stop()` 竞争。
+- 当前错误主要写日志并返回 `false`，没有结构化错误原因和状态事件。
 
-1. 在 `PublishProtocol` 中启用或新增枚举值。
-2. 新增 `RtpUdpProtocolAdapter : IProtocolAdapter`。
-3. 新增 `RtpUdpProtocol : IProtocol`。
-4. 在 `CreateProtocolAdapter()` 中注册。
-5. 添加协议级单元测试和至少一个集成测试。
-
-落点判断：
-
-- 需要处理 `MediaPacket`、codec、时间戳、extradata：写在 adapter。
-- 需要处理 socket、协议状态、连接、发送：写在 protocol。
-- 需要处理 H264/H265/AAC RTP 分片：写在 packetizer。
-
-### 新增一种 codec
-
-例如新增 H265 over RTSP。
-
-步骤：
-
-1. 新增 `H265Bitstream` 或通用 NAL parser。
-2. 新增 `H265RtpPacketizer`。
-3. 扩展 `RtspServerProtocolAdapter`，根据 `CodecType::H265` 选择 parser。
-4. 扩展 `RtspServerProtocol::BuildSdp()`，生成 H265 SDP。
-5. 增加 H265 单测和 RTSP 拉流验证。
-
-### 新增一种发布策略
-
-不是所有扩展都应该新增 `IPublisher` 实现。判断规则：
+推荐的 pipeline 停止顺序：
 
 ```text
-协议差异 -> 扩展 IProtocolAdapter / IProtocol
-发布策略差异 -> 扩展 IPublisher
+停止输入/拉流
+  -> 停止向编码器送帧
+  -> flush 编码器并发布剩余 packet
+  -> 停止 Publisher
+  -> 销毁编码器和上游资源
 ```
 
-适合新增 `IPublisher` 实现的例子：
+## 9. 当前能力状态
 
-- `MultiPublisher`：同时发布到 RTSP server 和 RTMP server。
-- `QueuedPublisher`：内部带队列，避免网络写阻塞 pipeline。
-- `FailoverPublisher`：主备发布地址自动切换。
-- `ManagedPublisher`：带重连、健康检查、状态事件。
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| FFmpeg RTSP/RTMP push | 已实现 | 具体格式由 URL 和 `format_name` 决定 |
+| FFmpeg 多音视频轨 | 已实现 | `stream_index` 必须与 `track_id` 对齐 |
+| 本机 RTSP H264 | 已实现 | Annex-B、AVCC、FU-A、SPS/PPS |
+| 本机 RTSP AAC/G711 | 已实现 | TCP interleaved 和 UDP unicast |
+| UDP multicast | 部分实现 | 仅共享 H264 video sender |
+| RTCP SR/RR | 已实现基础版本 | 缺 SDES/BYE、超时和详细指标导出 |
+| 裸 RTP UDP publisher | 未实现 | `RtpUdp` 仍为占位值，配置校验直接拒绝 |
+| WebRTC publisher | 未实现 | 枚举和独立规划文档已存在，工厂尚未注册 |
+| 自动重连/主备切换 | 未实现 | FFmpeg 写失败后由调用方处理 |
+| 发布队列和背压 | 未实现 | 当前同步传播协议写入延迟 |
+| RTSP 鉴权/TLS | 未实现 | 仅适合可信网络内使用 |
 
-当前 `DefaultPublisher` 适合单协议、单发布目标场景。
+## 10. 已知限制与技术债
 
-## 当前限制
+### 配置与接口
 
-RTSP server 当前限制：
+- `PublisherConfig::IsValid()` 只做基础校验，没有完整检查 mode/protocol 组合、重复 track id、重复 payload type、端口对和 codec/协议兼容性。
+- `PublishProtocol::WebRtc` 可以通过基础配置校验，但 adapter 工厂会返回空；`RtpUdp` 则在配置校验阶段直接失败，两种占位协议的行为不一致。
+- `IPublisher::Create(config)` 保存一份配置，但 `Start(config)` 又接受一份配置，存在“双配置源”。
+- 布尔返回值无法区分配置错误、网络错误、远端拒绝和运行时断流。
 
-- 支持 H264 video、AAC audio、G711A/G711U audio。
-- 支持多 track SDP 和多 track SETUP；每个 RTSP session 按 track 维护独立 SSRC、sequence、RTCP SR/RR 状态。
-- 支持 RTSP over TCP interleaved、UDP unicast 和标准共享 UDP multicast。
-- UDP multicast 当前只支持 H264 video；音频 multicast 需要后续扩展独立端口组。
-- UDP multicast 使用 protocol 级共享 socket、SSRC 和 sequence；多个客户端订阅同一个组播流，不会按客户端数量重复发送。
-- 已发送 RTCP sender report，并解析 TCP interleaved、UDP unicast、UDP multicast 客户端回传的 RTCP receiver report。
-- RTCP SDES、BYE、APP 当前只识别并忽略。
+### FFmpeg 推流
+
+- 同步写入可能阻塞 pipeline。
+- 没有自动重连、退避、关键帧等待和断线期间的 packet 丢弃策略。
+- 没有统一 bitstream filter 层；不同 muxer 的 H264/H265 格式要求需要逐个验证。
+- 多轨路由依赖 `stream_index == track_id` 的外部约定。
+
+### RTSP Server
+
 - RTSP request parser 是最小可用实现，不是完整 RFC 解析器。
-- SDP 中 H264 SPS/PPS 可从 `extra_data` 或写入包中更新，但客户端通常在 `DESCRIBE` 阶段就需要完整参数，因此生产路径建议在 `MediaTrackConfig.extra_data` 中提供 SPS/PPS。
-- SDP 中 AAC `config` 优先来自 `MediaTrackConfig.extra_data`；为空时会按 AAC-LC、sample rate、channels 生成 AudioSpecificConfig。
+- 没有 Basic/Digest 鉴权、RTSPS、会话 idle timeout、访问控制和连接数限制。
+- 只支持 H264 视频，尚未支持 H265。
+- multicast 只有单 H264 track，共享一组 RTP/RTCP 端口、SSRC 和 sequence。
+- 没有 RTCP SDES/BYE，也没有基于 RR 的质量告警或码率反馈。
+- 时间戳异常、重连后的 discontinuity 和长时间运行时的回绕测试还不充分。
 
-FFmpeg muxer 当前限制：
+### 可维护性与测试
 
-- 多 track 支持依赖 `track_id` 与 packet 映射。
-- 单 track 时 adapter 会忽略不稳定的 `packet.stream_index`，直接映射到配置中的唯一 track。
+- `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
+- 手动摄像头链路和协议自动测试目前混在 `test_rtsp_server_publisher`，并通过常量选择；当前默认进入不设时长的摄像头循环。
+- 部分协议测试函数在 `main()` 中被注释，没有作为 CTest 自动回归执行。
+- 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
 
-## 测试覆盖
+## 11. 扩展方法
+
+### 11.1 新增协议
+
+以 SRT 或裸 RTP UDP 为例：
+
+1. 在 `PublishProtocol` 中增加或启用枚举值。
+2. 定义协议专用配置，避免把所有字段继续堆进 `PublisherConfig` 顶层。
+3. 新增 `XxxProtocolAdapter : IProtocolAdapter`，完成 track、时间戳和 bitstream 适配。
+4. 新增 `XxxProtocol : IProtocol`，管理协议连接和写入。
+5. 在 `CreateProtocolAdapter()` 注册。
+6. 为配置校验、adapter 转换和 protocol 生命周期添加单元测试。
+7. 添加至少一个真实接收端的端到端测试。
+
+职责判断：
+
+```text
+MediaPacket / track / codec / timestamp 转换 -> Adapter
+连接 / socket / muxer / 会话 / 重连       -> Protocol
+NAL / AU / RTP payload 分片                -> Packetizer
+队列 / 多目标 / 主备 / 策略                -> Publisher
+```
+
+### 11.2 新增 codec
+
+以 H265 over RTSP 为例：
+
+1. 增加 H265 Annex-B/HVCC parser 和 VPS/SPS/PPS 提取。
+2. 实现 RFC 7798 RTP packetizer。
+3. 扩展 `RtspServerProtocolAdapter` 的 codec 校验和 access unit 转换。
+4. 扩展 SDP，生成 `H265/90000` 和对应 fmtp。
+5. 验证单 NAL、分片、关键帧参数集、多客户端和三种 transport。
+
+FFmpeg mux 路径已有 H265 codec 映射，但仍需针对目标格式和服务器验证 bitstream 形式。
+
+### 11.3 新增发布策略
+
+发布策略应实现或组合 `IPublisher`：
+
+- `QueuedPublisher`：有界队列、丢包策略、独立工作线程和背压统计。
+- `MultiPublisher`：把同一个 packet 发布到多个子 publisher，并定义部分失败语义。
+- `FailoverPublisher`：主目标失败后切到备用目标。
+- `ManagedPublisher`：状态机、重连退避、健康检查和事件回调。
+
+这些策略可以用装饰器组合，避免把队列、重连、多目标全部塞入 `DefaultPublisher`。
+
+## 12. 后续改进计划
+
+路线图按依赖关系排列。P0 先固定接口契约和回归基线，P1 再补可靠性与缺失媒体能力，P2 扩展协议和生产能力。
+
+### P0：稳定当前边界和回归基线
+
+#### 12.1 配置校验和能力查询
+
+目标：让不支持的组合在创建网络资源前给出明确错误。
+
+工作项：
+
+- 将 `IsValid()` 拆成结构校验和协议能力校验。
+- 校验 mode/protocol 是否匹配、track id 和 RTP payload type 是否唯一。
+- 校验 RTSP transport 至少启用一种，multicast 必须依赖 UDP。
+- 校验 RTP/RTCP 端口、payload type 范围、音频采样率和 codec 必需 extradata。
+- 统一 `RtpUdp`、`WebRtc` 等未实现协议的失败行为。
+- 提供 `ProtocolCapabilities` 或等价查询，让上层在启动前获知 codec、transport 和多轨能力。
+
+验收标准：错误配置不启动 socket/muxer，并能得到稳定的错误码和可读消息。
+
+#### 12.2 生命周期和错误模型
+
+目标：明确 Publisher 状态和失败恢复方式。
+
+工作项：
+
+- 引入 `Created/Starting/Running/Stopping/Stopped/Failed` 状态。
+- 消除 Create 和 Start 的双配置源，二选一：构造时固定配置，或只在 `Start(config)` 传入。
+- 用 `PublisherResult`/`PublisherError` 替代只有布尔值的失败结果。
+- 明确 `Publish()` 与 `Stop()` 的并发契约，并补竞态测试。
+- 增加启动失败、运行时断流和停止完成事件。
+
+验收标准：调用方不解析日志即可区分配置、连接、写入和远端错误。
+
+#### 12.3 测试拆分和自动化
+
+目标：默认测试有限时、可重复、无需摄像头和外部服务。
+
+工作项：
+
+- 将协议自动测试与无限时摄像头手动测试拆成两个 executable。
+- 恢复 TCP、UDP unicast、音视频和 multicast 测试函数的默认执行。
+- 将有限时协议测试注册到 CTest。
+- 保留摄像头和 ZLMediaKit 链路为显式手动测试。
+- 增加异常 Transport、错误 CSeq/Session、客户端中途断开和重复 Stop 测试。
+
+验收标准：无外部设备时可自动覆盖 Publisher 创建、SDP、SETUP/PLAY、RTP 和 RTCP 基础路径。
+
+### P1：补齐媒体能力和发布可靠性
+
+#### 12.4 多轨 multicast
+
+目标：支持 H264 + AAC/G711 的标准组播发布。
+
+工作项：
+
+- multicast 状态从单一全局 sender 改为 `track_id -> MulticastTrackState`。
+- 每个 track 分配独立 RTP/RTCP 端口、SSRC、sequence 和 RTCP 计数。
+- SDP 为每个 multicast track 输出正确的 `m=` 端口。
+- 音频使用自身 payload type 和 clock rate。
+- 按 track 和 reporter SSRC 聚合 RR。
+- 增加双客户端订阅同一音视频组播但每个 track 只发送一份数据的测试。
+
+验收标准：VLC 可通过 multicast 同时播放 H264 + AAC/G711，RTCP SR/RR 分轨正确。
+
+#### 12.5 RTCP 完整性与质量统计
+
+目标：让 RTCP 既满足互操作，也能用于诊断网络质量。
+
+工作项：
+
+- 使用独立 timer 调度周期 SR，不依赖新媒体 packet 触发。
+- 增加 SDES CNAME，在停止 track/session 时发送 BYE。
+- 暴露 per-track/per-client 丢包率、jitter、RTT、最后 RR 时间。
+- 对长时间无 RR、持续高丢包和高 jitter 提供状态事件。
+- 增加 NTP/RTP 映射、32 位 timestamp 回绕和 compound RTCP 边界测试。
+
+验收标准：Wireshark 校验 RTCP compound packet 合法，统计可定位到客户端和 track。
+
+#### 12.6 异步队列和背压
+
+目标：远端网络阻塞不拖住解码、推理和编码线程。
+
+工作项：
+
+- 实现有界 `QueuedPublisher`，由专用线程调用下游 publisher。
+- 支持按媒体类型配置队列容量和丢弃策略。
+- 视频拥塞时优先丢弃非关键帧，并在恢复后等待关键帧。
+- 音频定义连续性策略，避免无限积压导致延迟不断增长。
+- 增加 queue depth、dropped packets、write latency 和 last error 统计。
+
+验收标准：模拟慢写入时 pipeline 延迟有界，内存不持续增长，恢复后能从关键帧正常播放。
+
+#### 12.7 FFmpeg 推流重连
+
+目标：ZLMediaKit 重启或短时断网后自动恢复。
+
+工作项：
+
+- 为 FFmpeg protocol 增加连接状态和指数退避。
+- 重建 `AVFormatContext`、stream 和 header。
+- 重连期间执行有界丢包，并在连接恢复后等待视频关键帧。
+- 确保 AAC extradata、H264 SPS/PPS 和时间戳在新会话中重新初始化。
+- 增加 MediaServer 重启集成测试。
+
+验收标准：远端恢复后无需重启 pipeline，播放器可重新拉到音视频且时间戳单调。
+
+### P2：协议扩展和生产化
+
+#### 12.8 H265 over RTSP
+
+按照 11.2 的扩展步骤实现 H265 parser、packetizer、SDP 和测试。优先复用通用 NAL 工具，但不要用 H264 的 NAL type 和 FU-A 逻辑硬套 H265。
+
+#### 12.9 RTSP Server 生产能力
+
+工作项：
+
+- 将 request parser、session、RTP sender、RTCP 和 multicast 拆为独立组件。
+- 增加 Basic/Digest 鉴权、会话超时、最大连接数和访问控制。
+- 评估 RTSPS、IPv6、RTSP aggregate control 和更完整的 RFC 错误响应。
+- 增加慢客户端隔离和每客户端发送队列上限。
+- 使用 VLC、FFmpeg、GStreamer 和常见 NVR 做互操作矩阵测试。
+
+#### 12.10 多目标和主备发布
+
+先实现 `MultiPublisher` 的失败策略，再在其上实现 `FailoverPublisher`：
+
+- 明确 all-success、any-success 和 required-target 语义。
+- 每个目标拥有独立队列和状态，单个慢目标不能拖慢其他目标。
+- 允许本机 RTSP Server 与 ZLM push 同时发布。
+- 汇总统计时保留每个子 publisher 的明细。
+
+#### 12.11 WebRTC 和其他协议
+
+WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，通过 `PublishProtocol::WebRtc` 接入现有 Publisher 边界。裸 RTP UDP 可作为更小的协议先实现，用于验证 protocol/adapter 扩展流程。
+
+### P3：长期优化
+
+- 将 publisher 指标接入统一 metrics/HTTP API。
+- 增加 packet trace id 和结构化事件，串联 pull、decode、encode、publish 延迟。
+- 评估 buffer 零拷贝和 RTP scatter/gather write，减少高码率多客户端场景的复制。
+- 增加 24 小时稳定性测试、时间戳回绕测试和故障注入。
+- 建立协议兼容性文档，记录 codec、容器、服务器和播放器组合。
+
+## 13. 推荐实施顺序
+
+建议按以下里程碑推进：
+
+| 里程碑 | 内容 | 依赖 |
+|---|---|---|
+| M1 | 测试拆分、配置校验、结构化错误 | 无 |
+| M2 | RTCP timer/SDES/BYE、分轨质量统计 | M1 |
+| M3 | 多轨音视频 multicast | M1、M2 的分轨状态模型 |
+| M4 | QueuedPublisher、背压和 FFmpeg 重连 | M1 |
+| M5 | MultiPublisher/FailoverPublisher | M4 |
+| M6 | H265、RTSP 鉴权和互操作增强 | M1，可与 M4 并行 |
+| M7 | WebRTC 或其他新协议 | M1、统一能力查询和错误模型 |
+
+其中 M1 应优先完成。它不会扩大协议功能，但会显著降低后续每次扩展的调试成本。
+
+## 14. 测试与验证
 
 当前相关测试：
 
-- `test_publisher_protocol`
-  - `PublisherConfig` 校验。
-  - Annex-B H264 拆包。
-  - AVCC extradata SPS/PPS 解析。
-  - AVCC packet 拆包。
-  - H264 FU-A 分片。
-- `test_rtsp_server_publisher`
-  - 启动本机 RTSP publisher。
-  - 执行 `DESCRIBE -> SETUP -> PLAY`。
-  - 发布一帧 H264 packet。
-  - 验证 H264 + AAC 双 track SDP、双 SETUP、TCP interleaved RTP/RTCP。
-  - 验证只 SETUP AAC audio track 时，UDP unicast 能收到 RFC 3640 AAC RTP payload 和 RTCP sender report。
-  - 验证客户端收到 RTP over TCP interleaved frame。
-  - 验证 UDP unicast SETUP 返回 `server_port`，并且客户端 UDP socket 能收到 RTP packet。
-  - 验证 TCP interleaved、UDP unicast 和 UDP multicast 都能收到 RTCP sender report。
-  - 验证 TCP interleaved、UDP unicast 和 UDP multicast 可以接收客户端 compound RTCP receiver report。
-  - 验证 UDP multicast SDP/SETUP 返回 `destination/port/source/ttl`，两个 RTSP 客户端订阅时仍只发送一份组播 RTP。
-- `test_rtsp_decode_encode_push_zlm`
-  - 已迁移为通过 `IPublisher` 使用 `FfmpegMuxProtocol` 推到 ZLMediaKit。
+| 测试 | 覆盖内容 |
+|---|---|
+| `test_publisher_protocol` | 配置基础校验、Annex-B/AVCC、H264 FU-A、RTSP Transport 解析 |
+| `test_rtsp_server_publisher` | TCP/UDP/multicast、音视频 SDP、RTP、RTCP，以及手动摄像头双路发布 |
+| `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
+| `test_rtsp_decode_encode_push_zlm` | RTSP 拉流、解码、编码并通过 FFmpeg publisher 推送 ZLM |
 
-运行：
+构建和运行默认测试：
 
 ```powershell
 .\build.ps1 -Action test -Tests
 ```
 
-## 文件地图
+手动摄像头链路当前使用固定地址：
 
-Publisher 层：
+```text
+输入：rtsp://192.168.66.83/live/mainstream
+本机 RTSP：rtsp://127.0.0.1:7852/camera/mainstream
+ZLM RTSP：rtsp://127.0.0.1:554/live/video_pipeline_av_test
+```
+
+该测试持续拉取摄像头，不限制时长和帧数，必须手动结束。它不应作为后续默认 CTest 用例。
+
+## 15. 文件地图
+
+Publisher 接口和实现：
 
 - `include/media/publisher/i_publisher.h`
 - `include/media/publisher/publisher_config.h`
 - `include/media/publisher/default_publisher.h`
 - `src/media/publisher/default_publisher.cpp`
 
-Protocol 抽象：
+Protocol 抽象和工厂：
 
 - `include/media/protocol/i_protocol.h`
 - `include/media/protocol/i_protocol_adapter.h`
 - `include/media/protocol/protocol_types.h`
 - `src/media/protocol/protocol_adapter_factory.cpp`
 
-FFmpeg 协议：
+FFmpeg publisher：
 
 - `include/media/protocol/ffmpeg_protocol_adapter.h`
 - `include/media/protocol/ffmpeg_mux_protocol.h`
 - `src/media/protocol/ffmpeg_protocol_adapter.cpp`
 - `src/media/protocol/ffmpeg_mux_protocol.cpp`
 
-RTSP server 协议：
+RTSP Server publisher：
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
@@ -552,7 +758,7 @@ RTSP server 协议：
 - `src/media/protocol/rtsp_server_protocol.cpp`
 - `src/media/protocol/rtsp_transport_spec.cpp`
 
-H264/RTP 工具：
+RTP/bitstream 工具：
 
 - `include/media/protocol/h264_bitstream.h`
 - `include/media/protocol/h264_rtp_packetizer.h`
@@ -561,10 +767,12 @@ H264/RTP 工具：
 
 测试：
 
-- `test/test_publisher_protocol.cpp`
-- `test/test_rtsp_server_publisher.cpp`
-- `test/test_rtsp_decode_encode_push_zlm.cpp`
+- `test/media/test_publisher_protocol.cpp`
+- `test/media/test_rtsp_server_publisher.cpp`
+- `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
+- `test/media/test_rtsp_decode_encode_push_zlm.cpp`
 
-## 关联文档
+## 16. 关联文档
 
 - [RTSP / ZLMediaKit Pipeline 排障记录](rtsp-zlm-pipeline-troubleshooting.md)
+- [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md)

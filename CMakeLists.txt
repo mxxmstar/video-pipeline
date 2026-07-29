@@ -279,6 +279,8 @@ list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\common\\\\process\\\\.*\
 if(NOT ENABLE_PCAP)
     list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*/ethernet_capture\\.cpp$")
     list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\ethernet_capture\\.cpp$")
+    list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*/avtp_puller\\.cpp$")
+    list(FILTER VIDEO_PIPELINE_SOURCES EXCLUDE REGEX ".*\\\\avtp_puller\\.cpp$")
 endif()
 
 if(NOT VIDEO_PIPELINE_BUILD_INFERENCE)
