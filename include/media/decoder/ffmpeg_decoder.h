@@ -24,6 +24,9 @@ extern "C" {
 /// 注意：
 ///   - 暂不支持硬件加速解码
 ///   - 解码器状态由 avcodec 内部管理，无需额外包排序缓冲
+// 当前 decoder 支持两类输入：
+// 1. FFmpeg backend：MediaPacket.backend.ptr 指向 AVPacket，零拷贝送入 decoder；
+// 2. 普通 IMediaBuffer：例如 AVTP 输出的 SimpleBuffer，Decode() 中临时包装成 AVPacket。
 class FFmpegDecoder : public IDecoder {
 public:
     FFmpegDecoder() = default;

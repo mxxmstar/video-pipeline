@@ -7,6 +7,8 @@
 #include "common/log/logger.h"
 
 #include <cstddef>
+#include <cstring>
+#include <limits>
 
 extern "C" {
 #include <libavutil/avutil.h>
@@ -169,22 +171,61 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
         return false;
     }
 
-    // 从 BackendHandle 获取 AVPacket*
+    // FFmpegPuller 输出的 packet 已经持有 AVPacket，可以直接复用。
+    // AVTP/RTP 等输入通常只持有普通 IMediaBuffer，这里临时包装成 AVPacket。
     AVPacket* avpkt = nullptr;
+    AVPacket* temporary_packet = nullptr;
     if (packet->backend.type == BackendHandle::FFMPEG) {
         avpkt = static_cast<AVPacket*>(packet->backend.ptr);
     } else {
-        LOG_ERROR("non-FFmpeg backend not supported");
-        return false;
+        const std::size_t packet_size = packet->buffer->Size();
+        if (!packet->buffer->Data() || packet_size == 0 ||
+            packet_size > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+            LOG_ERROR("FFmpegDecoder:Decode: invalid raw packet");
+            return false;
+        }
+
+        temporary_packet = av_packet_alloc();
+        if (!temporary_packet ||
+            av_new_packet(temporary_packet, static_cast<int>(packet_size)) < 0) {
+            av_packet_free(&temporary_packet);
+            LOG_ERROR("FFmpegDecoder:Decode: AVPacket allocation failed");
+            return false;
+        }
+
+        std::memcpy(temporary_packet->data, packet->buffer->Data(), packet_size);
+
+        // MediaPacket 的时间戳单位由 packet->time_base 描述；而 libavcodec 期望
+        // AVPacket 时间戳落在 codec_ctx_->pkt_timebase 下。这里做一次显式换算，
+        // 使 AVTP 这类微秒时间戳，以及测试中从 FFmpegPuller 复制出来的微秒
+        // MediaPacket，都能进入同一条 decoder 路径。
+        const AVRational source_time_base = ToAVRational(packet->time_base);
+        const AVRational decoder_time_base = IsValidTimeBase(codec_ctx_->pkt_timebase)
+            ? codec_ctx_->pkt_timebase
+            : source_time_base;
+        const auto rescale_timestamp = [&](int64_t timestamp) -> int64_t {
+            return timestamp == AV_NOPTS_VALUE
+                ? AV_NOPTS_VALUE
+                : av_rescale_q(timestamp, source_time_base, decoder_time_base);
+        };
+
+        temporary_packet->pts = rescale_timestamp(packet->pts);
+        temporary_packet->dts = rescale_timestamp(packet->dts);
+        temporary_packet->duration = rescale_timestamp(packet->duration);
+        if (packet->keyframe) {
+            temporary_packet->flags |= AV_PKT_FLAG_KEY;
+        }
+        avpkt = temporary_packet;
     }
 
     if (!avpkt) {
+        av_packet_free(&temporary_packet);
         LOG_ERROR("backend AVPacket is null");
         return false;
     }
 
-    // 送入解码器
-    int ret = avcodec_send_packet(codec_ctx_, avpkt);
+    const int ret = avcodec_send_packet(codec_ctx_, avpkt);
+    av_packet_free(&temporary_packet);
     if (ret < 0) {
         char buf[AV_ERROR_MAX_STRING_SIZE];
         av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret);
@@ -192,7 +233,6 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
         return false;
     }
 
-    // 接收所有产生的帧
     return ReceiveFrames();
 }
 

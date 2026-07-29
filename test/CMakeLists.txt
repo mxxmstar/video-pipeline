@@ -113,6 +113,15 @@ if(ENABLE_PCAP)
     else()
         target_compile_options(avtp_live_probe PRIVATE -Wall -Wextra)
     endif()
+
+    add_executable(avtp_decode_rtsp_publisher media/avtp_decode_rtsp_publisher.cpp)
+    target_link_libraries(avtp_decode_rtsp_publisher PRIVATE video_pipeline_lib)
+    video_pipeline_copy_runtime_dlls(avtp_decode_rtsp_publisher)
+    if(MSVC)
+        target_compile_options(avtp_decode_rtsp_publisher PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+    else()
+        target_compile_options(avtp_decode_rtsp_publisher PRIVATE -Wall -Wextra)
+    endif()
 endif()
 
 if(VIDEO_PIPELINE_BUILD_INFERENCE)
@@ -150,6 +159,20 @@ else()
     target_compile_options(test_ffmpeg_audio_encoder PRIVATE -Wall -Wextra)
 endif()
 add_test(NAME test_ffmpeg_audio_encoder COMMAND test_ffmpeg_audio_encoder)
+
+add_executable(test_ffmpeg_decoder_raw_packet media/test_ffmpeg_decoder_raw_packet.cpp)
+target_link_libraries(test_ffmpeg_decoder_raw_packet PRIVATE video_pipeline_lib)
+target_compile_definitions(test_ffmpeg_decoder_raw_packet
+    PRIVATE
+        VIDEO_PIPELINE_TEST_MP4_PATH="${CMAKE_SOURCE_DIR}/test.mp4"
+)
+video_pipeline_copy_runtime_dlls(test_ffmpeg_decoder_raw_packet)
+if(MSVC)
+    target_compile_options(test_ffmpeg_decoder_raw_packet PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_ffmpeg_decoder_raw_packet PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_ffmpeg_decoder_raw_packet COMMAND test_ffmpeg_decoder_raw_packet)
 
 add_executable(test_rtsp_server_publisher media/test_rtsp_server_publisher.cpp)
 target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_lib)

@@ -67,6 +67,19 @@ MediaServer.exe: E:\share\project\video-pipeline\third_apps\win32\zlmediakit\Med
 - multicast 保留为显式能力，不作为默认 SDP 行为。
 - 如果后续要支持 audio multicast，需要给每个音频 track 分配独立 multicast RTP/RTCP 端口，并补齐发送和 RTCP 处理。
 
+AVTP 测试补充：
+
+- `avtp_decode_rtsp_publisher` 中提到的 multicast 指的是 RTSP publish 输出侧的 RTP multicast，不是 AVTP 输入侧的广播/组播以太网帧。
+- AVTP 拉流、解码、重编码、发布链路的首选验证方式仍然是 RTSP TCP interleaved，例如：
+
+```powershell
+ffplay -rtsp_transport tcp rtsp://127.0.0.1:<port>/avtp/main
+```
+
+- multicast 只作为可选传输方式保留，不作为 AVTP 集成测试是否通过的判据。
+- 当前手动 AVTP 发布测试默认使用 `--port 0` 自动挑选空闲 RTSP 监听端口，避免 Windows 上固定端口被占用、保留或策略限制导致 publisher 启动失败。
+- 如果后续要验证 RTSP multicast，需要单独指定固定 multicast 地址、RTP/RTCP 端口，并确认交换机、网卡、防火墙和播放器均允许 multicast；否则容易把网络环境问题误判成 AVTP 解码或 publisher 编码问题。
+
 ## 问题 2：推到 ZLMediaKit 后画面卡顿、时间戳乱跳
 
 现象：
