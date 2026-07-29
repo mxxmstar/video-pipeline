@@ -297,8 +297,23 @@ public:
 后续小步：
 
 1. 增加 PTS normalizer，处理缺失、倒退和明显跳变的 PTS。
-2. 增加 RenderSession 级别的同步测试，使用 fake clock/renderer 做确定性验证。
-3. 在 camera 手动测试日志里输出当前 clock source、视频 wait/drop 计数和平均 delta。
+   - 已实现 `VideoPtsNormalizer`，在视频帧进入 AV sync 决策前归一化 PTS。
+   - 支持缺失/重复、倒退、大跳变三类异常兜底。
+   - 新增 `test_video_pts_normalizer` 覆盖正常单调 PTS、重复 PTS、倒退 PTS、大跳变和 duration 缺失 fallback。
+2. 在 camera 手动测试日志里输出当前 clock source、视频 wait/drop 计数。
+   - 已新增 `av_sync_dropped_video_frames`、`av_sync_video_waits`、`av_sync_video_wait_us` 和 `playback_clock_source` 统计。
+   - `test_opengl_video_renderer` 新增 `--camera-frames <count>`，便于真实摄像头自动收尾验证。
+3. 增加 RenderSession 级别的同步测试，使用 fake clock/renderer 做确定性验证。
+
+真实 camera 验证记录：
+
+1. 摄像头：`rtsp://192.168.66.83/live/mainstream`，视频 1920x1080@25fps，音频 G711 16kHz mono。
+2. `--camera-frames 360` 结果：
+   - `clock=audio`，说明运行中使用 audio master。
+   - `normalized_video_pts=0`，说明该摄像头当前视频 PTS 稳定，没有触发归一化兜底。
+   - `avsync_dropped_video=0`，说明 AV sync 没有主动丢晚帧。
+   - `dropped_video=264` 主要来自视频队列满丢旧帧；当前 1080p Debug 路径叠加 H264 编码覆盖，视频消费明显慢于输入。
+   - `dropped_audio=0`，`audio_pcm_dropped=0`，`audio_underruns=13` 且运行中未继续增长，音频路径保持稳定。
 
 验收标准：
 

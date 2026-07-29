@@ -14,6 +14,7 @@
 #include "render/av_sync_controller.h"
 #include "render/media_clock.h"
 #include "render/opengl_video_renderer.h"
+#include "render/video_pts_normalizer.h"
 
 namespace render {
 namespace {
@@ -98,6 +99,7 @@ public:
         last_error_.clear();
         media_clock_.Reset();
         av_sync_.SetConfig(config_.av_sync);
+        video_pts_normalizer_.SetConfig(config_.video_pts);
         system_clock_anchored_ = false;
         return true;
     }
@@ -266,6 +268,7 @@ public:
         video_available_ = false;
         audio_available_ = false;
         media_clock_.Reset(stats_.playback_pts_us);
+        video_pts_normalizer_.Reset();
         system_clock_anchored_ = false;
     }
 
@@ -311,7 +314,10 @@ public:
             snapshot.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
             snapshot.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
         }
-        snapshot.playback_pts_us = media_clock_.Snapshot(audio_available_).position_us;
+        const auto clock_snapshot = media_clock_.Snapshot(audio_available_);
+        snapshot.playback_pts_us = clock_snapshot.position_us;
+        snapshot.playback_clock_source =
+            clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
         return snapshot;
     }
 
@@ -383,8 +389,11 @@ private:
                 } else {
                     std::lock_guard<std::mutex> lock(mutex_);
                     ++stats_.rendered_video_frames;
-                    stats_.playback_pts_us =
-                        media_clock_.Snapshot(audio_available_).position_us;
+                    const auto clock_snapshot =
+                        media_clock_.Snapshot(audio_available_);
+                    stats_.playback_pts_us = clock_snapshot.position_us;
+                    stats_.playback_clock_source =
+                        clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
                 }
             }
 
@@ -462,6 +471,10 @@ private:
                 UpdateAudioStatsLocked();
                 stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
                 media_clock_.UpdateAudioPosition(stats_.playback_pts_us);
+                const auto clock_snapshot = media_clock_.Snapshot(audio_available_);
+                stats_.playback_pts_us = clock_snapshot.position_us;
+                stats_.playback_clock_source =
+                    clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
             }
         }
 
@@ -498,9 +511,13 @@ private:
     }
 
     enum class VideoFrameSyncAction {
+        /// 当前视频帧可以立即交给 IVideoRenderer。
         Render,
+        /// 当前视频帧已被同步策略丢弃。
         Drop,
+        /// 当前视频帧因 Pause 等状态变化被放回队列头部。
         Requeued,
+        /// 会话正在停止，视频线程应退出。
         Stop,
     };
 
@@ -510,33 +527,59 @@ private:
             return VideoFrameSyncAction::Drop;
         }
 
+        // AV sync 只应该看到稳定的媒体时间轴。这里先把明显异常的输入 PTS
+        // 转换为连续 PTS，并把修正后的值写回 frame，保证后续统计/调试看到的是
+        // 实际参与调度的时间戳。
+        const auto video_pts_us = NormalizeVideoPts(*video_frame);
+
         // 无音频 master 时，第一帧视频用自己的 PTS 锚定 fallback 系统时钟。
         // 否则如果输入流首帧 PTS 不是 0，第一帧会被误判为“大幅早到”。
-        AnchorSystemClockForFirstVideoFrame(*video_frame);
+        AnchorSystemClockForFirstVideoFrame(video_pts_us);
 
         while (video_frame) {
+            // 每次等待后都重新读取 clock，因为 audio master 可能已经继续前进。
+            // 对早到帧来说，这个循环会把“短等待”拆成多次小步，保持 Stop/Pause 响应。
             const auto clock_snapshot = CurrentClockSnapshot();
             const auto decision =
-                av_sync_.Decide(video_frame->time.pts_us, clock_snapshot);
+                av_sync_.Decide(video_pts_us, clock_snapshot);
 
             if (decision.action == AvSyncAction::Render) {
                 return VideoFrameSyncAction::Render;
             }
 
             if (decision.action == AvSyncAction::Drop) {
+                // 这里的丢帧是 AV sync 主动丢晚帧；SubmitFrame() 中队列满丢帧不会
+                // 进入这个分支。两个计数拆开后，camera 日志能区分“渲染慢导致队列满”
+                // 和“同步策略认为帧已经过期”。
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.dropped_video_frames;
+                ++stats_.av_sync_dropped_video_frames;
                 stats_.playback_pts_us = clock_snapshot.position_us;
+                stats_.playback_clock_source =
+                    clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
                 video_frame.reset();
                 return VideoFrameSyncAction::Drop;
             }
 
+            {
+                // 只要 AV sync 要求 Wait，就先记录一次等待意图。即使等待过程中
+                // 被 Pause/Stop 提前唤醒，该统计也能反映同步策略施加过节奏控制。
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++stats_.av_sync_video_waits;
+                stats_.av_sync_video_wait_us +=
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        decision.wait_duration).count();
+            }
             if (!WaitForVideoSync(decision.wait_duration)) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (stop_requested_) {
                     return VideoFrameSyncAction::Stop;
                 }
                 if (paused_) {
+                    // Pause 发生在帧已经出队之后。为了不丢掉这帧，把它放回队列头部；
+                    // Resume 后它会重新走 PTS normalizer/AV sync。当前 normalizer
+                    // 已经消费过这帧 PTS，后续阶段若要严格避免重复归一化，可把
+                    // normalized PTS 缓存在 frame 扩展字段中。
                     video_queue_.push_front(std::move(video_frame));
                     stats_.video_queue_size = video_queue_.size();
                     return VideoFrameSyncAction::Requeued;
@@ -547,21 +590,43 @@ private:
         return VideoFrameSyncAction::Drop;
     }
 
-    void AnchorSystemClockForFirstVideoFrame(const MediaFrame& video_frame) {
+    std::int64_t NormalizeVideoPts(MediaFrame& video_frame) {
+        // duration_us 对异常 PTS 的兜底生成很重要：有 duration 就按真实帧间隔推进；
+        // 没有 duration 才使用配置里的 fallback_fps。
+        const auto normalized =
+            video_pts_normalizer_.Normalize(video_frame.time.pts_us,
+                                            video_frame.time.duration_us);
+        if (normalized.normalized) {
+            // normalizer 只在 video worker 使用，不需要自己加锁；但统计属于 session
+            // 共享状态，必须通过 mutex_ 更新。
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++stats_.normalized_video_pts_frames;
+        }
+
+        // 写回 frame，保证后续 Render()、日志和调试器里看到的是参与同步的 PTS。
+        video_frame.time.pts_us = normalized.pts_us;
+        return normalized.pts_us;
+    }
+
+    void AnchorSystemClockForFirstVideoFrame(std::int64_t video_pts_us) {
         std::lock_guard<std::mutex> lock(mutex_);
+        // 只有真正拿到音频播放位置后，audio master 才算 ready。音频设备初始化成功但
+        // 尚未播放出第一批 PCM 时，仍然需要用视频首帧锚定 fallback clock。
         const bool audio_master_ready =
             audio_available_ && media_clock_.HasAudioPosition();
         if (audio_master_ready || system_clock_anchored_) {
             return;
         }
 
-        media_clock_.SetSystemPositionUs(video_frame.time.pts_us);
-        stats_.playback_pts_us = video_frame.time.pts_us;
+        media_clock_.SetSystemPositionUs(video_pts_us);
+        stats_.playback_pts_us = video_pts_us;
         system_clock_anchored_ = true;
     }
 
     MediaClockSnapshot CurrentClockSnapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
+        // audio_available_ 只表示音频 renderer 初始化成功；MediaClock 内部还会判断
+        // 是否已经有有效音频播放位置，没有时自动回退到 system clock。
         return media_clock_.Snapshot(audio_available_);
     }
 
@@ -570,6 +635,8 @@ private:
             return true;
         }
 
+        // 不用 sleep_for，而是挂在 queue_cv_ 上等待，这样 Stop/Pause 可以立刻唤醒
+        // 视频线程，不必等满本次 AV sync wait。
         std::unique_lock<std::mutex> lock(mutex_);
         return !queue_cv_.wait_for(lock, duration, [this] {
             return stop_requested_ || paused_;
@@ -623,6 +690,7 @@ private:
     RenderStats stats_;
     MediaClock media_clock_;
     AvSyncController av_sync_;
+    VideoPtsNormalizer video_pts_normalizer_;
     std::deque<std::shared_ptr<MediaFrame>> video_queue_;
     std::deque<std::shared_ptr<MediaFrame>> audio_queue_;
     std::unique_ptr<IVideoRenderer> video_renderer_;

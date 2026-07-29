@@ -5,6 +5,7 @@
 #include "render/av_sync_config.h"
 #include "render/audio/audio_render_config.h"
 #include "render/render_config.h"
+#include "render/video_pts_normalizer.h"
 
 namespace render {
 
@@ -39,6 +40,9 @@ struct RenderSessionConfig {
 
     /// 音视频同步策略配置。阶段 4 第一版用于控制视频帧的早到等待和晚到丢弃。
     AvSyncConfig av_sync;
+
+    /// 视频 PTS 归一化配置。阶段 4 后续小步用于处理缺失、倒退和大跳变 PTS。
+    VideoPtsNormalizerConfig video_pts;
 };
 
 } // namespace render

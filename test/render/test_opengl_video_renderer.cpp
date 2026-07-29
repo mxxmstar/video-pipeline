@@ -166,7 +166,8 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
               << width << "x" << height << " @" << state.fps
               << "fps, audio=" << audio_info.sample_rate
               << "Hz/" << audio_info.channels << "ch\n";
-    std::cout << "Rendering camera stream. Press ESC or close the window to stop.\n";
+    std::cout << "Rendering camera stream. Press ESC or close the window to stop.\n"
+              << std::flush;
     return true;
 }
 
@@ -269,7 +270,7 @@ int TestStaticRgbRenderSmoke() {
     return 0;
 }
 
-int TestCameraAudioVideoDecodeEncodeRender() {
+int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
     FFmpegPuller puller;
     puller.SetConnectTimeoutMs(kManualConnectTimeoutMs);
     puller.SetReadTimeoutMs(kManualReadTimeoutMs);
@@ -316,7 +317,7 @@ int TestCameraAudioVideoDecodeEncodeRender() {
     std::cout << "Source audio: codec="
               << static_cast<int>(audio_stream_info.codec_type)
               << ", sample_rate=" << audio_detail.sample_rate
-              << ", channels=" << audio_detail.channels << "\n";
+              << ", channels=" << audio_detail.channels << "\n" << std::flush;
 
     CameraAvRenderState state;
     state.fps = ResolveManualFps(video_detail);
@@ -460,6 +461,12 @@ int TestCameraAudioVideoDecodeEncodeRender() {
             state.decoded_video_frames >= state.reported_video_frames + 120) {
             state.reported_video_frames = state.decoded_video_frames;
             const auto stats = state.render_session->GetStats();
+            // 这组日志用于手动判断阶段 4 同步策略是否真的在工作：
+            // - dropped_video 是总视频丢帧，可能来自队列满，也可能来自 AV sync。
+            // - avsync_dropped_video 只统计 AV sync 主动丢弃的晚帧。
+            // - avsync_waits/avsync_wait_ms 反映早到视频帧被音频 master 节奏约束的程度。
+            // - clock 显示当前 master 是 audio 还是 system fallback。
+            // - normalized_video_pts 用于观察上游摄像头 PTS 是否稳定。
             std::cout << "camera render pipeline: read_video="
                       << state.read_video_packets
                       << ", read_audio=" << state.read_audio_packets
@@ -468,6 +475,11 @@ int TestCameraAudioVideoDecodeEncodeRender() {
                       << ", rendered_video=" << stats.rendered_video_frames
                       << ", rendered_audio=" << stats.rendered_audio_frames
                       << ", dropped_video=" << stats.dropped_video_frames
+                      << ", avsync_dropped_video=" << stats.av_sync_dropped_video_frames
+                      << ", avsync_waits=" << stats.av_sync_video_waits
+                      << ", avsync_wait_ms=" << stats.av_sync_video_wait_us / 1000
+                      << ", clock=" << (stats.playback_clock_source == 1 ? "audio" : "system")
+                      << ", normalized_video_pts=" << stats.normalized_video_pts_frames
                       << ", dropped_audio=" << stats.dropped_audio_frames
                       << ", audio_underruns=" << stats.audio_underruns
                       << ", audio_pcm_dropped=" << stats.audio_dropped_pcm_frames
@@ -477,7 +489,15 @@ int TestCameraAudioVideoDecodeEncodeRender() {
                       << ", audio_renderer_frames=" << stats.audio_renderer_queued_frames
                       << ", encoded_video_packets=" << state.encoded_video_packets
                       << ", encoded_audio_packets=" << state.encoded_audio_packets
-                      << "\n";
+                      << "\n" << std::flush;
+        }
+
+        if (max_decoded_video_frames > 0 &&
+            state.decoded_video_frames >= max_decoded_video_frames) {
+            // --camera-frames 用于自动化验证：跑够指定解码视频帧后主动收尾，
+            // 避免依赖人工关闭 GLFW 窗口，也避免命令超时导致 stdout 没有 flush。
+            state.closed = true;
+            break;
         }
     }
 
@@ -505,11 +525,17 @@ int TestCameraAudioVideoDecodeEncodeRender() {
               << render_stats.rendered_video_frames
               << ", rendered_audio=" << render_stats.rendered_audio_frames
               << ", dropped_video=" << render_stats.dropped_video_frames
+              << ", avsync_dropped_video=" << render_stats.av_sync_dropped_video_frames
+              << ", avsync_waits=" << render_stats.av_sync_video_waits
+              << ", avsync_wait_ms=" << render_stats.av_sync_video_wait_us / 1000
+              << ", clock=" << (render_stats.playback_clock_source == 1 ? "audio" : "system")
+              << ", normalized_video_pts=" << render_stats.normalized_video_pts_frames
               << ", dropped_audio=" << render_stats.dropped_audio_frames
               << ", audio_underruns=" << render_stats.audio_underruns
               << ", audio_pcm_dropped=" << render_stats.audio_dropped_pcm_frames
               << ", encoded_video_packets=" << state.encoded_video_packets
-              << ", encoded_audio_packets=" << state.encoded_audio_packets << "\n";
+              << ", encoded_audio_packets=" << state.encoded_audio_packets
+              << "\n" << std::flush;
     return 0;
 }
 
@@ -521,6 +547,15 @@ int main(int argc, char* argv[]) {
         return TestCameraAudioVideoDecodeEncodeRender();
     }
 
+    if (mode == "--camera-frames") {
+        if (argc < 3) {
+            std::cerr << "Usage: test_opengl_video_renderer --camera-frames <count>\n";
+            return 1;
+        }
+        // 该模式仍然走真实 camera decode/encode/render 链路，只是增加自动退出条件。
+        return TestCameraAudioVideoDecodeEncodeRender(std::stoi(argv[2]));
+    }
+
     if (mode == "--smoke") {
         return TestStaticRgbRenderSmoke();
     }
@@ -529,6 +564,6 @@ int main(int argc, char* argv[]) {
         return TestStaticRgbRenderLoop();
     }
 
-    std::cerr << "Usage: test_opengl_video_renderer [--camera|--smoke|--loop]\n";
+    std::cerr << "Usage: test_opengl_video_renderer [--camera|--camera-frames <count>|--smoke|--loop]\n";
     return 1;
 }
