@@ -187,6 +187,7 @@ bool TestVideoQueueDropsOldestFrame() {
     config.enable_audio = false;
     config.max_video_queue_frames = 2;
     config.drop_late_video_frames = true;
+    config.av_sync.enabled = false;
 
     if (!session.Init(config) || !session.Start()) {
         std::cerr << "queue test session start failed: " << session.LastError() << '\n';
@@ -251,6 +252,7 @@ bool TestPauseResumeAndAudioDispatch() {
     render::RenderSessionConfig config;
     config.enable_video = true;
     config.enable_audio = true;
+    config.av_sync.enabled = false;
     if (!session.Init(config) || !session.Start()) {
         std::cerr << "pause test session start failed: " << session.LastError() << '\n';
         return false;
@@ -313,6 +315,7 @@ bool TestAudioDispatchDoesNotWaitForSlowVideo() {
     config.enable_video = true;
     config.enable_audio = true;
     config.max_audio_queue_frames = 8;
+    config.av_sync.enabled = false;
     if (!session.Init(config) || !session.Start()) {
         std::cerr << "audio/video decouple test session start failed: "
                   << session.LastError() << '\n';

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 
+#include "render/av_sync_config.h"
 #include "render/audio/audio_render_config.h"
 #include "render/render_config.h"
 
@@ -35,6 +36,9 @@ struct RenderSessionConfig {
 
     /// 是否允许在低延迟场景丢弃过期视频帧；阶段 2 用于控制队列满时的策略。
     bool drop_late_video_frames{true};
+
+    /// 音视频同步策略配置。阶段 4 第一版用于控制视频帧的早到等待和晚到丢弃。
+    AvSyncConfig av_sync;
 };
 
 } // namespace render

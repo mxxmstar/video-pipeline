@@ -270,6 +270,36 @@ public:
 - `include/render/av_sync_controller.h`
 - `src/render/av_sync_controller.cpp`
 
+第一版实现记录：
+
+1. 新增 `MediaClock`
+   - 作为阶段 4 的统一播放时钟入口。
+   - 有有效音频播放位置时返回 audio master。
+   - 音频不可用或尚未给出有效位置时，回退到现有 `PlaybackClock`。
+   - 音频位置更新时同步校准 fallback clock，避免 master 切换时发生明显跳变。
+
+2. 新增 `AvSyncController`
+   - 只做纯决策，不持有队列、不睡眠、不调用 renderer。
+   - 输入为视频帧 PTS 和 `MediaClockSnapshot`。
+   - 输出 `Render`、`Drop` 或 `Wait`。
+   - 第一版默认 late threshold 为 80ms，early threshold 为 20ms，单次最大等待 20ms。
+
+3. 接入 `RenderSession` video worker
+   - 视频帧出队后先读取 master clock，再交给 `AvSyncController` 决策。
+   - 晚到帧计入 `dropped_video_frames`。
+   - 早到帧通过短等待重新评估，等待期间仍可响应 Stop/Pause。
+   - 无音频时第一帧视频会用自身 PTS 锚定 fallback clock，避免非零首帧 PTS 被误判为大幅早到。
+
+4. 测试
+   - 新增 `test_av_sync_controller`，覆盖准时渲染、晚帧丢弃、早帧等待、禁用同步直接渲染。
+   - 既有 `test_render_session` 的队列和生命周期用例显式关闭 AV sync，避免测试目标混淆。
+
+后续小步：
+
+1. 增加 PTS normalizer，处理缺失、倒退和明显跳变的 PTS。
+2. 增加 RenderSession 级别的同步测试，使用 fake clock/renderer 做确定性验证。
+3. 在 camera 手动测试日志里输出当前 clock source、视频 wait/drop 计数和平均 delta。
+
 验收标准：
 
 - 摄像头手动测试音频和视频体感同步。

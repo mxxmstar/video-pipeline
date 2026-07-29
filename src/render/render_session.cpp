@@ -11,8 +11,9 @@
 #include <utility>
 
 #include "render/audio/wasapi_audio_renderer.h"
+#include "render/av_sync_controller.h"
+#include "render/media_clock.h"
 #include "render/opengl_video_renderer.h"
-#include "render/playback_clock.h"
 
 namespace render {
 namespace {
@@ -95,7 +96,9 @@ public:
         video_available_ = false;
         audio_available_ = false;
         last_error_.clear();
-        clock_.Reset();
+        media_clock_.Reset();
+        av_sync_.SetConfig(config_.av_sync);
+        system_clock_anchored_ = false;
         return true;
     }
 
@@ -262,7 +265,8 @@ public:
         startup_done_ = true;
         video_available_ = false;
         audio_available_ = false;
-        clock_.Reset(stats_.playback_pts_us);
+        media_clock_.Reset(stats_.playback_pts_us);
+        system_clock_anchored_ = false;
     }
 
     void Pause() {
@@ -271,7 +275,7 @@ public:
             return;
         }
         paused_ = true;
-        clock_.Pause();
+        media_clock_.Pause();
         queue_cv_.notify_all();
     }
 
@@ -281,7 +285,7 @@ public:
             return;
         }
         paused_ = false;
-        clock_.Resume();
+        media_clock_.Resume();
         queue_cv_.notify_all();
     }
 
@@ -307,7 +311,7 @@ public:
             snapshot.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
             snapshot.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
         }
-        snapshot.playback_pts_us = clock_.PositionUs();
+        snapshot.playback_pts_us = media_clock_.Snapshot(audio_available_).position_us;
         return snapshot;
     }
 
@@ -366,14 +370,21 @@ private:
                 }
             }
 
-            if (video_frame && !video_renderer_->Render(*video_frame)) {
-                FailAndRequestStop("视频帧渲染失败");
-            } else if (video_frame) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                ++stats_.rendered_video_frames;
-                if (!audio_available_) {
-                    stats_.playback_pts_us = video_frame->time.pts_us;
-                    clock_.SetPositionUs(stats_.playback_pts_us);
+            if (video_frame) {
+                const auto sync_action = PrepareVideoFrameForRender(video_frame);
+                if (sync_action == VideoFrameSyncAction::Stop) {
+                    break;
+                }
+                if (sync_action == VideoFrameSyncAction::Requeued ||
+                    sync_action == VideoFrameSyncAction::Drop) {
+                    video_frame.reset();
+                } else if (!video_renderer_->Render(*video_frame)) {
+                    FailAndRequestStop("视频帧渲染失败");
+                } else {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ++stats_.rendered_video_frames;
+                    stats_.playback_pts_us =
+                        media_clock_.Snapshot(audio_available_).position_us;
                 }
             }
 
@@ -450,7 +461,7 @@ private:
                 ++stats_.rendered_audio_frames;
                 UpdateAudioStatsLocked();
                 stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
-                clock_.SetPositionUs(stats_.playback_pts_us);
+                media_clock_.UpdateAudioPosition(stats_.playback_pts_us);
             }
         }
 
@@ -480,10 +491,89 @@ private:
         startup_done_ = true;
         running_ = startup_success_;
         if (startup_success_) {
-            clock_.Start();
+            media_clock_.Start();
         } else {
             stop_requested_ = true;
         }
+    }
+
+    enum class VideoFrameSyncAction {
+        Render,
+        Drop,
+        Requeued,
+        Stop,
+    };
+
+    VideoFrameSyncAction PrepareVideoFrameForRender(
+        std::shared_ptr<MediaFrame>& video_frame) {
+        if (!video_frame) {
+            return VideoFrameSyncAction::Drop;
+        }
+
+        // 无音频 master 时，第一帧视频用自己的 PTS 锚定 fallback 系统时钟。
+        // 否则如果输入流首帧 PTS 不是 0，第一帧会被误判为“大幅早到”。
+        AnchorSystemClockForFirstVideoFrame(*video_frame);
+
+        while (video_frame) {
+            const auto clock_snapshot = CurrentClockSnapshot();
+            const auto decision =
+                av_sync_.Decide(video_frame->time.pts_us, clock_snapshot);
+
+            if (decision.action == AvSyncAction::Render) {
+                return VideoFrameSyncAction::Render;
+            }
+
+            if (decision.action == AvSyncAction::Drop) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                ++stats_.dropped_video_frames;
+                stats_.playback_pts_us = clock_snapshot.position_us;
+                video_frame.reset();
+                return VideoFrameSyncAction::Drop;
+            }
+
+            if (!WaitForVideoSync(decision.wait_duration)) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stop_requested_) {
+                    return VideoFrameSyncAction::Stop;
+                }
+                if (paused_) {
+                    video_queue_.push_front(std::move(video_frame));
+                    stats_.video_queue_size = video_queue_.size();
+                    return VideoFrameSyncAction::Requeued;
+                }
+            }
+        }
+
+        return VideoFrameSyncAction::Drop;
+    }
+
+    void AnchorSystemClockForFirstVideoFrame(const MediaFrame& video_frame) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const bool audio_master_ready =
+            audio_available_ && media_clock_.HasAudioPosition();
+        if (audio_master_ready || system_clock_anchored_) {
+            return;
+        }
+
+        media_clock_.SetSystemPositionUs(video_frame.time.pts_us);
+        stats_.playback_pts_us = video_frame.time.pts_us;
+        system_clock_anchored_ = true;
+    }
+
+    MediaClockSnapshot CurrentClockSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return media_clock_.Snapshot(audio_available_);
+    }
+
+    bool WaitForVideoSync(std::chrono::milliseconds duration) {
+        if (duration.count() <= 0) {
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(mutex_);
+        return !queue_cv_.wait_for(lock, duration, [this] {
+            return stop_requested_ || paused_;
+        });
     }
 
     void UpdateAudioStatsLocked() {
@@ -531,7 +621,8 @@ private:
 
     RenderSessionConfig config_;
     RenderStats stats_;
-    PlaybackClock clock_;
+    MediaClock media_clock_;
+    AvSyncController av_sync_;
     std::deque<std::shared_ptr<MediaFrame>> video_queue_;
     std::deque<std::shared_ptr<MediaFrame>> audio_queue_;
     std::unique_ptr<IVideoRenderer> video_renderer_;
@@ -550,6 +641,7 @@ private:
     bool audio_startup_success_{false};
     bool video_available_{false};
     bool audio_available_{false};
+    bool system_clock_anchored_{false};
     std::string last_error_;
 };
 
