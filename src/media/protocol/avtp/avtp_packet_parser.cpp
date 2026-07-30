@@ -40,6 +40,23 @@ bool IsVlanEtherType(std::uint16_t ether_type) {
            ether_type == kEtherTypeQinQ;
 }
 
+int AafSampleRateFromCode(std::uint8_t code) {
+    // AAF nominal sample rate 代码。当前现场包里 code=2，即 16 kHz。
+    switch (code) {
+        case 1: return 8000;
+        case 2: return 16000;
+        case 3: return 32000;
+        case 4: return 44100;
+        case 5: return 48000;
+        case 6: return 88200;
+        case 7: return 96000;
+        case 8: return 176400;
+        case 9: return 192000;
+        case 10: return 24000;
+        default: return 0;
+    }
+}
+
 void SetError(ParseError* error, ParseError value) {
     if (error) {
         *error = value;
@@ -116,6 +133,47 @@ bool AvtpPacketParser::ParseEthernetPrefix(const std::uint8_t* data,
     std::uint16_t ether_type = ReadBe16(data + 12);
     std::size_t offset = kEthernetHeaderSize;
     // 兼容单层 VLAN 和 QinQ。超过两层的场景暂不支持，避免错误越界。
+    for (std::size_t tag = 0; tag < kMaxVlanTags && IsVlanEtherType(ether_type);
+         ++tag) {
+        if (size < offset + 4) {
+            SetError(error, ParseError::TooShort);
+            return false;
+        }
+        ether_type = ReadBe16(data + offset + 2);
+        offset += 4;
+    }
+
+    if (ether_type != kEtherTypeAvtp) {
+        SetError(error, ParseError::UnsupportedEtherType);
+        return false;
+    }
+
+    packet.has_ethernet_header = true;
+    packet.ether_type = ether_type;
+    packet.avtp_offset = offset;
+    avtp_offset = offset;
+    SetError(error, ParseError::None);
+    return true;
+}
+
+bool AvtpPacketParser::ParseEthernetPrefix(const std::uint8_t* data,
+                                           std::size_t size,
+                                           ParsedAafPacket& packet,
+                                           std::size_t& avtp_offset,
+                                           ParseError* error) {
+    packet = {};
+    avtp_offset = 0;
+
+    if (!data || size < kEthernetHeaderSize) {
+        SetError(error, ParseError::TooShort);
+        return false;
+    }
+
+    std::copy(data, data + 6, packet.destination_mac.begin());
+    std::copy(data + 6, data + 12, packet.source_mac.begin());
+
+    std::uint16_t ether_type = ReadBe16(data + 12);
+    std::size_t offset = kEthernetHeaderSize;
     for (std::size_t tag = 0; tag < kMaxVlanTags && IsVlanEtherType(ether_type);
          ++tag) {
         if (size < offset + 4) {
@@ -232,6 +290,108 @@ bool AvtpPacketParser::ParseCvfPdu(const std::uint8_t* data,
                 parsed.payload_size - kCustomPayloadHeaderSize - kRtpHeaderSize;
         }
     }
+
+    packet = parsed;
+    SetError(error, ParseError::None);
+    return true;
+}
+
+bool AvtpPacketParser::ParseAaf(const std::uint8_t* data,
+                                std::size_t size,
+                                ParsedAafPacket& packet,
+                                ParseError* error) {
+    packet = {};
+    SetError(error, ParseError::None);
+
+    if (!data) {
+        SetError(error, ParseError::TooShort);
+        return false;
+    }
+
+    std::size_t avtp_offset = 0;
+    ParsedAafPacket ethernet_packet;
+    ParseError ethernet_error = ParseError::None;
+    if (ParseEthernetPrefix(data, size, ethernet_packet, avtp_offset,
+                            &ethernet_error)) {
+        packet = ethernet_packet;
+        return ParseAafPdu(data + avtp_offset,
+                           size - avtp_offset,
+                           packet,
+                           error);
+    }
+
+    if (size >= 1 && data[0] == kSubtypeAaf) {
+        return ParseAafPdu(data, size, packet, error);
+    }
+
+    SetError(error, ethernet_error);
+    return false;
+}
+
+bool AvtpPacketParser::ParseAafPdu(const std::uint8_t* data,
+                                   std::size_t size,
+                                   ParsedAafPacket& packet,
+                                   ParseError* error) {
+    const bool had_ethernet = packet.has_ethernet_header;
+    const MacAddress destination = packet.destination_mac;
+    const MacAddress source = packet.source_mac;
+    const std::uint16_t ether_type = packet.ether_type;
+    const std::size_t avtp_offset = packet.avtp_offset;
+
+    ParsedAafPacket parsed;
+    parsed.has_ethernet_header = had_ethernet;
+    parsed.destination_mac = destination;
+    parsed.source_mac = source;
+    parsed.ether_type = ether_type;
+    parsed.avtp_offset = avtp_offset;
+
+    if (!data || size < kAafHeaderSize) {
+        SetError(error, ParseError::TooShort);
+        return false;
+    }
+
+    parsed.subtype = data[0];
+    if (parsed.subtype != kSubtypeAaf) {
+        SetError(error, ParseError::UnsupportedSubtype);
+        return false;
+    }
+
+    parsed.stream_id_valid = (data[1] & 0x80U) != 0;
+    parsed.version = static_cast<std::uint8_t>((data[1] & 0x70U) >> 4);
+    parsed.media_clock_restart = (data[1] & 0x08U) != 0;
+    parsed.timestamp_valid = (data[1] & 0x01U) != 0;
+    if (parsed.version != 0) {
+        SetError(error, ParseError::UnsupportedVersion);
+        return false;
+    }
+
+    parsed.sequence_num = data[2];
+    parsed.timestamp_uncertain = (data[3] & 0x01U) != 0;
+    parsed.stream_id = ReadBe64(data + 4);
+    parsed.avtp_timestamp = ReadBe32(data + 12);
+
+    // AAF format_info:
+    // byte16=format, byte17 高 4 bit=nominal sample rate,
+    // byte18..19 低 10 bit≈channels_per_frame/bit depth 组合。
+    // 现场包表现为 04 20 01 10：format=4、NSR=2(16k)、channels=1、bit_depth=16。
+    parsed.format = data[16];
+    parsed.nominal_sample_rate_code = static_cast<std::uint8_t>((data[17] & 0xF0U) >> 4);
+    parsed.sample_rate = AafSampleRateFromCode(parsed.nominal_sample_rate_code);
+    parsed.channels_per_frame = data[18];
+    parsed.bit_depth = data[19];
+
+    parsed.stream_data_length = ReadBe16(data + 20);
+    parsed.sparse_timestamp = (data[22] & 0x10U) != 0;
+    parsed.event = static_cast<std::uint8_t>(data[22] & 0x0FU);
+
+    if (static_cast<std::size_t>(parsed.stream_data_length) >
+        size - kAafHeaderSize) {
+        SetError(error, ParseError::StreamDataLengthTooLarge);
+        return false;
+    }
+
+    parsed.payload = data + kAafHeaderSize;
+    parsed.payload_size = parsed.stream_data_length;
 
     packet = parsed;
     SetError(error, ParseError::None);

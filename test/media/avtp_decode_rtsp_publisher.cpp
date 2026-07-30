@@ -56,10 +56,19 @@ struct PipelineState {
     bool failed{false};
     std::string error;
 
+    bool has_audio_stream{false};
+    CodecType audio_codec{CodecType::UNKNOWN};
+    int audio_sample_rate{0};
+    int audio_channels{0};
+
     int decoded_frames{0};
+    int decoded_audio_frames{0};
     int decoder_errors{0};
+    int audio_decoder_errors{0};
     int encoded_packets{0};
     int published_packets{0};
+    int read_audio_packets{0};
+    int published_audio_packets{0};
     int keyframes{0};
     int64_t frame_duration_us{1'000'000 / kDefaultFps};
 };
@@ -262,6 +271,21 @@ bool InitializeOutputPipeline(PipelineState& state,
     track.extra_data = state.encoder->GetExtraData();
     publisher_config.tracks.push_back(std::move(track));
 
+    if (state.has_audio_stream && state.audio_codec != CodecType::UNKNOWN &&
+        state.audio_sample_rate > 0 && state.audio_channels > 0) {
+        MediaTrackConfig audio_track;
+        audio_track.track_id = 1;
+        audio_track.media_type = MediaType::AUDIO;
+        audio_track.codec_type = state.audio_codec;
+        audio_track.sample_rate = state.audio_sample_rate;
+        audio_track.channels = state.audio_channels;
+        audio_track.time_base_num = 1;
+        audio_track.time_base_den = 1'000'000;
+        audio_track.rtp_clock_rate =
+            static_cast<std::uint32_t>(state.audio_sample_rate);
+        publisher_config.tracks.push_back(std::move(audio_track));
+    }
+
     state.publisher = IPublisher::Create(publisher_config);
     if (!state.publisher || !state.publisher->Start(publisher_config)) {
         state.error = "failed to start RTSP publisher";
@@ -271,9 +295,32 @@ bool InitializeOutputPipeline(PipelineState& state,
     state.initialized = true;
     std::cout << "AVTP decode/publish pipeline initialized: "
               << width << "x" << height << " @" << options.fps
-              << "fps\n";
+              << "fps";
+    if (state.has_audio_stream) {
+        std::cout << ", audio=" << state.audio_sample_rate
+                  << "Hz/" << state.audio_channels << "ch codec="
+                  << static_cast<int>(state.audio_codec);
+    }
+    std::cout << "\n";
     std::cout << "Play URL: rtsp://127.0.0.1:" << options.rtsp_port
               << options.stream_path << "\n";
+    return true;
+}
+
+bool PublishAudioPacket(PipelineState& state, const std::shared_ptr<MediaPacket>& packet) {
+    if (!state.initialized || !state.publisher || !packet) {
+        return true;
+    }
+
+    packet->stream_index = 1;
+    packet->time_base = Rational{1, 1'000'000};
+    if (!state.publisher->Publish(*packet)) {
+        state.error = "failed to publish AVTP audio packet";
+        return false;
+    }
+
+    ++state.published_audio_packets;
+    ++state.published_packets;
     return true;
 }
 
@@ -331,8 +378,10 @@ void HandleDecodedFrame(PipelineState& state,
 
     if (state.decoded_frames % 30 == 0) {
         std::cout << "decoded=" << state.decoded_frames
+                  << ", decoded_audio=" << state.decoded_audio_frames
                   << ", encoded=" << state.encoded_packets
                   << ", published=" << state.published_packets
+                  << ", published_audio=" << state.published_audio_packets
                   << ", keyframes=" << state.keyframes << "\n";
     }
 }
@@ -373,8 +422,29 @@ int main(int argc, char** argv) {
     }
 
     FFmpegDecoder decoder;
+    FFmpegDecoder audio_decoder;
     PipelineState state;
     state.frame_duration_us = 1'000'000 / std::max(1, options.fps);
+    if (streams.HasAudioStream()) {
+        const MediaStreamInfo& audio_info = streams.stream_infos[streams.audio_stream_idx_];
+        const auto& audio_detail = audio_info.get_detail<AudioStreamInfo>();
+        state.has_audio_stream = true;
+        state.audio_codec = audio_info.codec_type;
+        state.audio_sample_rate = audio_detail.sample_rate;
+        state.audio_channels = audio_detail.channels;
+        audio_decoder.SetFrameCallback(
+            [&](std::shared_ptr<MediaFrame> frame) {
+                if (frame && frame->type == MediaType::AUDIO) {
+                    ++state.decoded_audio_frames;
+                }
+            });
+        if (!audio_decoder.Open(audio_info)) {
+            std::cerr << "failed to open audio decoder\n";
+            puller.Close();
+            logger::Shutdown();
+            return 1;
+        }
+    }
     decoder.SetFrameCallback(
         [&](std::shared_ptr<MediaFrame> frame) {
             HandleDecodedFrame(state, options, frame);
@@ -407,6 +477,18 @@ int main(int argc, char** argv) {
         }
 
         ++avtp_packets;
+        if (packet->type == MediaType::AUDIO) {
+            ++state.read_audio_packets;
+            if (state.has_audio_stream && !audio_decoder.Decode(packet)) {
+                ++state.audio_decoder_errors;
+            }
+            if (!PublishAudioPacket(state, packet)) {
+                state.failed = true;
+                break;
+            }
+            continue;
+        }
+
         if (!decoder.Decode(packet)) {
             ++state.decoder_errors;
             // 直播接入时可能先收到 P/B 帧，尚未等到 SPS/PPS 或 IDR。
@@ -429,6 +511,7 @@ int main(int argc, char** argv) {
     }
 
     decoder.Close();
+    audio_decoder.Close();
     puller.Close();
     if (state.publisher) {
         state.publisher->Stop();
@@ -436,9 +519,13 @@ int main(int argc, char** argv) {
 
     std::cout << "Summary: avtp_packets=" << avtp_packets
               << ", decoded_frames=" << state.decoded_frames
+              << ", decoded_audio_frames=" << state.decoded_audio_frames
               << ", decoder_errors=" << state.decoder_errors
+              << ", audio_decoder_errors=" << state.audio_decoder_errors
               << ", encoded_packets=" << state.encoded_packets
               << ", published_packets=" << state.published_packets
+              << ", read_audio_packets=" << state.read_audio_packets
+              << ", published_audio_packets=" << state.published_audio_packets
               << ", empty_reads=" << empty_reads << "\n";
 
     if (state.failed) {

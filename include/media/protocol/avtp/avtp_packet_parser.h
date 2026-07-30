@@ -15,6 +15,7 @@ constexpr std::uint16_t kEtherTypeAvtp = 0x22F0;
 //   0x03 = CVF(Compressed Video Format)，H.264/H.265/MJPEG 走这里。
 constexpr std::uint8_t kSubtypeAaf = 0x02;
 constexpr std::uint8_t kSubtypeCvf = 0x03;
+constexpr std::size_t kAafHeaderSize = 24;
 
 // CVF 的 format=0x02 表示 RFC 格式。format_subtype 再进一步区分
 // MJPEG/H.264/JPEG2000 等编码。H.265=0x03 是当前设备/源工程使用的扩展。
@@ -92,6 +93,41 @@ struct ParsedCvfPacket {
     std::size_t media_payload_size{0};
 };
 
+/// @brief 一个已经解析好的 AAF 音频包。
+///
+/// 当前项目第一阶段只把 AAF 作为现场设备音频承载解析出来；具体音频编码
+/// 由 AvtpPuller 配置映射到 G711A/G711U。若后续要支持标准 AAF PCM，
+/// 可以继续利用这里的 sample_rate / channels / bit_depth 等字段。
+struct ParsedAafPacket {
+    bool has_ethernet_header{false};
+    MacAddress destination_mac{};
+    MacAddress source_mac{};
+    std::uint16_t ether_type{0};
+    std::size_t avtp_offset{0};
+
+    std::uint8_t subtype{0};
+    bool stream_id_valid{false};
+    std::uint8_t version{0};
+    bool media_clock_restart{false};
+    bool timestamp_valid{false};
+    std::uint8_t sequence_num{0};
+    bool timestamp_uncertain{false};
+    std::uint64_t stream_id{0};
+    std::uint32_t avtp_timestamp{0};
+
+    std::uint8_t format{0};
+    std::uint8_t nominal_sample_rate_code{0};
+    int sample_rate{0};
+    int channels_per_frame{0};
+    int bit_depth{0};
+    std::uint16_t stream_data_length{0};
+    bool sparse_timestamp{false};
+    std::uint8_t event{0};
+
+    const std::uint8_t* payload{nullptr};
+    std::size_t payload_size{0};
+};
+
 /// @brief AVTP/CVF 包解析器。
 ///
 /// 该 parser 只输出 CVF 视频包。AAF 音频、AVDECC 控制面等 subtype
@@ -110,6 +146,18 @@ public:
                             ParsedCvfPacket& packet,
                             ParseError* error = nullptr);
 
+    /// @brief 解析以太网帧或已经剥离以太网头的 AAF PDU。
+    static bool ParseAaf(const std::uint8_t* data,
+                         std::size_t size,
+                         ParsedAafPacket& packet,
+                         ParseError* error = nullptr);
+
+    /// @brief 解析 AAF PDU。调用方已知 data 起点是 AVTP header 时使用。
+    static bool ParseAafPdu(const std::uint8_t* data,
+                            std::size_t size,
+                            ParsedAafPacket& packet,
+                            ParseError* error = nullptr);
+
     /// @brief 将 ParseError 转成稳定的日志字符串。
     static const char* ErrorToString(ParseError error);
 
@@ -118,6 +166,13 @@ private:
     static bool ParseEthernetPrefix(const std::uint8_t* data,
                                     std::size_t size,
                                     ParsedCvfPacket& packet,
+                                    std::size_t& avtp_offset,
+                                    ParseError* error);
+
+    /// @brief AAF 版本的以太网前缀解析；字段与 CVF 相同，但输出结构不同。
+    static bool ParseEthernetPrefix(const std::uint8_t* data,
+                                    std::size_t size,
+                                    ParsedAafPacket& packet,
                                     std::size_t& avtp_offset,
                                     ParseError* error);
 };

@@ -29,6 +29,7 @@ struct PcapApi {
     using setfilter_fn = int(__cdecl*)(pcap_t*, bpf_program*);
     using freecode_fn = void(__cdecl*)(bpf_program*);
     using loop_fn = int(__cdecl*)(pcap_t*, int, pcap_handler, u_char*);
+    using dispatch_fn = int(__cdecl*)(pcap_t*, int, pcap_handler, u_char*);
     using breakloop_fn = void(__cdecl*)(pcap_t*);
     using close_fn = void(__cdecl*)(pcap_t*);
     using geterr_fn = char*(__cdecl*)(pcap_t*);
@@ -45,6 +46,7 @@ struct PcapApi {
     setfilter_fn setfilter{nullptr};         ///< 设置 BPF 过滤表达式
     freecode_fn freecode{nullptr};           ///< 释放 BPF 编译后的代码
     loop_fn loop{nullptr};                  ///< 捕获循环函数
+    dispatch_fn dispatch{nullptr};          ///< 可超时返回的捕获分发函数
     breakloop_fn breakloop{nullptr};        ///< 中断捕获循环函数
     close_fn close{nullptr};                ///< 关闭网卡设备函数
     geterr_fn geterr{nullptr};              ///< 获取错误信息函数
@@ -141,6 +143,11 @@ bool PcapApi::resolveFunctions() {
                module_,
 #endif
                "pcap_loop", loop, last_error_) &&
+           resolvePcapFunction(
+#ifdef _WIN32
+               module_,
+#endif
+               "pcap_dispatch", dispatch, last_error_) &&
            resolvePcapFunction(
 #ifdef _WIN32
                module_,
@@ -486,8 +493,25 @@ void EthernetCapture::captureLoop() {
         return;
     }
 
-    const int ret = api.loop(handler_, 0, &EthernetCapture::dispatch, reinterpret_cast<u_char*>(this));
-    LOG_INFO("EthernetCapture::CaptureLoop exit, ret={} (dropped={})", ret, dropped_count_.load());
+    // pcap_loop(handler, 0, ...) 在部分 Npcap/网卡状态下对 breakloop 的响应不够
+    // 可预测，Close() 会卡在 capture_thread_.join()。这里改用 pcap_dispatch()
+    // 分批取包：底层 read timeout 到期时 dispatch 返回 0，线程就有机会检查
+    // running_/stopped_ 并自然退出。这样 AvtpPuller probe 或手动工具超时时，
+    // Close() 不会无限等待抓包线程。
+    int ret = 0;
+    while (running_.load() && handler_) {
+        ret = api.dispatch(handler_,
+                           -1,
+                           &EthernetCapture::dispatch,
+                           reinterpret_cast<u_char*>(this));
+        if (ret == -1 || ret == -2) {
+            break;
+        }
+    }
+
+    LOG_INFO("EthernetCapture::CaptureLoop exit, ret={} (dropped={})",
+             ret,
+             dropped_count_.load());
 
     {
         std::lock_guard<std::mutex> lk(queue_mutex_);

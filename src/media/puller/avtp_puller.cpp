@@ -273,9 +273,26 @@ const char* CodecName(CodecType codec) {
             return "H265";
         case CodecType::JPEG:
             return "JPEG";
+        case CodecType::G711A:
+            return "G711A";
+        case CodecType::G711U:
+            return "G711U";
         default:
             return "UNKNOWN";
     }
+}
+
+CodecType AudioCodecFromText(const std::string& text, bool& enable_audio) {
+    if (text == "off" || text == "none" || text == "0" || text == "false") {
+        enable_audio = false;
+        return CodecType::UNKNOWN;
+    }
+    enable_audio = true;
+    if (text == "g711u" || text == "pcmu" || text == "ulaw") {
+        return CodecType::G711U;
+    }
+    // 当前设备 AAF payload 表现为 G711A-like 数据，auto 默认按 G711A。
+    return CodecType::G711A;
 }
 
 } // namespace
@@ -377,6 +394,26 @@ bool AvtpPuller::ParseUrl(const std::string& url,
         if (!ParseFloat(it->second, parsed.fps)) {
             return fail("invalid fps");
         }
+    }
+    if (const auto it = values.find("audio"); it != values.end()) {
+        parsed.audio_codec = AudioCodecFromText(it->second, parsed.enable_audio);
+    }
+    if (const auto it = values.find("audio_codec"); it != values.end()) {
+        parsed.audio_codec = AudioCodecFromText(it->second, parsed.enable_audio);
+    }
+    if (const auto it = values.find("audio_rate"); it != values.end()) {
+        std::uint64_t sample_rate = 0;
+        if (!ParseUnsigned(it->second, 384000, sample_rate) || sample_rate == 0) {
+            return fail("invalid audio sample rate");
+        }
+        parsed.audio_sample_rate = static_cast<int>(sample_rate);
+    }
+    if (const auto it = values.find("audio_channels"); it != values.end()) {
+        std::uint64_t channels = 0;
+        if (!ParseUnsigned(it->second, 64, channels) || channels == 0) {
+            return fail("invalid audio channel count");
+        }
+        parsed.audio_channels = static_cast<int>(channels);
     }
     if (const auto it = values.find("format"); it != values.end()) {
         if (it->second == "h264" || it->second == "standard" ||
@@ -495,9 +532,11 @@ bool AvtpPuller::Open(const Config& config) {
     current_codec_ = CodecType::UNKNOWN;
     raw_packets_ = 0;
     parsed_video_packets_ = 0;
+    parsed_audio_packets_ = 0;
     filtered_packets_ = 0;
     parse_errors_ = 0;
     access_units_ = 0;
+    audio_packets_ = 0;
     h265_access_units_ = 0;
     jpeg_access_units_ = 0;
 
@@ -526,13 +565,14 @@ bool AvtpPuller::Open(const Config& config) {
         return false;
     }
 
-    LOG_INFO("AVTP listening on {} src={} stream={} codec={}",
+    LOG_INFO("AVTP listening on {} src={} stream={} video_codec={} audio={}",
              config_.device,
              config_.source_mac ? FormatMacAddress(*config_.source_mac) : "*",
              config_.stream_id ? std::to_string(*config_.stream_id) : "*",
              CodecName(current_codec_ != CodecType::UNKNOWN
                            ? current_codec_
-                           : CodecFromPayloadFormat(config_.format)));
+                           : CodecFromPayloadFormat(config_.format)),
+             config_.enable_audio ? CodecName(config_.audio_codec) : "off");
     return true;
 }
 
@@ -629,12 +669,35 @@ bool AvtpPuller::ProcessRawPacketData(
     ++raw_packets_;
     media::avtp::ParsedCvfPacket cvf_packet;
     media::avtp::ParseError parse_error = media::avtp::ParseError::None;
-    // parser 只接受标准 CVF 视频包。AAF 音频、非 AVTP 包、未知格式包
-    // 都会被计入 filtered 或 parse_errors。
+    // 先按 CVF 视频解析；如果 subtype 不是 CVF，再尝试 AAF 音频。
+    // 这样 parser 层保持“按 subtype 分流”，puller 层负责把不同媒体类型
+    // 包装成统一的 MediaPacket。
     if (!media::avtp::AvtpPacketParser::Parse(data,
                                               size,
                                               cvf_packet,
                                               &parse_error)) {
+        if (parse_error == media::avtp::ParseError::UnsupportedSubtype &&
+            config_.enable_audio) {
+            media::avtp::ParsedAafPacket aaf_packet;
+            media::avtp::ParseError aaf_error = media::avtp::ParseError::None;
+            if (media::avtp::AvtpPacketParser::ParseAaf(data,
+                                                        size,
+                                                        aaf_packet,
+                                                        &aaf_error)) {
+                if (!PassesConfiguredFilters(aaf_packet)) {
+                    ++filtered_packets_;
+                    return false;
+                }
+
+                ++parsed_audio_packets_;
+                ++audio_packets_;
+                UpdateAudioStreamInfo(aaf_packet);
+                packet = MakeAudioMediaPacket(aaf_packet, timestamp_us);
+                return packet != nullptr;
+            }
+            parse_error = aaf_error;
+        }
+
         if (parse_error == media::avtp::ParseError::UnsupportedSubtype ||
             parse_error == media::avtp::ParseError::UnsupportedFormat ||
             parse_error == media::avtp::ParseError::UnsupportedEtherType) {
@@ -709,6 +772,18 @@ bool AvtpPuller::ProcessRawPacketData(
 
 bool AvtpPuller::PassesConfiguredFilters(
     const media::avtp::ParsedCvfPacket& packet) const {
+    if (config_.source_mac && packet.has_ethernet_header &&
+        !media::avtp::IsSameMac(packet.source_mac, *config_.source_mac)) {
+        return false;
+    }
+    if (config_.stream_id && packet.stream_id != *config_.stream_id) {
+        return false;
+    }
+    return true;
+}
+
+bool AvtpPuller::PassesConfiguredFilters(
+    const media::avtp::ParsedAafPacket& packet) const {
     if (config_.source_mac && packet.has_ethernet_header &&
         !media::avtp::IsSameMac(packet.source_mac, *config_.source_mac)) {
         return false;
@@ -804,8 +879,8 @@ CodecType AvtpPuller::SelectCodec(
 }
 
 void AvtpPuller::UpdateStreamInfo(CodecType codec) {
-    // 当前只输出一路视频。width/height/fps 来自配置；如果 AVTP 流或
-    // decoder 后续能提供更准的参数，再扩展 StreamInfo changed 机制。
+    // 当前输出一路视频 + 可选一路 AAF 音频。width/height/fps 来自配置；
+    // 音频默认参数来自 Config，收到 AAF 后会按 header 进一步更新。
     MediaStreamInfo video_info;
     video_info.media_type = MediaType::VIDEO;
     video_info.codec_type = codec;
@@ -817,10 +892,44 @@ void AvtpPuller::UpdateStreamInfo(CodecType codec) {
     detail.fps = config_.fps;
     video_info.detail = detail;
 
-    cached_info_.stream_infos.clear();
-    cached_info_.stream_infos.push_back(std::move(video_info));
-    cached_info_.video_stream_idx_ = 0;
-    cached_info_.audio_stream_idx_ = -1;
+    MultiStreamInfo updated;
+    updated.stream_infos.push_back(std::move(video_info));
+    updated.video_stream_idx_ = 0;
+
+    if (config_.enable_audio && config_.audio_codec != CodecType::UNKNOWN) {
+        MediaStreamInfo audio_info;
+        audio_info.media_type = MediaType::AUDIO;
+        audio_info.codec_type = config_.audio_codec;
+        audio_info.stream_index = 1;
+        audio_info.time_base = Rational{1, 1000000};
+        AudioStreamInfo detail;
+        detail.sample_rate = config_.audio_sample_rate;
+        detail.channels = config_.audio_channels;
+        detail.channel_layout = config_.audio_channels == 1 ? 4 : 3;
+        audio_info.detail = detail;
+        updated.audio_stream_idx_ = static_cast<int>(updated.stream_infos.size());
+        updated.stream_infos.push_back(std::move(audio_info));
+    }
+
+    cached_info_ = std::move(updated);
+}
+
+void AvtpPuller::UpdateAudioStreamInfo(
+    const media::avtp::ParsedAafPacket& packet) {
+    if (!config_.enable_audio || config_.audio_codec == CodecType::UNKNOWN) {
+        return;
+    }
+    if (packet.sample_rate > 0) {
+        config_.audio_sample_rate = packet.sample_rate;
+    }
+    if (packet.channels_per_frame > 0) {
+        config_.audio_channels = packet.channels_per_frame;
+    }
+
+    // 保持当前视频 codec，不因为 AAF 包到达而把 video StreamInfo 重置为 UNKNOWN。
+    UpdateStreamInfo(current_codec_ != CodecType::UNKNOWN
+                         ? current_codec_
+                         : CodecFromPayloadFormat(config_.format));
 }
 
 std::shared_ptr<MediaPacket> AvtpPuller::MakeMediaPacket(
@@ -857,6 +966,38 @@ std::shared_ptr<MediaPacket> AvtpPuller::MakeMediaPacketFromAccessUnit(
     return packet;
 }
 
+std::shared_ptr<MediaPacket> AvtpPuller::MakeAudioMediaPacket(
+    const media::avtp::ParsedAafPacket& aaf_packet,
+    std::int64_t timestamp_us) const {
+    if (!aaf_packet.payload || aaf_packet.payload_size == 0 ||
+        !config_.enable_audio || config_.audio_codec == CodecType::UNKNOWN) {
+        return nullptr;
+    }
+
+    auto packet = std::make_shared<MediaPacket>();
+    packet->type = MediaType::AUDIO;
+    packet->codec = config_.audio_codec;
+    packet->stream_index = 1;
+    packet->pts = timestamp_us;
+    packet->dts = timestamp_us;
+    packet->time_base = Rational{1, 1000000};
+    packet->keyframe = false;
+
+    const int sample_rate = config_.audio_sample_rate > 0
+        ? config_.audio_sample_rate
+        : 16000;
+    const int channels = std::max(1, config_.audio_channels);
+    const std::size_t samples = aaf_packet.payload_size /
+        static_cast<std::size_t>(channels);
+    packet->duration = static_cast<std::int64_t>(
+        samples * 1000000ULL / static_cast<std::uint64_t>(sample_rate));
+
+    packet->buffer = std::make_shared<SimpleBuffer>(
+        aaf_packet.payload, aaf_packet.payload_size);
+    packet->backend = {};
+    return packet;
+}
+
 MultiStreamInfo AvtpPuller::GetStreamInfo() const {
     return cached_info_;
 }
@@ -889,9 +1030,11 @@ AvtpPuller::Stats AvtpPuller::GetStats() const {
     Stats stats;
     stats.raw_packets = raw_packets_.load();
     stats.parsed_video_packets = parsed_video_packets_.load();
+    stats.parsed_audio_packets = parsed_audio_packets_.load();
     stats.filtered_packets = filtered_packets_.load();
     stats.parse_errors = parse_errors_.load();
     stats.access_units = access_units_.load();
+    stats.audio_packets = audio_packets_.load();
     stats.h265_access_units = h265_access_units_.load();
     stats.jpeg_access_units = jpeg_access_units_.load();
     stats.h264_assembler = h264_assembler_.GetStats();

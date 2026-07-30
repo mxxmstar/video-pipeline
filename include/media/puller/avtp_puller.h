@@ -23,7 +23,8 @@ class EthernetCapture;
 ///
 /// 设计边界：
 /// - 只实现 IPuller 输入侧，不负责 decoder、重连状态机和渲染；
-/// - AAF 音频和 AVDECC 控制面暂时只过滤，不输出；
+/// - AAF 音频第一阶段按当前设备画像输出 G711A/G711U packet；
+///   标准 AAF PCM 后续需要扩展 PCM codec 或直接 frame path；
 /// - format=auto 时默认在 Open() 中做有界 probe，保证 GetStreamInfo()
 ///   返回时尽量已经有确定 codec。
 class AvtpPuller : public IPuller {
@@ -72,6 +73,16 @@ public:
         /// 可选帧率。默认 25，当前主要用于 StreamInfo。
         float fps{25.0F};
 
+        /// 是否输出 AAF 音频。当前默认打开，便于 AVTP A/V 现场验证。
+        bool enable_audio{true};
+
+        /// 当前设备 AAF payload 表现为 G711A-like 数据；如设备改为 G711U 可配置。
+        CodecType audio_codec{CodecType::G711A};
+
+        /// AAF header 未 probe 前的音频默认参数；收到 AAF 后会用 header 更新。
+        int audio_sample_rate{16000};
+        int audio_channels{1};
+
         /// format=auto 时是否在 Open() 内做有界 probe。
         bool probe_on_open{true};
 
@@ -86,9 +97,11 @@ public:
     struct Stats {
         std::uint64_t raw_packets{0};
         std::uint64_t parsed_video_packets{0};
+        std::uint64_t parsed_audio_packets{0};
         std::uint64_t filtered_packets{0};
         std::uint64_t parse_errors{0};
         std::uint64_t access_units{0};
+        std::uint64_t audio_packets{0};
         std::uint64_t h265_access_units{0};
         std::uint64_t jpeg_access_units{0};
         media::avtp::AvtpH264Assembler::Stats h264_assembler;
@@ -162,6 +175,7 @@ private:
 
     /// @brief 检查 source MAC / stream_id 过滤条件。
     bool PassesConfiguredFilters(const media::avtp::ParsedCvfPacket& packet) const;
+    bool PassesConfiguredFilters(const media::avtp::ParsedAafPacket& packet) const;
 
     /// @brief 检查探测到的 codec 是否符合配置中的 format。
     bool PassesFormatFilter(CodecType codec) const;
@@ -180,6 +194,9 @@ private:
     /// @brief 更新 GetStreamInfo() 返回的缓存信息。
     void UpdateStreamInfo(CodecType codec);
 
+    /// @brief 用 AAF header 中的采样率/通道数更新音频 StreamInfo。
+    void UpdateAudioStreamInfo(const media::avtp::ParsedAafPacket& packet);
+
     /// @brief 将 H.264 access unit 包装为 MediaPacket。
     std::shared_ptr<MediaPacket> MakeMediaPacket(
         media::avtp::H264AccessUnit access_unit) const;
@@ -189,6 +206,11 @@ private:
         media::avtp::AvtpAccessUnit access_unit,
         CodecType codec,
         bool keyframe) const;
+
+    /// @brief 将 AAF audio payload 包装为 MediaPacket。
+    std::shared_ptr<MediaPacket> MakeAudioMediaPacket(
+        const media::avtp::ParsedAafPacket& packet,
+        std::int64_t timestamp_us) const;
 
     /// @brief 输出日志并触发 IPuller 事件回调。
     void EmitEvent(const std::string& message);
@@ -209,9 +231,11 @@ private:
 
     std::atomic<std::uint64_t> raw_packets_{0};
     std::atomic<std::uint64_t> parsed_video_packets_{0};
+    std::atomic<std::uint64_t> parsed_audio_packets_{0};
     std::atomic<std::uint64_t> filtered_packets_{0};
     std::atomic<std::uint64_t> parse_errors_{0};
     std::atomic<std::uint64_t> access_units_{0};
+    std::atomic<std::uint64_t> audio_packets_{0};
     std::atomic<std::uint64_t> h265_access_units_{0};
     std::atomic<std::uint64_t> jpeg_access_units_{0};
 };

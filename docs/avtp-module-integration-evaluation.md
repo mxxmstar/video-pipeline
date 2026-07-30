@@ -224,6 +224,61 @@ constexpr uint8_t kSubtypeCustom = 0x03;
 3. source MAC
 4. VLAN / EtherType 辅助过滤
 
+### live read / stop 控制需要进一步收敛
+
+现场验证时已经复现过一种关闭卡住现象：上层 `ReadPacket()` 已按超时返回，`ProbeCodec()` 也已经判定失败，但进程仍可能卡在 `EthernetCapture::Close()` 的后台抓包线程 join 阶段。
+
+初始实现中 `EthernetCapture` 后台线程执行 `pcap_loop()`，上层通过 `ReadPacket()` 从队列取包。`Close()` 主要依赖：
+
+```text
+pcap_breakloop()
+  -> capture_thread_.join()
+```
+
+这意味着在某些 Npcap/网卡状态下，即使上层读包逻辑已经超时，进程仍可能卡在关闭或 probe 收尾阶段，表现为 `avtp_live_probe`、`avtp_decode_rtsp_publisher` 等现场工具没有按预期时间退出。
+
+当前代码已先做一版缓解：把后台捕获循环从长时间阻塞的 `pcap_loop()` 改为可周期检查 `running_` 的 `pcap_dispatch()` 循环，并在 close 路径增加进入、退出和丢包统计日志。实测旧 source MAC 过滤失效、probe 超时失败时，工具已经可以稳定退出。
+
+这个问题与 AVTP AAF/CVF parser 本身无关，更像是抓包线程生命周期控制不够明确。后续仍建议继续收敛：
+
+1. 明确区分 `ReadPacket()` 的“无包超时”和“底层已停止/错误”返回语义。
+2. 保留并完善 `EthernetCapture::Close()` 的诊断日志，例如进入 close、调用 `pcap_breakloop`、开始 join、join 完成。
+3. 继续评估 `pcap_dispatch()` 在不同 Npcap 版本和网卡驱动上的行为，必要时改为 `pcap_next_ex()` + 超时轮询。
+4. 在 `AvtpPuller::ProbeCodec()` 中遇到持续无包时，应能稳定按 `probe_timeout_ms` 返回，不被底层 capture 线程 join 阻塞。
+5. 手动工具应避免无限等待，必要时增加 `--open-timeout` / `--close-timeout` 或 watchdog 日志。
+
+在这个问题收敛前，现场验证时如果工具超时，需要同时检查：
+
+- 设备是否确实仍在发 AVTP 包；
+- BPF filter 中的 source MAC 是否与设备重启后的实际 source MAC 一致；
+- `format=auto` 是否在等待 CVF 视频包完成 probe；
+- 是否有上一次超时遗留的 `avtp_*` 进程仍占用 Npcap 句柄。
+
+### AVTP render probe 与 AV sync 的边界
+
+`avtp_render_probe` 的定位是现场确认链路：
+
+```text
+AvtpPuller -> FFmpegDecoder(video/audio) -> RenderSession(OpenGL/WASAPI)
+```
+
+现场验证中曾出现 `submitted_video=30` 但 `rendered_video=1` 的现象。补充统计后确认这不是 OpenGL 渲染失败，而是 AV sync 把后续视频帧判定为晚到帧并主动丢弃：`avsync_dropped_video=29`。
+
+根因是 probe 工具为了快速验证，会在 codec probe 后短时间内消费已经积累的 AVTP 包；这种“突发提交”不等价于真实播放器按节奏喂帧。用 AV sync 参与这个测试，反而容易把测试工具自身的突发行为误判成视频晚到。
+
+因此当前 `avtp_render_probe` 默认关闭 `RenderSessionConfig::av_sync.enabled`，只验证 AVTP 拉流、解码和渲染通路本身。A/V 同步策略仍应由持续运行的 camera/RTSP render 场景单独验证。
+
+最新现场短测结果：
+
+```text
+read_video=41, read_audio=80
+decoded_video=30, decoded_audio=80
+submitted_video=30, submitted_audio=57
+rendered_video=30, rendered_audio=57
+dropped_video=0, avsync_dropped_video=0
+audio_decoder_errors=0
+```
+
 ## 分阶段实施建议
 
 ### 第一阶段：已知格式 H.264 单路视频
