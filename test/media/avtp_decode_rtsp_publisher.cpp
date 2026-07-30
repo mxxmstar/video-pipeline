@@ -512,6 +512,7 @@ int main(int argc, char** argv) {
 
     decoder.Close();
     audio_decoder.Close();
+    const auto timestamp_stats = puller.GetStats().timestamp_mapper;
     puller.Close();
     if (state.publisher) {
         state.publisher->Stop();
@@ -526,7 +527,13 @@ int main(int argc, char** argv) {
               << ", published_packets=" << state.published_packets
               << ", read_audio_packets=" << state.read_audio_packets
               << ", published_audio_packets=" << state.published_audio_packets
-              << ", empty_reads=" << empty_reads << "\n";
+              << ", empty_reads=" << empty_reads
+              << ", timestamp_mapped=" << timestamp_stats.mapped_timestamps
+              << ", timestamp_invalid=" << timestamp_stats.invalid_fallbacks
+              << ", timestamp_uncertain=" << timestamp_stats.uncertain_fallbacks
+              << ", timestamp_mcr=" << timestamp_stats.media_clock_restarts
+              << ", timestamp_resets=" << timestamp_stats.discontinuity_resets
+              << ", timestamp_wraps=" << timestamp_stats.forward_wraps << "\n";
 
     if (state.failed) {
         std::cerr << "pipeline failed: " << state.error << "\n";

@@ -114,7 +114,8 @@ void TestParseUrlToConfig() {
     const bool ok = AvtpPuller::ParseUrl(
         "avtp://default?src=aa:02:54:08:69:ca&stream=0xaabbccddeeff0001"
         "&format=h265&width=1920&height=1080&fps=25&audio=g711u"
-        "&audio_rate=16000&audio_channels=1&probe_timeout=500",
+        "&audio_rate=16000&audio_channels=1&timestamp=capture"
+        "&probe_timeout=500",
         config,
         &error);
 
@@ -131,6 +132,7 @@ void TestParseUrlToConfig() {
     assert(config.audio_codec == CodecType::G711U);
     assert(config.audio_sample_rate == 16000);
     assert(config.audio_channels == 1);
+    assert(config.timestamp_mode == AvtpPuller::TimestampMode::Capture);
     assert(config.probe_timeout_ms == 500);
 }
 

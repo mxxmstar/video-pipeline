@@ -427,12 +427,19 @@ int main(int argc, char** argv) {
     }
     audio_decoder.Close();
     video_decoder.Close();
+    const auto timestamp_stats = puller.GetStats().timestamp_mapper;
     puller.Close();
 
     PrintRenderStats("Summary: ", state, stats);
     std::cout << "Decoder summary: video_decoder_errors="
               << state.video_decoder_errors
               << ", audio_decoder_errors=" << state.audio_decoder_errors
+              << ", timestamp_mapped=" << timestamp_stats.mapped_timestamps
+              << ", timestamp_invalid=" << timestamp_stats.invalid_fallbacks
+              << ", timestamp_uncertain=" << timestamp_stats.uncertain_fallbacks
+              << ", timestamp_mcr=" << timestamp_stats.media_clock_restarts
+              << ", timestamp_resets=" << timestamp_stats.discontinuity_resets
+              << ", timestamp_wraps=" << timestamp_stats.forward_wraps
               << "\n";
 
     if (state.failed) {

@@ -2,6 +2,7 @@
 
 #include "media/protocol/avtp/avtp_h264_assembler.h"
 #include "media/protocol/avtp/avtp_payload_assembler.h"
+#include "media/protocol/avtp/avtp_timestamp_mapper.h"
 #include "media/puller/i_puller.h"
 
 #include <atomic>
@@ -38,6 +39,14 @@ public:
         H264,
         H265,
         Jpeg,
+    };
+
+    /// @brief MediaPacket PTS 的时间来源。
+    enum class TimestampMode {
+        /// 优先使用 AVTP presentation timestamp；无效/不确定时回退到抓包时间。
+        Avtp,
+        /// 完全沿用 Npcap 抓包时间，主要用于现场对比和兼容旧行为。
+        Capture,
     };
 
     /// @brief AVTP puller 配置结构体。
@@ -83,6 +92,9 @@ public:
         int audio_sample_rate{16000};
         int audio_channels{1};
 
+        /// PTS 默认使用 AVTP 时间轴。URL 可用 timestamp=avtp|capture 覆盖。
+        TimestampMode timestamp_mode{TimestampMode::Avtp};
+
         /// format=auto 时是否在 Open() 内做有界 probe。
         bool probe_on_open{true};
 
@@ -106,6 +118,7 @@ public:
         std::uint64_t jpeg_access_units{0};
         media::avtp::AvtpH264Assembler::Stats h264_assembler;
         media::avtp::AvtpPayloadAssembler::Stats payload_assembler;
+        media::avtp::AvtpTimestampMapper::Stats timestamp_mapper;
     };
 
     AvtpPuller();
@@ -220,6 +233,7 @@ private:
     std::unique_ptr<EthernetCapture> capture_;
     media::avtp::AvtpH264Assembler h264_assembler_;
     media::avtp::AvtpPayloadAssembler payload_assembler_;
+    media::avtp::AvtpTimestampMapper timestamp_mapper_;
     std::queue<std::shared_ptr<MediaPacket>> pending_packets_;
     bool has_codec_stream_{false};
     std::uint64_t codec_stream_id_{0};

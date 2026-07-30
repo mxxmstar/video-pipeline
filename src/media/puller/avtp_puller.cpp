@@ -415,6 +415,16 @@ bool AvtpPuller::ParseUrl(const std::string& url,
         }
         parsed.audio_channels = static_cast<int>(channels);
     }
+    if (const auto it = values.find("timestamp"); it != values.end()) {
+        if (it->second == "avtp" || it->second == "gptp") {
+            parsed.timestamp_mode = TimestampMode::Avtp;
+        } else if (it->second == "capture" || it->second == "pcap" ||
+                   it->second == "local") {
+            parsed.timestamp_mode = TimestampMode::Capture;
+        } else {
+            return fail("invalid timestamp mode (use avtp or capture)");
+        }
+    }
     if (const auto it = values.find("format"); it != values.end()) {
         if (it->second == "h264" || it->second == "standard" ||
             it->second == "1") {
@@ -523,6 +533,7 @@ bool AvtpPuller::Open(const Config& config) {
 
     h264_assembler_.Reset();
     payload_assembler_.Reset();
+    timestamp_mapper_.Reset();
     while (!pending_packets_.empty()) {
         pending_packets_.pop();
     }
@@ -565,14 +576,16 @@ bool AvtpPuller::Open(const Config& config) {
         return false;
     }
 
-    LOG_INFO("AVTP listening on {} src={} stream={} video_codec={} audio={}",
+    LOG_INFO("AVTP listening on {} src={} stream={} video_codec={} audio={} "
+             "timestamp={}",
              config_.device,
              config_.source_mac ? FormatMacAddress(*config_.source_mac) : "*",
              config_.stream_id ? std::to_string(*config_.stream_id) : "*",
              CodecName(current_codec_ != CodecType::UNKNOWN
                            ? current_codec_
                            : CodecFromPayloadFormat(config_.format)),
-             config_.enable_audio ? CodecName(config_.audio_codec) : "off");
+             config_.enable_audio ? CodecName(config_.audio_codec) : "off",
+             config_.timestamp_mode == TimestampMode::Avtp ? "avtp" : "capture");
     return true;
 }
 
@@ -692,7 +705,17 @@ bool AvtpPuller::ProcessRawPacketData(
                 ++parsed_audio_packets_;
                 ++audio_packets_;
                 UpdateAudioStreamInfo(aaf_packet);
-                packet = MakeAudioMediaPacket(aaf_packet, timestamp_us);
+                const std::int64_t media_timestamp_us =
+                    config_.timestamp_mode == TimestampMode::Avtp
+                        ? timestamp_mapper_.Map(
+                              aaf_packet.stream_id,
+                              aaf_packet.avtp_timestamp,
+                              timestamp_us,
+                              aaf_packet.timestamp_valid,
+                              aaf_packet.timestamp_uncertain,
+                              aaf_packet.media_clock_restart)
+                        : timestamp_us;
+                packet = MakeAudioMediaPacket(aaf_packet, media_timestamp_us);
                 return packet != nullptr;
             }
             parse_error = aaf_error;
@@ -732,11 +755,23 @@ bool AvtpPuller::ProcessRawPacketData(
     RememberCodec(cvf_packet, codec);
     UpdateStreamInfo(codec);
 
+    // 对同一个 puller 内的 CVF 和 AAF 共用映射器，使两类 packet 的 PTS 保持在
+    // 同一微秒时间轴。每个视频 access unit 仍采用第一片的映射时间。
+    const std::int64_t media_timestamp_us =
+        config_.timestamp_mode == TimestampMode::Avtp
+            ? timestamp_mapper_.Map(cvf_packet.stream_id,
+                                    cvf_packet.avtp_timestamp,
+                                    timestamp_us,
+                                    cvf_packet.timestamp_valid,
+                                    cvf_packet.timestamp_uncertain,
+                                    cvf_packet.media_clock_restart)
+            : timestamp_us;
+
     if (codec == CodecType::H264) {
         // H.264 单独组帧，方便识别 IDR/SPS 并设置 keyframe。
         media::avtp::H264AccessUnit access_unit;
         const auto result = h264_assembler_.Push(
-            cvf_packet, timestamp_us, access_unit);
+            cvf_packet, media_timestamp_us, access_unit);
         if (result == media::avtp::AvtpH264Assembler::Result::AccessUnitReady) {
             ++access_units_;
             packet = MakeMediaPacket(std::move(access_unit));
@@ -750,7 +785,7 @@ bool AvtpPuller::ProcessRawPacketData(
     const auto result = payload_assembler_.Push(cvf_packet,
                                                 payload,
                                                 payload_size,
-                                                timestamp_us,
+                                                media_timestamp_us,
                                                 access_unit);
     if (result == media::avtp::AvtpPayloadAssembler::Result::AccessUnitReady) {
         const bool keyframe =
@@ -1039,5 +1074,6 @@ AvtpPuller::Stats AvtpPuller::GetStats() const {
     stats.jpeg_access_units = jpeg_access_units_.load();
     stats.h264_assembler = h264_assembler_.GetStats();
     stats.payload_assembler = payload_assembler_.GetStats();
+    stats.timestamp_mapper = timestamp_mapper_.GetStats();
     return stats;
 }

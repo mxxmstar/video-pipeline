@@ -54,6 +54,13 @@ int main(int argc, char** argv) {
                   << " size=" << (packet->buffer ? packet->buffer->Size() : 0)
                   << " pts=" << packet->pts
                   << " keyframe=" << packet->keyframe << "\n";
+        const auto mapper = puller.GetStats().timestamp_mapper;
+        std::cout << "timestamp mapper: mapped=" << mapper.mapped_timestamps
+                  << " invalid_fallbacks=" << mapper.invalid_fallbacks
+                  << " uncertain_fallbacks=" << mapper.uncertain_fallbacks
+                  << " mcr=" << mapper.media_clock_restarts
+                  << " resets=" << mapper.discontinuity_resets
+                  << " wraps=" << mapper.forward_wraps << "\n";
         puller.Close();
         return 0;
     }

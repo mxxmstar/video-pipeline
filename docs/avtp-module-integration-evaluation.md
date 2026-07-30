@@ -194,18 +194,19 @@ constexpr uint8_t kSubtypeCustom = 0x03;
 
 不过从样例 pcap 看，`subtype=0x03` 的视频 payload 直接以 Annex-B start code 开始，并没有出现源工程定义的 8 字节私有前缀。因此私有前缀应作为设备兼容分支处理，而不应作为 `0x03` 的默认解释。
 
-### AVTP timestamp 尚未转成媒体时间轴
+### AVTP timestamp 已接入相对媒体时间轴
 
-当前实现解析了 AVTP timestamp，但构造 `MediaPacket` 时主要使用 Npcap capture timestamp。
+第三阶段已新增 `AvtpTimestampMapper`，`AvtpPuller` 默认优先使用 AVTP presentation timestamp 生成 `MediaPacket::pts/dts`，并保持当前工程统一的微秒时基 `time_base={1, 1000000}`。
 
-这意味着目前还没有处理：
+当前已经处理：
 
-- TV / TU / MCR 标志
-- 32 位 timestamp 回绕
-- gPTP 时钟映射
-- 音视频同步
+- TV 无效或 TU 不确定时回退到 Npcap capture timestamp。
+- 32 位纳秒 timestamp 每约 4.295 秒回绕的展开。
+- 按 stream 跟踪 MR toggle，并在 media clock restart 时重建锚点。
+- AVTP 与抓包时间走势偏差过大时自动重锚，避免输出跳跃 PTS。
+- CVF 视频和 AAF 音频共用同一个 mapper，保留两者在 AVTP 时间轴上的相对关系。
 
-第一阶段这可以接受，目标是“单路视频先跑起来”。如果后续要做 AVB/TSN 级别同步，需要单独设计 `AvtpTimestampMapper`。
+这里实现的是“以首个有效 AVTP timestamp + 抓包时间为锚点”的相对映射，并不宣称已经获得完整 gPTP epoch。后续若要达到 AVB/TSN 跨设备绝对同步，还需要接入主机 gPTP 时钟、测量 presentation offset，并在长时间现场测试中验证漂移。现场排障可通过 URL 添加 `timestamp=capture` 恢复旧行为做 A/B 对比。
 
 ### 当前实现是设备画像，不是完整 IEEE 1722 栈
 
@@ -313,13 +314,15 @@ audio_decoder_errors=0
 
 目标是把 AVTP timestamp 映射到当前工程媒体时间轴，并为后续音视频同步或多流同步打基础。
 
+当前状态：基础映射已实施并通过单元测试与真实设备 render probe；绝对 gPTP 同步和长时间漂移验证尚未完成。
+
 建议工作项：
 
-1. 设计 `AvtpTimestampMapper`。
-2. 处理 32 位 timestamp 展开和回绕。
-3. 处理 MCR 重置。
-4. 明确 gPTP 与本地时间轴映射方式。
-5. 用真实设备验证延迟、抖动和同步行为。
+1. 已设计并接入 `AvtpTimestampMapper`。
+2. 已处理 32 位 timestamp 展开和回绕。
+3. 已按 stream 处理 MR toggle 和 MCR 重置。
+4. 已明确当前采用相对锚点映射；完整 gPTP epoch 接入待实施。
+5. 已完成短时真实设备验证；延迟、抖动、漂移和同步行为仍需长时间验证。
 
 预估工作量：2 到 4 天，需要真实设备配合。
 
@@ -420,12 +423,14 @@ avtp://<pcap-device>?src=<source-mac>&stream=<stream-id>&format=h264
 - `<pcap-device>`：抓包网卡或设备标识，可使用 `default`。
 - `src`：AVTP source MAC，建议填写。
 - `stream`：AVTP stream ID，强烈建议填写。
-- `format`：第一阶段必填，先支持 `h264`。
+- `format`：支持 `auto`、`h264`、`h265`、`jpeg`；当前工程默认在 `Open()` 内有界 probe。
+- `audio`：支持 `g711a`、`g711u`、`off`。
+- `timestamp`：支持 `avtp`（默认）和 `capture`（现场兼容/对比）。
 
 后续再扩展：
 
 ```text
-avtp://<pcap-device>?src=<source-mac>&stream=<stream-id>&format=auto&sync=gptp
+avtp://<pcap-device>?src=<source-mac>&stream=<stream-id>&format=auto&audio=g711a&timestamp=avtp
 ```
 
 ## 推荐落地顺序
