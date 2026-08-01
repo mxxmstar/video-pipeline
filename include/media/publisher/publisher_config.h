@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "media/media_packet.h"
@@ -49,8 +50,32 @@ struct MediaTrackConfig {
 };
 
 struct FfmpegPublishOptions {
+    // 显式指定 FFmpeg 输出 muxer 的名称。例如 RTSP 推流通常使用 "rtsp"。
+    // 为空时由 FfmpegMuxProtocol 根据 URL 推断；RTSP URL 会默认选择 rtsp
+    // muxer，其它 URL 则交给 libavformat 按协议/扩展名选择。
     std::string format_name;
+
+    // RTSP 输出的底层传输方式，例如 "tcp" 或 "udp"。该选项只会在
+    // format_name/URL 解析为 RTSP 输出时传给 FFmpeg。
     std::string rtsp_transport{"tcp"};
+
+    // 单次 FFmpeg I/O 操作的超时时间，单位为毫秒。它覆盖连接、写 header、
+    // 写 packet、写 trailer 和关闭输出等操作；设置为 0 表示不主动设置超时。
+    int io_timeout_ms{5000};
+
+    // packet 写入发生 RuntimeDisconnected 后最多重新建立多少次输出会话。
+    // 0 表示不自动重连，调用方会直接收到写入失败结果。
+    int reconnect_attempts{3};
+
+    // 两次重连尝试之间的固定等待时间，单位为毫秒。当前实现是固定退避，
+    // 还没有指数退避或主备 URL 切换能力。
+    int reconnect_backoff_ms{200};
+
+    // 按 Publisher track_id 指定 FFmpeg bitstream filter。例如：
+    // { {0, "h264_mp4toannexb"} }。
+    // filter 默认不启用，只有确认输入 packet 格式与目标 muxer 不匹配时才配置，
+    // 避免对已经满足目标格式的 packet 进行重复转换。
+    std::unordered_map<int, std::string> bitstream_filters;
 };
 
 struct RtspServerOptions {

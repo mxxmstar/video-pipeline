@@ -80,7 +80,7 @@ struct PublisherConfig {
 | `listen_host` / `listen_port` | RTSP Server 的监听地址和端口 |
 | `stream_path` | RTSP Server 对外暴露的流路径，应以 `/` 开头 |
 | `tracks` | 本次发布的所有音视频轨道 |
-| `ffmpeg` | FFmpeg 输出格式和 RTSP transport 选项 |
+| `ffmpeg` | FFmpeg 输出格式、I/O 超时、重连和 bitstream filter 选项 |
 | `rtsp` | 本机 RTSP Server 的 TCP、UDP、组播和 RTP 包大小配置 |
 
 `Auto` 当前只有两条推断规则：
@@ -113,9 +113,267 @@ PushClient -> FfmpegMux
 | `rtp_payload_type` | SDP 和 RTP header 中使用的 payload type |
 | `rtp_clock_rate` | RTP timestamp 的时钟频率；H264 通常为 90000，音频使用采样率 |
 
-多轨发布时，当前 adapter 使用 `MediaPacket::stream_index` 匹配 `track_id`。因此上游必须保证二者一致。单轨发布会直接映射到唯一 track，不依赖 `stream_index`。
+多轨发布时，FFmpeg adapter 优先使用 packet 的 `stream_index` 匹配配置中的 `track_id`；如果无法匹配，则按媒体类型和 codec 唯一匹配。存在多个候选时会拒绝 packet，避免错误写入其他轨道。
 
-### 3.3 MediaPacket 与 EncodedAccessUnit
+### 3.3 `stream_index` 与 `track_id`
+
+这两个字段都可以用来“找到一条媒体流”，但它们属于不同层次，不能默认视为同一个值。实际链路中还会出现 FFmpeg 输出侧的 `AVStream::index`，因此需要区分下面三种标识：
+
+| 标识 | 所属对象 | 产生方 | 作用域 | 主要用途 |
+|---|---|---|---|---|
+| `MediaPacket::stream_index` | 输入媒体包 | 上游 demuxer、拉流器或解码链路 | 当前输入源/输入会话 | 表示该 packet 来自输入源的哪条 stream |
+| `MediaTrackConfig::track_id` | Publisher 轨道配置 | 应用或 Publisher 配置 | 当前发布任务 | Publisher 内部稳定、唯一的逻辑轨道键 |
+| `AVStream::index` / 输出 `AVPacket::stream_index` | FFmpeg 输出对象 | FFmpeg `AVFormatContext` | 当前输出会话 | 表示 packet 应写入 FFmpeg 输出 context 的哪条 `AVStream` |
+
+#### 3.3.1 `MediaPacket::stream_index`
+
+`MediaPacket::stream_index` 描述的是**输入侧身份**。它通常来自上游 FFmpeg `AVPacket::stream_index` 或等价的 demuxer stream 编号，常见形式是：
+
+```text
+输入文件/摄像头/远端 RTSP
+  AVStream[0] -> 视频 -> MediaPacket.stream_index = 0
+  AVStream[1] -> 音频 -> MediaPacket.stream_index = 1
+```
+
+它有以下特点：
+
+- 通常从 0 开始，但编号是否连续、视频是否一定为 0、音频是否一定为 1，都不应作为 Publisher 的通用假设。
+- 它属于输入源。更换输入文件、摄像头、demuxer，或者改变输入流筛选顺序后，编号可能变化。
+- `-1` 表示上游没有提供可用的 stream 编号。此时 adapter 只能依赖媒体类型和 codec 等其它元数据。
+- 它只说明 packet 来自哪条输入 stream，不说明 Publisher 是否要把它发布为哪条输出 track。
+
+因此，`stream_index` 适合作为 adapter 的路由线索，但不适合作为跨输入源、跨发布任务持久化的业务 ID。
+
+#### 3.3.2 `MediaTrackConfig::track_id`
+
+`track_id` 描述的是**Publisher 逻辑侧身份**。它由发布配置提供，在一次 `PublisherConfig` 中必须非负且唯一：
+
+```cpp
+MediaTrackConfig video;
+video.track_id = 10;
+video.media_type = MediaType::VIDEO;
+video.codec_type = CodecType::H264;
+
+MediaTrackConfig audio;
+audio.track_id = 20;
+audio.media_type = MediaType::AUDIO;
+audio.codec_type = CodecType::AAC;
+```
+
+在当前架构中，`track_id` 的职责包括：
+
+- 作为 `EncodedAccessUnit::track_id`，在 adapter 和 protocol 之间传递已经解析完成的逻辑轨道。
+- 作为 `FfmpegPublishOptions::bitstream_filters` 的配置键，例如 `track_id -> h264_mp4toannexb`。
+- 作为 RTSP Server 内部 track 状态、RTP/RTCP 状态和 SDP `trackN` 控制 URL 的关联键。
+- 在重连、会话重建和多轨处理时保持 Publisher 内部语义稳定。
+
+`track_id` 不要求等于输入 `stream_index`，也不要求等于 FFmpeg 输出 `AVStream::index`。它只需要在当前发布任务内唯一，并且在创建配置、发送 packet 和 protocol 运行期间保持一致。
+
+#### 3.3.3 FFmpeg 输出侧 `AVStream::index`
+
+FFmpeg mux protocol 启动时，会按照 `PublisherConfig::tracks` 创建输出 stream：
+
+```text
+PublisherConfig::tracks
+  track_id = 10, VIDEO -> fmt_ctx->streams[0]
+  track_id = 20, AUDIO -> fmt_ctx->streams[1]
+```
+
+FFmpeg protocol 会保存一张内部映射表：
+
+```text
+track_to_stream_index_
+  10 -> 0
+  20 -> 1
+```
+
+写包时的实际过程是：
+
+```text
+EncodedAccessUnit.track_id
+  -> track_to_stream_index_
+  -> 输出 AVStream::index
+  -> AVPacket.stream_index
+  -> av_write_frame()
+```
+
+这里的输出 `AVPacket::stream_index` 与输入 `MediaPacket::stream_index` 可能数值相同，也可能不同。它们分别属于两个不同的 `AVFormatContext`：一个是输入上下文，一个是输出上下文。即使两个值都为 `0`，也只能说明它们在各自上下文中都是第 0 条 stream，不能说明它们是同一个对象。
+
+#### 3.3.4 当前 adapter 的映射优先级
+
+`FfmpegProtocolAdapter::FindTrackForPacket()` 当前使用以下规则：
+
+```text
+1. 如果 packet.stream_index >= 0：
+   使用 stream_index 查找 track_id == stream_index 的 track，
+   同时校验 media_type 和 codec。
+
+2. 如果没有命中：
+   按 packet 的 media_type 和 codec 查找配置中的候选 track。
+
+3. 候选为 0 条：
+   返回 InvalidMediaPacket。
+
+4. 候选超过 1 条：
+   返回 InvalidMediaPacket，要求上游提供更明确的 stream_index。
+
+5. 候选恰好 1 条：
+   将 packet 映射到该 track 的 track_id。
+```
+
+第一步是一个兼容性快捷路径，适用于项目约定 `track_id == 输入 stream_index` 的配置；它不是两个字段的定义关系。第二步是单轨或媒体类型/codec 唯一时的安全回退。
+
+转换完成后，adapter 会把配置中的 `track_id` 写入 `EncodedAccessUnit::track_id`，不会继续把 `MediaPacket::stream_index` 当作 Publisher 轨道编号：
+
+```text
+MediaPacket(stream_index=0, type=AUDIO, codec=AAC)
+  -> 配置中唯一匹配的 track_id=20
+  -> EncodedAccessUnit(track_id=20, media_type=AUDIO, codec=AAC)
+```
+
+#### 3.3.5 单轨和多轨示例
+
+**示例一：数值恰好相同，但语义仍然不同**
+
+```text
+输入：stream_index=0，H264 视频
+配置：track_id=0，H264 视频
+输出：AVStream::index=0
+```
+
+这个例子可以直接命中 adapter 的快捷路径，但三个 `0` 分别来自输入源、Publisher 配置和输出 FFmpeg context。更换输入源或调整 `tracks` 顺序后，输出 stream index 仍可能变化。
+
+**示例二：输入编号和 Publisher track_id 不同**
+
+```text
+输入 packet：stream_index=0，AAC 音频
+Publisher 配置：
+  track_id=10，H264 视频
+  track_id=20，AAC 音频
+```
+
+`stream_index=0` 无法命中 `track_id=0`，adapter 会根据 `AUDIO + AAC` 唯一匹配到 `track_id=20`。随后 FFmpeg mux protocol 可能将 `track_id=20` 映射为输出 `AVStream::index=1`：
+
+```text
+0（输入 stream_index） -> 20（Publisher track_id） -> 1（输出 AVStream index）
+```
+
+**示例三：同 codec 多轨不能靠类型推断**
+
+```text
+Publisher 配置：
+  track_id=10，H264 视频
+  track_id=11，H264 视频
+输入 packet：stream_index=-1，H264 视频
+```
+
+此时两个候选的媒体类型和 codec 完全相同，adapter 无法安全判断 packet 属于哪条轨道。FFmpeg adapter 会返回 `InvalidMediaPacket`，而不是随机选择一条 track。
+
+#### 3.3.6 使用约束和建议
+
+- 配置 `track_id` 时使用发布任务内稳定、唯一的逻辑编号，不要依赖输入文件或摄像头当前的 stream 排列。
+- 上游能够提供输入 stream 编号时，应尽量填充 `MediaPacket::stream_index`；这对同 codec 多轨尤其重要。
+- 不要在 protocol 中直接使用 `MediaPacket::stream_index`。应先由 adapter 转换为 `EncodedAccessUnit::track_id`。
+- 不要在业务层使用 FFmpeg 输出 `AVStream::index` 作为轨道 ID。它是当前输出 context 的运行时编号，重建 context 或调整轨道创建顺序后可能变化。
+- 单轨发布时可以不依赖 `stream_index`，但 packet 的媒体类型和 codec 仍应与唯一 track 一致。
+- 当前 `RtspServerProtocolAdapter` 与 `FfmpegProtocolAdapter` 都支持 `stream_index == track_id` 的兼容路径，但二者的多候选回退策略还没有完全统一；新增协议 adapter 时应采用“候选必须唯一”的规则。
+
+### 3.4 FFmpeg 推流选项
+
+`FfmpegPublishOptions` 当前提供：
+
+| 字段 | 用途 |
+|---|---|
+| `format_name` | 显式选择 FFmpeg 输出格式；为空时由 URL 推断 |
+| `rtsp_transport` | RTSP 输出使用的传输方式，例如 `tcp` |
+| `io_timeout_ms` | 连接、header、packet 和关闭操作的超时；`0` 表示不启用超时 |
+| `reconnect_attempts` | packet 写入失败后的最大重连次数；`0` 表示不重连 |
+| `reconnect_backoff_ms` | 两次重连尝试之间的等待时间 |
+| `bitstream_filters` | `track_id -> FFmpeg bitstream filter 名称` |
+
+示例：
+
+```cpp
+config.ffmpeg.format_name = "rtsp";
+config.ffmpeg.rtsp_transport = "tcp";
+config.ffmpeg.io_timeout_ms = 5000;
+config.ffmpeg.reconnect_attempts = 3;
+config.ffmpeg.reconnect_backoff_ms = 200;
+config.ffmpeg.bitstream_filters.emplace(0, "h264_mp4toannexb");
+```
+
+bitstream filter 默认关闭。只有确认上游 packet 格式和目标 muxer 要求不一致时才配置，不能把 `h264_mp4toannexb` 无条件用于已经是 Annex-B 的 packet。
+
+#### Bitstream Filter 理论
+
+**为什么需要 bitstream filter？**
+
+编码器输出的比特流格式与目标封装协议要求的格式可能不一致：
+
+| 编码器输出 | 目标协议 | 需要转换 |
+|-----------|---------|---------|
+| AVCC (长度前缀) | RTSP/TS | 需要 `h264_mp4toannexb` |
+| AVCC (长度前缀) | MP4/FLV | 不需要 |
+| ADTS (AAC) | RTSP/MP4 | 需要 `aac_adtstoasc` |
+
+**常见过滤器：**
+
+| 过滤器名称 | 作用 | 场景 |
+|-----------|------|------|
+| `h264_mp4toannexb` | H.264 AVCC → AnnexB | RTSP/TS 推流 |
+| `hevc_mp4toannexb` | H.265 AVCC → AnnexB | H.265 RTSP 推流 |
+| `aac_adtstoasc` | AAC ADTS → ASC | AAC 音频推流 |
+
+**设计原则：**
+
+- **显式配置** - filter 名称由用户显式指定，不自动检测
+- **责任分离** - 编码器只负责编码，Publisher 负责协议适配
+- **避免重复转换** - 已经是目标格式的数据不应再次转换
+
+**配置示例：**
+
+```cpp
+// 拉流 → 解码 → 编码 → 推流管线
+PublisherConfig config;
+config.protocol = PublishProtocol::FfmpegMux;
+config.url = "rtsp://192.168.1.100/live/stream";
+config.tracks.push_back(video_track);
+
+// 编码器输出 AVCC，RTSP 要求 AnnexB，需要转换
+config.ffmpeg.bitstream_filters[video_track.track_id] = "h264_mp4toannexb";
+```
+
+#### 配置错误场景
+
+**场景：编码器已输出 AnnexB，但仍配置了 `h264_mp4toannexb`**
+
+```
+编码器输出 (AnnexB)
+    ↓ h264_mp4toannexb (错误配置)
+重复转换（可能损坏数据）
+    ↓
+RTP 打包 (格式错误)
+    ↓
+RTSP 推流 ✗ 客户端解码失败
+```
+
+**后果：**
+- NALU 可能被重复添加起始码 (`0x000001`)
+- 长度前缀信息丢失
+- 客户端无法正确解析 NALU 边界
+- 视频花屏或完全无法解码
+
+**排查建议：**
+1. 先不配置 filter，测试推流是否正常
+2. 如果客户端解码失败，再添加 `h264_mp4toannexb`
+3. 使用 FFmpeg 命令行工具验证编码器输出格式：
+   ```bash
+   ffprobe -show_data -i input.h264 | head -20
+   ```
+   - 看到 `00 00 00 01` 起始码 → AnnexB 格式
+   - 看到 4 字节长度前缀 → AVCC 格式
+
+### 3.5 MediaPacket 与 EncodedAccessUnit
 
 `MediaPacket` 是 pipeline 对外的编码包模型，`EncodedAccessUnit` 是 protocol 内部使用的模型。两者之间的转换由 adapter 完成。
 
@@ -129,7 +387,7 @@ PushClient -> FfmpegMux
 
 FFmpeg 路径保留源 packet 的时间基，写入前转换到 `AVStream::time_base`。RTSP Server 路径则由 adapter 先把 PTS 转换为对应 track 的 RTP timestamp。
 
-### 3.4 PublisherStats
+### 3.6 PublisherStats
 
 当前公开统计如下：
 
@@ -245,11 +503,11 @@ Adapter 不应负责 socket 收发、客户端会话和 FFmpeg muxer 的资源�
 `FfmpegProtocolAdapter` 的转换较薄：
 
 - 单轨时直接使用唯一的 `track_id`。
-- 多轨时使用 `MediaPacket::stream_index` 作为 `track_id`。
+- 多轨时优先将 `MediaPacket::stream_index` 作为 track id 候选；无法命中时按媒体类型和 codec 唯一匹配。
 - 保留 packet 的 PTS/DTS/duration/time base、buffer 和 FFmpeg backend handle。
 - 调用 `FfmpegMuxProtocol::Write()`。
 
-它不解析 H264 NAL，也不修改 bitstream。目标 muxer 是否要求 Annex-B、AVCC 或额外 bitstream filter，当前由上游和 FFmpeg muxer 的兼容性共同保证。
+它不解析 H264 NAL；显式配置的 bitstream filter 由 `FfmpegMuxProtocol` 在写 packet 前执行。目标 muxer 是否要求 Annex-B、AVCC 或额外 filter，仍需要针对输入格式和输出格式验证。
 
 ### 5.3 RtspServerProtocolAdapter
 
@@ -304,7 +562,12 @@ Write
   -> 引用 FFmpeg AVPacket 或复制编码 buffer
   -> track_id 映射到 AVStream index
   -> av_packet_rescale_ts 到输出 stream time base
+  -> 可选 AVBSFContext 处理 bitstream filter
   -> av_write_frame
+
+写入失败
+  -> 在配置允许时重建 output context、streams 和 header
+  -> 视频等待关键帧后恢复发布
 
 Stop
   -> av_write_trailer
@@ -314,7 +577,7 @@ Stop
 
 代码中的 codec 映射包括 H264、H265、AAC、Opus、G711A 和 G711U。最终能否发布还取决于所选容器、FFmpeg muxer 和远端服务器是否接受该 codec 组合。
 
-当前 `Write()` 是同步调用。远端拥塞、断网或 muxer 阻塞可能直接拖慢调用它的 pipeline 线程。
+当前 `Write()` 仍是同步调用，但每个 FFmpeg I/O 操作可以通过 `io_timeout_ms` 设置上限。远端拥塞不会无限期阻塞，但仍可能在超时窗口内拖慢调用它的 pipeline 线程；彻底解耦需要上层有界发布队列。
 
 ### 6.3 RtspServerProtocol
 
@@ -463,14 +726,14 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | FFmpeg RTSP/RTMP push | 已实现 | 具体格式由 URL 和 `format_name` 决定 |
-| FFmpeg 多音视频轨 | 已实现 | `stream_index` 必须与 `track_id` 对齐 |
+| FFmpeg 多音视频轨 | 已实现 | adapter 优先按 track id 匹配，无法匹配时按媒体类型和 codec 唯一匹配 |
 | 本机 RTSP H264 | 已实现 | Annex-B、AVCC、FU-A、SPS/PPS |
 | 本机 RTSP AAC/G711 | 已实现 | TCP interleaved 和 UDP unicast |
 | UDP multicast | 部分实现 | 仅共享 H264 video sender |
 | RTCP SR/RR | 已实现基础版本 | 缺 SDES/BYE、超时和详细指标导出 |
 | 裸 RTP UDP publisher | 未实现 | `RtpUdp` 统一返回结构化 `UnsupportedProtocol` |
 | WebRTC publisher | 未实现 | `WebRtc` 统一返回结构化 `UnsupportedProtocol`，独立规划文档已存在 |
-| 自动重连/主备切换 | 未实现 | FFmpeg 写失败后由调用方处理 |
+| FFmpeg 自动重连 | 已实现基础版本 | 写入失败后按配置重连，视频重连后等待关键帧；主备切换仍未实现 |
 | 发布队列和背压 | 未实现 | 当前同步传播协议写入延迟 |
 | RTSP 鉴权/TLS | 未实现 | 仅适合可信网络内使用 |
 
@@ -498,9 +761,21 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### FFmpeg 推流
 
 - 同步写入可能阻塞 pipeline。
+  - 状态：部分修复。
+  - 修复日期：2026-08-01。
+  - 修复方法：新增 `io_timeout_ms`，通过 FFmpeg `rw_timeout` 和 `AVIOInterruptCB` 限制连接、header、packet、trailer 和 close 操作的最长等待时间。`Write()` 仍是同步调用，后续需要 `QueuedPublisher` 才能彻底与 pipeline 解耦。
 - 没有自动重连、退避、关键帧等待和断线期间的 packet 丢弃策略。
+  - 状态：已实现基础版本。
+  - 修复日期：2026-08-01。
+  - 修复方法：新增 `reconnect_attempts` 和 `reconnect_backoff_ms`；`av_write_frame` 失败后重建 FFmpeg output context、streams、header 和 filter 状态，视频重连后丢弃非关键帧并等待下一个 keyframe。主备目标切换和有界发送队列仍未实现。
 - 没有统一 bitstream filter 层；不同 muxer 的 H264/H265 格式要求需要逐个验证。
-- 多轨路由依赖 `stream_index == track_id` 的外部约定。
+  - 状态：已实现显式 filter 层。
+  - 修复日期：2026-08-01。
+  - 修复方法：`FfmpegPublishOptions::bitstream_filters` 按 `track_id` 配置 FFmpeg `AVBSFContext`，在 `av_write_frame` 前完成 filter 处理；默认不启用 filter，避免改变现有流。尚未根据输入 packet 自动判断 Annex-B/AVCC 并自动选择 filter。
+- 多轨路由历史上依赖 `stream_index == track_id` 的外部约定。
+  - 状态：已修复。
+  - 修复日期：2026-08-01。
+  - 修复方法：`FfmpegProtocolAdapter` 新增 track 查找逻辑，优先校验 `stream_index` 对应的 track，失败后按媒体类型和 codec 做唯一匹配；多条候选无法区分时返回 `InvalidMediaPacket`。
 
 ### RTSP Server
 
@@ -597,7 +872,7 @@ FFmpeg mux 路径已有 H265 codec 映射，但仍需针对目标格式和服务
 
 - 引入 `Created/Starting/Running/Stopping/Stopped/Failed` 状态。
 - 已采用构造时固定配置，并将启动接口统一为无参数 `Start()`。
-- 用 `PublisherResult`/`PublisherError` 替代只有布尔值的失败结果。
+- 用 `PublisherResult`/`PublisherErrorCode` 替代只有布尔值的失败结果。
 - 明确 `Publish()` 与 `Stop()` 的并发契约，并补竞态测试。
 - 增加启动失败、运行时断流和停止完成事件。
 
@@ -666,9 +941,11 @@ FFmpeg mux 路径已有 H265 codec 映射，但仍需针对目标格式和服务
 
 目标：ZLMediaKit 重启或短时断网后自动恢复。
 
+进度（2026-08-01）：基础重连、退避、重建 FFmpeg context 和关键帧恢复已完成；MediaServer 重启集成测试以及指数退避仍待补充。
+
 工作项：
 
-- 为 FFmpeg protocol 增加连接状态和指数退避。
+- 为 FFmpeg protocol 增加连接状态和有界退避；指数退避仍待补充。
 - 重建 `AVFormatContext`、stream 和 header。
 - 重连期间执行有界丢包，并在连接恢复后等待视频关键帧。
 - 确保 AAC extradata、H264 SPS/PPS 和时间戳在新会话中重新初始化。

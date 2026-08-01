@@ -2,6 +2,7 @@
 
 #include <boost/asio/ip/address.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <unordered_set>
 #include <utility>
@@ -116,11 +117,34 @@ PublisherResult PublisherConfig::ValidateProtocol() const {
     }
 
     if (resolved_protocol == PublishProtocol::FfmpegMux) {
+        // FFmpeg mux protocol 是主动连接远端的 push client，不承担监听和拉流职责。
+        // 因此这里同时校验角色、输出 URL 以及 FFmpeg 专属运行参数。
         if (mode != PublishMode::PushClient) {
             return Invalid("FfmpegMux requires PublishMode::PushClient");
         }
         if (url.empty()) {
             return Invalid("FfmpegMux requires a non-empty output URL");
+        }
+        if (ffmpeg.io_timeout_ms < 0 || ffmpeg.reconnect_attempts < 0 ||
+            ffmpeg.reconnect_backoff_ms < 0) {
+            return Invalid("FFmpeg timeout and reconnect values must not be negative");
+        }
+
+        // bitstream filter 通过 track_id 绑定到具体输出 stream。提前检查 track
+        // 是否存在，可以把配置错误定位在启动前，而不是等到第一帧到达时才失败。
+        for (const auto& [track_id, filter_name] : ffmpeg.bitstream_filters) {
+            if (filter_name.empty()) {
+                return Invalid("FFmpeg bitstream filter names must not be empty");
+            }
+            const auto track_it = std::find_if(
+                tracks.begin(),
+                tracks.end(),
+                [track_id](const MediaTrackConfig& track) {
+                    return track.track_id == track_id;
+                });
+            if (track_it == tracks.end()) {
+                return Invalid("FFmpeg bitstream filter references an unknown track");
+            }
         }
         for (const auto& track : tracks) {
             if (!IsFfmpegCodecSupported(track.codec_type)) {
