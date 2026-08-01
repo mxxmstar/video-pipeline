@@ -12,13 +12,13 @@ class IProtocol {
 public:
     virtual ~IProtocol() = default;
 
-    virtual bool Start(const PublisherConfig& config,
-                       const std::vector<MediaTrackConfig>& tracks) = 0;
-    virtual bool Write(const EncodedAccessUnit& access_unit) = 0;
+    virtual PublisherResult Start(
+        const PublisherConfig& config,
+        const std::vector<MediaTrackConfig>& tracks) = 0;
+    virtual PublisherResult Write(const EncodedAccessUnit& access_unit) = 0;
     virtual void Stop() = 0;
 
     virtual std::string GetOutputUrl() const = 0;
     virtual PublisherStats GetStats() const = 0;
 };
-
 

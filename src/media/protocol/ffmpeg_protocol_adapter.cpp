@@ -14,7 +14,7 @@ FfmpegProtocolAdapter::~FfmpegProtocolAdapter() {
     Close();
 }
 
-bool FfmpegProtocolAdapter::Open(const PublisherConfig& config) {
+PublisherResult FfmpegProtocolAdapter::Open(const PublisherConfig& config) {
     Close();
 
     config_ = config;
@@ -22,13 +22,16 @@ bool FfmpegProtocolAdapter::Open(const PublisherConfig& config) {
         protocol_ = std::make_unique<FfmpegMuxProtocol>();
     }
 
-    opened_ = protocol_->Start(config_, config_.tracks);
-    return opened_;
+    auto result = protocol_->Start(config_, config_.tracks);
+    opened_ = result.IsSuccess();
+    return result;
 }
 
-bool FfmpegProtocolAdapter::Send(const MediaPacket& packet) {
+PublisherResult FfmpegProtocolAdapter::Send(const MediaPacket& packet) {
     if (!opened_ || !protocol_) {
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidState,
+            "FFmpeg protocol adapter is not open");
     }
 
     return protocol_->Write(ToAccessUnit(packet));
@@ -67,5 +70,4 @@ EncodedAccessUnit FfmpegProtocolAdapter::ToAccessUnit(const MediaPacket& packet)
     access_unit.backend = packet.backend;
     return access_unit;
 }
-
 

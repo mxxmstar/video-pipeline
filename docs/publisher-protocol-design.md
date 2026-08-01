@@ -92,6 +92,12 @@ PushClient -> FfmpegMux
 
 建议生产代码显式填写 `protocol`。这样新增协议后不会因为默认推断规则改变而产生行为漂移。
 
+配置校验分为两步：
+
+- `ValidateStructure()` 校验 track 基础参数和 `track_id` 唯一性。
+- `ValidateProtocol()` 校验 mode/protocol 组合、协议 codec 能力、RTP payload type、RTSP transport 和组播端口对。
+- `Validate()` 依次执行前两步，并返回包含错误码和消息的 `PublisherResult`。
+
 ### 3.2 MediaTrackConfig
 
 `MediaTrackConfig` 是 Publisher 的静态轨道描述：
@@ -145,12 +151,13 @@ FFmpeg 路径保留源 packet 的时间基，写入前转换到 `AVStream::time_
 ```cpp
 class IPublisher {
 public:
-    virtual bool Start(const PublisherConfig& config) = 0;
-    virtual bool Publish(const MediaPacket& packet) = 0;
+    virtual PublisherResult Start() = 0;
+    virtual PublisherResult Publish(const MediaPacket& packet) = 0;
     virtual void Stop() = 0;
 
     virtual std::string GetPlayUrl() const = 0;
     virtual PublisherStats GetStats() const = 0;
+    virtual PublisherResult GetLastResult() const = 0;
 
     static std::unique_ptr<IPublisher> Create(PublisherConfig config);
 };
@@ -158,13 +165,15 @@ public:
 
 接口语义：
 
-- `Start()` 创建协议资源。重复调用时，当前默认实现会先停止旧任务。
-- `Publish()` 只接受已编码 packet；未启动或发送失败时返回 `false`。
+- `Create(config)` 固定本次发布配置，消除构造和启动阶段的双配置源。
+- `Start()` 使用已固定的配置创建协议资源。重复调用时，当前默认实现会先停止旧任务。
+- `Publish()` 只接受已编码 packet，并返回结构化结果。
 - `Stop()` 可以重复调用，析构函数也会执行停止。
 - `GetPlayUrl()` 返回协议输出地址。对 Push Client 来说是推流地址，对 Pull Server 来说是客户端播放地址。
 - `GetStats()` 返回当前统计快照。
+- `GetLastResult()` 返回最近一次启动或发布操作的结果。
 
-当前接口没有错误码、状态回调、异步结果和背压语义。调用方只能通过布尔返回值和日志判断失败原因。
+`PublisherResult` 当前可以区分配置错误、不支持的协议/codec、非法状态、无效 packet、资源打开或端口绑定失败、连接失败、远端拒绝和运行时断流。状态回调、异步结果和背压语义仍未实现。
 
 ### 4.2 DefaultPublisher
 
@@ -176,10 +185,10 @@ public:
 IPublisher::Create(config)
   -> DefaultPublisher(config)
 
-DefaultPublisher::Start(config)
+DefaultPublisher::Start()
   -> Stop()
-  -> ResolveProtocol(config)
-  -> PublisherConfig::IsValid()
+  -> ResolvePublishProtocol(config_)
+  -> PublisherConfig::Validate()
   -> CreateProtocolAdapter(protocol)
   -> adapter->Open(config)
 
@@ -212,8 +221,8 @@ Adapter 是项目数据模型与协议运行时的边界：
 ```cpp
 class IProtocolAdapter {
 public:
-    virtual bool Open(const PublisherConfig& config) = 0;
-    virtual bool Send(const MediaPacket& packet) = 0;
+    virtual PublisherResult Open(const PublisherConfig& config) = 0;
+    virtual PublisherResult Send(const MediaPacket& packet) = 0;
     virtual void Close() = 0;
 
     virtual std::string GetOutputUrl() const = 0;
@@ -266,9 +275,10 @@ Adapter 不应负责 socket 收发、客户端会话和 FFmpeg muxer 的资源�
 ```cpp
 class IProtocol {
 public:
-    virtual bool Start(const PublisherConfig& config,
-                       const std::vector<MediaTrackConfig>& tracks) = 0;
-    virtual bool Write(const EncodedAccessUnit& access_unit) = 0;
+    virtual PublisherResult Start(
+        const PublisherConfig& config,
+        const std::vector<MediaTrackConfig>& tracks) = 0;
+    virtual PublisherResult Write(const EncodedAccessUnit& access_unit) = 0;
     virtual void Stop() = 0;
 
     virtual std::string GetOutputUrl() const = 0;
@@ -384,7 +394,11 @@ config.ffmpeg.rtsp_transport = "tcp";
 config.tracks = {video_track, aac_audio_track};
 
 auto publisher = IPublisher::Create(config);
-if (!publisher || !publisher->Start(config)) {
+if (!publisher) {
+    // 创建失败。
+}
+const auto start_result = publisher->Start();
+if (!start_result) {
     // 启动失败。
 }
 ```
@@ -418,7 +432,7 @@ config.rtsp.enable_multicast = false;
 config.tracks = {video_track, audio_track};
 
 auto publisher = IPublisher::Create(config);
-publisher->Start(config);
+const auto result = publisher->Start();
 // 播放地址：rtsp://127.0.0.1:8554/live/main
 ```
 
@@ -454,8 +468,8 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 | 本机 RTSP AAC/G711 | 已实现 | TCP interleaved 和 UDP unicast |
 | UDP multicast | 部分实现 | 仅共享 H264 video sender |
 | RTCP SR/RR | 已实现基础版本 | 缺 SDES/BYE、超时和详细指标导出 |
-| 裸 RTP UDP publisher | 未实现 | `RtpUdp` 仍为占位值，配置校验直接拒绝 |
-| WebRTC publisher | 未实现 | 枚举和独立规划文档已存在，工厂尚未注册 |
+| 裸 RTP UDP publisher | 未实现 | `RtpUdp` 统一返回结构化 `UnsupportedProtocol` |
+| WebRTC publisher | 未实现 | `WebRtc` 统一返回结构化 `UnsupportedProtocol`，独立规划文档已存在 |
 | 自动重连/主备切换 | 未实现 | FFmpeg 写失败后由调用方处理 |
 | 发布队列和背压 | 未实现 | 当前同步传播协议写入延迟 |
 | RTSP 鉴权/TLS | 未实现 | 仅适合可信网络内使用 |
@@ -465,9 +479,21 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 配置与接口
 
 - `PublisherConfig::IsValid()` 只做基础校验，没有完整检查 mode/protocol 组合、重复 track id、重复 payload type、端口对和 codec/协议兼容性。
+  - 状态：已修复。
+  - 修复日期：2026-07-31。
+  - 修复方法：新增 `MediaTrackConfig::ValidateStructure()`、`PublisherConfig::ValidateStructure()` 和 `ValidateProtocol()`；统一校验轨道结构、唯一 `track_id`、RTSP 唯一 payload type、角色/协议组合、监听和组播地址、transport 开关、组播偶数 RTP/相邻 RTCP 端口及协议 codec 能力。`Validate()` 返回首个结构化错误。
 - `PublishProtocol::WebRtc` 可以通过基础配置校验，但 adapter 工厂会返回空；`RtpUdp` 则在配置校验阶段直接失败，两种占位协议的行为不一致。
+  - 状态：已修复。
+  - 修复日期：2026-07-31。
+  - 修复方法：所有配置先通过 `ResolvePublishProtocol()` 解析 `Auto`；未实现的 `WebRtc` 和 `RtpUdp` 均在 `ValidateProtocol()` 返回 `PublisherErrorCode::UnsupportedProtocol`，不会进入 adapter 工厂或创建协议资源。
 - `IPublisher::Create(config)` 保存一份配置，但 `Start(config)` 又接受一份配置，存在“双配置源”。
+  - 状态：已修复。
+  - 修复日期：2026-07-31。
+  - 修复方法：保留 `IPublisher::Create(config)` 作为唯一配置入口，删除 `Start(config)`，改为无参数 `Start()`；`DefaultPublisher` 启动时只读取构造阶段固定的 `config_`。
 - 布尔返回值无法区分配置错误、网络错误、远端拒绝和运行时断流。
+  - 状态：已修复。
+  - 修复日期：2026-07-31。
+  - 修复方法：新增 `PublisherResult`、`PublisherErrorCode` 和 `native_error`，并贯穿 `IPublisher`、`IProtocolAdapter` 和 `IProtocol`。FFmpeg 路径区分连接失败、header 被拒绝和运行时写入断开；RTSP Server 路径区分配置、资源打开、端口绑定、状态和 packet 错误；`GetLastResult()` 保存最近一次结果。
 
 ### FFmpeg 推流
 
@@ -548,6 +574,8 @@ FFmpeg mux 路径已有 H265 codec 映射，但仍需针对目标格式和服务
 
 目标：让不支持的组合在创建网络资源前给出明确错误。
 
+进度（2026-07-31）：配置结构和协议能力校验已完成；公开的 `ProtocolCapabilities` 查询仍待实现。
+
 工作项：
 
 - 将 `IsValid()` 拆成结构校验和协议能力校验。
@@ -563,10 +591,12 @@ FFmpeg mux 路径已有 H265 codec 映射，但仍需针对目标格式和服务
 
 目标：明确 Publisher 状态和失败恢复方式。
 
+进度（2026-07-31）：单配置源和同步操作的结构化错误已完成；完整状态机、异步状态事件和重连事件仍待实现。
+
 工作项：
 
 - 引入 `Created/Starting/Running/Stopping/Stopped/Failed` 状态。
-- 消除 Create 和 Start 的双配置源，二选一：构造时固定配置，或只在 `Start(config)` 传入。
+- 已采用构造时固定配置，并将启动接口统一为无参数 `Start()`。
 - 用 `PublisherResult`/`PublisherError` 替代只有布尔值的失败结果。
 - 明确 `Publish()` 与 `Stop()` 的并发契约，并补竞态测试。
 - 增加启动失败、运行时断流和停止完成事件。
@@ -732,7 +762,9 @@ Publisher 接口和实现：
 
 - `include/media/publisher/i_publisher.h`
 - `include/media/publisher/publisher_config.h`
+- `include/media/publisher/publisher_result.h`
 - `include/media/publisher/default_publisher.h`
+- `src/media/publisher/publisher_config.cpp`
 - `src/media/publisher/default_publisher.cpp`
 
 Protocol 抽象和工厂：

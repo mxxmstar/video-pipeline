@@ -33,13 +33,16 @@ FfmpegMuxProtocol::~FfmpegMuxProtocol() {
     Stop();
 }
 
-bool FfmpegMuxProtocol::Start(const PublisherConfig& config,
-                              const std::vector<MediaTrackConfig>& tracks) {
+PublisherResult FfmpegMuxProtocol::Start(
+    const PublisherConfig& config,
+    const std::vector<MediaTrackConfig>& tracks) {
     Stop();
 
     if (config.url.empty() || tracks.empty()) {
         LOG_ERROR("FfmpegMuxProtocol: invalid config");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidConfiguration,
+            "FFmpeg mux protocol requires an output URL and tracks");
     }
 
     config_ = config;
@@ -56,12 +59,16 @@ bool FfmpegMuxProtocol::Start(const PublisherConfig& config,
         LOG_ERROR("FfmpegMuxProtocol: alloc output context failed: {}",
                   ErrorString(ret));
         FreeContext(false);
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::ResourceOpenFailed,
+            "failed to allocate FFmpeg output context: " + ErrorString(ret),
+            ret);
     }
 
-    if (!BuildStreams(tracks_)) {
+    auto streams_result = BuildStreams(tracks_);
+    if (!streams_result) {
         FreeContext(false);
-        return false;
+        return streams_result;
     }
 
     AVDictionary* opts = nullptr;
@@ -77,7 +84,10 @@ bool FfmpegMuxProtocol::Start(const PublisherConfig& config,
                       ErrorString(ret));
             av_dict_free(&opts);
             FreeContext(false);
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::ConnectionFailed,
+                "failed to open FFmpeg output URL: " + ErrorString(ret),
+                ret);
         }
     }
 
@@ -86,7 +96,11 @@ bool FfmpegMuxProtocol::Start(const PublisherConfig& config,
     if (ret < 0) {
         LOG_ERROR("FfmpegMuxProtocol: write header failed: {}", ErrorString(ret));
         FreeContext(false);
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::RemoteRejected,
+            "remote endpoint rejected the FFmpeg output header: " +
+                ErrorString(ret),
+            ret);
     }
 
     header_written_ = true;
@@ -98,24 +112,30 @@ bool FfmpegMuxProtocol::Start(const PublisherConfig& config,
                  stream->time_base.den);
     }
     LOG_INFO("FfmpegMuxProtocol: started {}", config_.url);
-    return true;
+    return PublisherResult::Success();
 }
 
-bool FfmpegMuxProtocol::Write(const EncodedAccessUnit& access_unit) {
+PublisherResult FfmpegMuxProtocol::Write(
+    const EncodedAccessUnit& access_unit) {
     if (!fmt_ctx_ || !header_written_) {
         LOG_ERROR("FfmpegMuxProtocol: Write called before Start");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidState,
+            "FFmpeg mux protocol must be started before writing");
     }
 
     AVPacket* out = av_packet_alloc();
     if (!out) {
         LOG_ERROR("FfmpegMuxProtocol: av_packet_alloc failed");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InternalError,
+            "failed to allocate an FFmpeg packet");
     }
 
-    if (!BuildPacket(access_unit, out)) {
+    auto packet_result = BuildPacket(access_unit, out);
+    if (!packet_result) {
         av_packet_free(&out);
-        return false;
+        return packet_result;
     }
 
     const int ret = av_write_frame(fmt_ctx_, out);
@@ -123,12 +143,15 @@ bool FfmpegMuxProtocol::Write(const EncodedAccessUnit& access_unit) {
     av_packet_free(&out);
     if (ret < 0) {
         LOG_ERROR("FfmpegMuxProtocol: write packet failed: {}", ErrorString(ret));
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::RuntimeDisconnected,
+            "FFmpeg output failed while publishing: " + ErrorString(ret),
+            ret);
     }
 
     ++stats_.packets_published;
     stats_.bytes_published += packet_size;
-    return true;
+    return PublisherResult::Success();
 }
 
 void FfmpegMuxProtocol::Stop() {
@@ -162,14 +185,17 @@ int FfmpegMuxProtocol::MapCodecType(CodecType type) {
     }
 }
 
-bool FfmpegMuxProtocol::BuildStreams(const std::vector<MediaTrackConfig>& tracks) {
+PublisherResult FfmpegMuxProtocol::BuildStreams(
+    const std::vector<MediaTrackConfig>& tracks) {
     track_to_stream_index_.clear();
 
     for (const auto& track : tracks) {
         AVStream* stream = avformat_new_stream(fmt_ctx_, nullptr);
         if (!stream) {
             LOG_ERROR("FfmpegMuxProtocol: avformat_new_stream failed");
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InternalError,
+                "failed to allocate an FFmpeg output stream");
         }
 
         track_to_stream_index_[track.track_id] = stream->index;
@@ -185,7 +211,9 @@ bool FfmpegMuxProtocol::BuildStreams(const std::vector<MediaTrackConfig>& tracks
         if (par->codec_id == AV_CODEC_ID_NONE) {
             LOG_ERROR("FfmpegMuxProtocol: unsupported codec {}",
                       static_cast<int>(track.codec_type));
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::UnsupportedCodec,
+                "FFmpeg mux protocol does not support the configured codec");
         }
 
         if (track.media_type == MediaType::VIDEO) {
@@ -205,7 +233,9 @@ bool FfmpegMuxProtocol::BuildStreams(const std::vector<MediaTrackConfig>& tracks
         } else {
             LOG_ERROR("FfmpegMuxProtocol: unsupported media type {}",
                       static_cast<int>(track.media_type));
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InvalidConfiguration,
+                "FFmpeg output track has an unsupported media type");
         }
 
         if (!track.extra_data.empty()) {
@@ -214,26 +244,33 @@ bool FfmpegMuxProtocol::BuildStreams(const std::vector<MediaTrackConfig>& tracks
                 av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE));
             if (!par->extradata) {
                 LOG_ERROR("FfmpegMuxProtocol: allocate extradata failed");
-                return false;
+                return PublisherResult::Failure(
+                    PublisherErrorCode::InternalError,
+                    "failed to allocate FFmpeg codec extradata");
             }
             std::memcpy(par->extradata, track.extra_data.data(), size);
             par->extradata_size = static_cast<int>(size);
         }
     }
 
-    return true;
+    return PublisherResult::Success();
 }
 
-bool FfmpegMuxProtocol::BuildPacket(const EncodedAccessUnit& access_unit,
-                                    AVPacket* out) const {
+PublisherResult FfmpegMuxProtocol::BuildPacket(
+    const EncodedAccessUnit& access_unit,
+    AVPacket* out) const {
     if (!out) {
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InternalError,
+            "FFmpeg output packet is null");
     }
 
     const auto stream_it = track_to_stream_index_.find(access_unit.track_id);
     if (stream_it == track_to_stream_index_.end()) {
         LOG_ERROR("FfmpegMuxProtocol: unknown track id {}", access_unit.track_id);
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidMediaPacket,
+            "access unit uses an unknown FFmpeg track id");
     }
 
     av_packet_unref(out);
@@ -244,13 +281,19 @@ bool FfmpegMuxProtocol::BuildPacket(const EncodedAccessUnit& access_unit,
         ret = av_packet_ref(out, src);
         if (ret < 0) {
             LOG_ERROR("FfmpegMuxProtocol: packet ref failed: {}", ErrorString(ret));
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InternalError,
+                "failed to reference the FFmpeg input packet: " +
+                    ErrorString(ret),
+                ret);
         }
     } else {
         if (!access_unit.encoded_data || !access_unit.encoded_data->Data() ||
             access_unit.encoded_data->Size() == 0) {
             LOG_ERROR("FfmpegMuxProtocol: access unit buffer is empty");
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InvalidMediaPacket,
+                "FFmpeg access unit buffer is empty");
         }
 
         const auto size = static_cast<int>(access_unit.encoded_data->Size());
@@ -258,7 +301,10 @@ bool FfmpegMuxProtocol::BuildPacket(const EncodedAccessUnit& access_unit,
         if (ret < 0) {
             LOG_ERROR("FfmpegMuxProtocol: packet allocation failed: {}",
                       ErrorString(ret));
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InternalError,
+                "failed to allocate FFmpeg packet data: " + ErrorString(ret),
+                ret);
         }
         std::memcpy(out->data,
                     access_unit.encoded_data->Data(),
@@ -284,7 +330,7 @@ bool FfmpegMuxProtocol::BuildPacket(const EncodedAccessUnit& access_unit,
         out->flags &= ~AV_PKT_FLAG_KEY;
     }
 
-    return true;
+    return PublisherResult::Success();
 }
 
 void FfmpegMuxProtocol::FreeContext(bool write_trailer) {

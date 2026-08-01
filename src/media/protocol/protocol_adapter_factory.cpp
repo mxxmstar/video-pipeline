@@ -13,9 +13,9 @@ std::unique_ptr<IProtocolAdapter> CreateProtocolAdapter(PublishProtocol protocol
             return std::make_unique<RtspServerProtocolAdapter>();
         case PublishProtocol::Auto:
         case PublishProtocol::RtpUdp:
+        case PublishProtocol::WebRtc:
         default:
             return nullptr;
     }
 }
-
 

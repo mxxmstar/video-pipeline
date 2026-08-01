@@ -21,9 +21,10 @@ namespace {
 
 // 这条默认 URL 对应现场抓包中看到的 AVTP 源，方便开发机直接运行。
 // 如果换网卡、换设备或换 stream_id，可以在命令行传入新的 avtp:// URL 覆盖它。
+    //"?src=aa:80:b9:86:cf:7e"
 constexpr const char* kDefaultAvtpUrl =
     "avtp://\\Device\\NPF_{00087179-AD1C-4C01-904C-11127E5E94C2}"
-    "?src=aa:80:b9:86:cf:7e"
+    "?src=02:aa:bb:cc:dd:ee"
     "&format=auto"
     "&probe_timeout=5000"
     "&read_timeout=100"
@@ -34,7 +35,7 @@ constexpr const char* kDefaultStreamPath = "/avtp/main";
 constexpr std::uint16_t kDefaultRtspPort = 0;
 constexpr int kDefaultFps = 25;
 constexpr int kDefaultBitrate = 2'000'000;
-constexpr int kDefaultMaxFrames = 300;
+constexpr int kDefaultMaxFrames = 300 * 6000;
 constexpr int kDefaultDurationSeconds = 30;
 constexpr int kDefaultMaxDecoderErrorsBeforeInit = 100;
 
@@ -287,7 +288,7 @@ bool InitializeOutputPipeline(PipelineState& state,
     }
 
     state.publisher = IPublisher::Create(publisher_config);
-    if (!state.publisher || !state.publisher->Start(publisher_config)) {
+    if (!state.publisher || !state.publisher->Start()) {
         state.error = "failed to start RTSP publisher";
         return false;
     }

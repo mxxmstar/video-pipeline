@@ -75,7 +75,7 @@ RtspServerProtocolAdapter::~RtspServerProtocolAdapter() {
     Close();
 }
 
-bool RtspServerProtocolAdapter::Open(const PublisherConfig& config) {
+PublisherResult RtspServerProtocolAdapter::Open(const PublisherConfig& config) {
     Close();
 
     config_ = config;
@@ -90,7 +90,9 @@ bool RtspServerProtocolAdapter::Open(const PublisherConfig& config) {
                      config_.tracks.end(),
                      IsSupportedRtspTrack)) {
         LOG_ERROR("RtspServerProtocolAdapter: supports H264 video and AAC/G711 audio tracks");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::UnsupportedCodec,
+            "RTSP server adapter supports H264 video and AAC/G711 audio tracks");
     }
 
     avcc_length_size_by_track_.clear();
@@ -109,30 +111,39 @@ bool RtspServerProtocolAdapter::Open(const PublisherConfig& config) {
         protocol_ = std::make_unique<RtspServerProtocol>();
     }
 
-    opened_ = protocol_->Start(config_, config_.tracks);
-    return opened_;
+    auto result = protocol_->Start(config_, config_.tracks);
+    opened_ = result.IsSuccess();
+    return result;
 }
 
-bool RtspServerProtocolAdapter::Send(const MediaPacket& packet) {
+PublisherResult RtspServerProtocolAdapter::Send(const MediaPacket& packet) {
     if (!opened_ || !protocol_) {
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidState,
+            "RTSP server protocol adapter is not open");
     }
 
     const auto* track = FindTrackForPacket(packet);
     if (!track) {
         LOG_ERROR("RtspServerProtocolAdapter: unsupported codec {}",
                   static_cast<int>(packet.codec));
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidMediaPacket,
+            "media packet does not match any configured RTSP track");
     }
     if (!packet.buffer || !packet.buffer->Data() || packet.buffer->Size() == 0) {
         LOG_ERROR("RtspServerProtocolAdapter: empty packet buffer");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidMediaPacket,
+            "media packet buffer is empty");
     }
 
     auto access_unit = ToAccessUnit(packet);
     if (access_unit.codec_type == CodecType::H264 && access_unit.nals.empty()) {
         LOG_ERROR("RtspServerProtocolAdapter: failed to split H264 packet");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidMediaPacket,
+            "failed to split H264 media packet");
     }
 
     return protocol_->Write(access_unit);

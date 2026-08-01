@@ -324,7 +324,7 @@ bool InitializeEncodeAndPush(PipelineState& state,
     }
 
     state.publisher = IPublisher::Create(publisher_config);
-    if (!state.publisher || !state.publisher->Start(publisher_config)) {
+    if (!state.publisher || !state.publisher->Start()) {
         state.error = "failed to start FFmpeg publisher to ZLMediaKit";
         return false;
     }

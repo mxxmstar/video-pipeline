@@ -1986,15 +1986,18 @@ std::uint32_t RtspServerProtocol::GetMulticastLastRtpTimestamp() const {
     return multicast_last_rtp_timestamp_;
 }
 
-bool RtspServerProtocol::Start(const PublisherConfig& config,
-                               const std::vector<MediaTrackConfig>& tracks) {
+PublisherResult RtspServerProtocol::Start(
+    const PublisherConfig& config,
+    const std::vector<MediaTrackConfig>& tracks) {
     Stop();
 
     if (tracks.empty() ||
         !std::all_of(tracks.begin(), tracks.end(), IsRtspServerSupportedTrack) ||
         (!config.rtsp.enable_tcp_interleaved && !config.rtsp.enable_udp)) {
         LOG_ERROR("RtspServerProtocol: supports H264 video and AAC/G711 audio with RTSP TCP interleaved or UDP");
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidConfiguration,
+            "RTSP server requires supported tracks and at least one transport");
     }
 
     config_ = config;
@@ -2020,7 +2023,10 @@ bool RtspServerProtocol::Start(const PublisherConfig& config,
         LOG_ERROR("RtspServerProtocol: invalid listen host {}: {}",
                   config_.listen_host,
                   ec.message());
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidConfiguration,
+            "invalid RTSP listen host: " + ec.message(),
+            ec.value());
     }
 
     boost::asio::ip::tcp::endpoint endpoint(address, config_.listen_port);
@@ -2029,7 +2035,10 @@ bool RtspServerProtocol::Start(const PublisherConfig& config,
     if (ec) {
         LOG_ERROR("RtspServerProtocol: acceptor open failed: {}", ec.message());
         Stop();
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::ResourceOpenFailed,
+            "failed to open RTSP acceptor: " + ec.message(),
+            ec.value());
     }
 
     acceptor_->set_option(boost::asio::socket_base::reuse_address(true), ec);
@@ -2044,14 +2053,20 @@ bool RtspServerProtocol::Start(const PublisherConfig& config,
                   config_.listen_port,
                   ec.message());
         Stop();
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::BindFailed,
+            "failed to bind RTSP listen endpoint: " + ec.message(),
+            ec.value());
     }
 
     acceptor_->listen(boost::asio::socket_base::max_listen_connections, ec);
     if (ec) {
         LOG_ERROR("RtspServerProtocol: listen failed: {}", ec.message());
         Stop();
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::ResourceOpenFailed,
+            "failed to listen on RTSP endpoint: " + ec.message(),
+            ec.value());
     }
 
     {
@@ -2066,26 +2081,33 @@ bool RtspServerProtocol::Start(const PublisherConfig& config,
     });
 
     LOG_INFO("RtspServerProtocol: started {}", GetOutputUrl());
-    return true;
+    return PublisherResult::Success();
 }
 
-bool RtspServerProtocol::Write(const EncodedAccessUnit& access_unit) {
+PublisherResult RtspServerProtocol::Write(
+    const EncodedAccessUnit& access_unit) {
     const auto* track = FindTrackById(tracks_, access_unit.track_id);
     if (!track || access_unit.codec_type != track->codec_type) {
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidMediaPacket,
+            "access unit does not match a configured RTSP track");
     }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!started_) {
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InvalidState,
+                "RTSP server protocol must be started before writing");
         }
     }
 
     std::vector<RtpPayload> packets;
     if (track->codec_type == CodecType::H264) {
         if (access_unit.nals.empty()) {
-            return false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::InvalidMediaPacket,
+                "H264 access unit does not contain NAL units");
         }
         UpdateH264ParameterSets(access_unit);
         packets = h264_packetizer_.Packetize(access_unit);
@@ -2096,7 +2118,9 @@ bool RtspServerProtocol::Write(const EncodedAccessUnit& access_unit) {
         packets = PacketizeRawAudioAccessUnit(access_unit);
     }
     if (packets.empty()) {
-        return false;
+        return PublisherResult::Failure(
+            PublisherErrorCode::InvalidMediaPacket,
+            "access unit could not be packetized for RTP");
     }
 
     std::vector<std::shared_ptr<ClientSession>> sessions;
@@ -2133,7 +2157,7 @@ bool RtspServerProtocol::Write(const EncodedAccessUnit& access_unit) {
     ++stats_.packets_published;
     stats_.bytes_published += data_size;
     stats_.clients_connected = sessions.size();
-    return true;
+    return PublisherResult::Success();
 }
 
 void RtspServerProtocol::Stop() {

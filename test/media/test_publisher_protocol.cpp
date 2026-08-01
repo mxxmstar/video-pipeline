@@ -36,13 +36,83 @@ static PublisherConfig MakeRtspConfig() {
 static void TestPublisherConfigValidation() {
     auto config = MakeRtspConfig();
     assert(config.IsValid());
+    assert(config.Validate().code == PublisherErrorCode::None);
 
     config.tracks.clear();
     assert(!config.IsValid());
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
 
     config = MakeRtspConfig();
     config.listen_port = 0;
     assert(!config.IsValid());
+
+    config = MakeRtspConfig();
+    config.listen_host = "not-an-ip-address";
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.mode = PublishMode::PushClient;
+    config.url = "rtsp://127.0.0.1/live/main";
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.protocol = PublishProtocol::RtpUdp;
+    assert(config.Validate().code == PublisherErrorCode::UnsupportedProtocol);
+
+    config.protocol = PublishProtocol::WebRtc;
+    assert(config.Validate().code == PublisherErrorCode::UnsupportedProtocol);
+
+    config = MakeRtspConfig();
+    auto second_track = config.tracks.front();
+    second_track.rtp_payload_type = 97;
+    config.tracks.push_back(second_track);
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    second_track = config.tracks.front();
+    second_track.track_id = 1;
+    config.tracks.push_back(second_track);
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.rtsp.enable_multicast = true;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config.rtsp.enable_udp = true;
+    config.rtsp.multicast_rtcp_port = config.rtsp.multicast_rtp_port + 2;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config.rtsp.multicast_rtp_port = 5005;
+    config.rtsp.multicast_rtcp_port = 5006;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config.rtsp.multicast_rtp_port = 5004;
+    config.rtsp.multicast_rtcp_port = 5005;
+    config.rtsp.multicast_address = "127.0.0.1";
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.tracks.front().codec_type = CodecType::H265;
+    assert(config.Validate().code == PublisherErrorCode::UnsupportedCodec);
+}
+
+static void TestPublisherStructuredResults() {
+    auto invalid_config = MakeRtspConfig();
+    invalid_config.tracks.clear();
+    auto invalid_publisher = IPublisher::Create(invalid_config);
+    assert(invalid_publisher);
+
+    const auto start_result = invalid_publisher->Start();
+    assert(start_result.code == PublisherErrorCode::InvalidConfiguration);
+    assert(!start_result.message.empty());
+    assert(invalid_publisher->GetLastResult().code == start_result.code);
+
+    auto publisher = IPublisher::Create(MakeRtspConfig());
+    assert(publisher);
+    MediaPacket packet;
+    const auto publish_result = publisher->Publish(packet);
+    assert(publish_result.code == PublisherErrorCode::InvalidState);
+    assert(!publish_result.message.empty());
 }
 
 static void TestAnnexBSplit() {
@@ -185,6 +255,7 @@ static void TestRtspTransportSpecInvalid() {
 
 int main() {
     TestPublisherConfigValidation();
+    TestPublisherStructuredResults();
     TestAnnexBSplit();
     TestAvccExtradata();
     TestAvccSplit();

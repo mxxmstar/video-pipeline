@@ -12,17 +12,18 @@ public:
     explicit DefaultPublisher(PublisherConfig config);
     ~DefaultPublisher() override;
 
-    bool Start(const PublisherConfig& config) override;
-    bool Publish(const MediaPacket& packet) override;
+    PublisherResult Start() override;
+    PublisherResult Publish(const MediaPacket& packet) override;
     void Stop() override;
 
     std::string GetPlayUrl() const override;
     PublisherStats GetStats() const override;
+    PublisherResult GetLastResult() const override;
 
 private:
     PublisherConfig config_;
     std::unique_ptr<IProtocolAdapter> adapter_;
+    PublisherResult last_result_;
     bool started_{false};
 };
-
 

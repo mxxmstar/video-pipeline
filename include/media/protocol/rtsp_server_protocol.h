@@ -31,9 +31,10 @@ public:
     RtspServerProtocol(const RtspServerProtocol&) = delete;
     RtspServerProtocol& operator=(const RtspServerProtocol&) = delete;
 
-    bool Start(const PublisherConfig& config,
-               const std::vector<MediaTrackConfig>& tracks) override;
-    bool Write(const EncodedAccessUnit& access_unit) override;
+    PublisherResult Start(
+        const PublisherConfig& config,
+        const std::vector<MediaTrackConfig>& tracks) override;
+    PublisherResult Write(const EncodedAccessUnit& access_unit) override;
     void Stop() override;
 
     std::string GetOutputUrl() const override;

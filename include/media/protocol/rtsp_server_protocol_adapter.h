@@ -14,8 +14,8 @@ public:
     explicit RtspServerProtocolAdapter(std::unique_ptr<IProtocol> protocol = nullptr);
     ~RtspServerProtocolAdapter() override;
 
-    bool Open(const PublisherConfig& config) override;
-    bool Send(const MediaPacket& packet) override;
+    PublisherResult Open(const PublisherConfig& config) override;
+    PublisherResult Send(const MediaPacket& packet) override;
     void Close() override;
 
     std::string GetOutputUrl() const override;

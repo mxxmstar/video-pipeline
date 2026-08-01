@@ -10,8 +10,8 @@ public:
     explicit FfmpegProtocolAdapter(std::unique_ptr<IProtocol> protocol = nullptr);
     ~FfmpegProtocolAdapter() override;
 
-    bool Open(const PublisherConfig& config) override;
-    bool Send(const MediaPacket& packet) override;
+    PublisherResult Open(const PublisherConfig& config) override;
+    PublisherResult Send(const MediaPacket& packet) override;
     void Close() override;
 
     std::string GetOutputUrl() const override;
@@ -24,5 +24,4 @@ private:
     std::unique_ptr<IProtocol> protocol_;
     bool opened_{false};
 };
-
 

@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "media/media_packet.h"
+#include "media/publisher/publisher_result.h"
 
 
 
@@ -18,7 +19,7 @@ enum class PublishProtocol {
     FfmpegMux,  ///< FFmpeg 复用器推送.
     RtspServer, ///< RTSP 服务器推送.
     RtpUdp,     ///< RTP UDP 推送.
-    WebRtc, ///< WebRTC 推送.
+    WebRtc,     ///< WebRTC 推送.
 };
 
 struct MediaTrackConfig {
@@ -39,21 +40,11 @@ struct MediaTrackConfig {
     std::uint8_t rtp_payload_type{96};
     std::uint32_t rtp_clock_rate{90000};
 
+    /// @brief 只校验与协议无关的轨道结构和媒体参数。
+    PublisherResult ValidateStructure() const;
+
     bool IsValid() const {
-        if (codec_type == CodecType::UNKNOWN || time_base_num <= 0 ||
-            time_base_den <= 0) {
-            return false;
-        }
-
-        if (media_type == MediaType::VIDEO) {
-            return width > 0 && height > 0;
-        }
-
-        if (media_type == MediaType::AUDIO) {
-            return sample_rate > 0 && channels > 0;
-        }
-
-        return false;
+        return ValidateStructure().IsSuccess();
     }
 };
 
@@ -79,8 +70,7 @@ struct PublisherConfig {
     PublishMode mode{PublishMode::PushClient};
     PublishProtocol protocol{PublishProtocol::Auto};
 
-    // PushClient uses url directly. PullServer may also use an rtsp:// URL
-    // as shorthand for listen host/port/path.
+    // PushClient 使用 url；PullServer 使用 listen_host/listen_port/stream_path。
     std::string url;
     std::string listen_host{"0.0.0.0"};
     std::uint16_t listen_port{8554};
@@ -91,30 +81,19 @@ struct PublisherConfig {
     FfmpegPublishOptions ffmpeg;
     RtspServerOptions rtsp;
 
+    /// @brief 校验与具体发布协议无关的配置结构。
+    PublisherResult ValidateStructure() const;
+
+    /// @brief 校验解析后的协议能力、角色和协议专用配置。
+    PublisherResult ValidateProtocol() const;
+
+    /// @brief 依次执行结构校验和协议能力校验。
+    PublisherResult Validate() const;
+
     bool IsValid() const {
-        if (protocol == PublishProtocol::RtpUdp) {
-            return false;
-        }
-
-        if (mode == PublishMode::PushClient && url.empty()) {
-            return false;
-        }
-
-        if (mode == PublishMode::PullServer &&
-            (listen_port == 0 || stream_path.empty())) {
-            return false;
-        }
-
-        if (tracks.empty()) {
-            return false;
-        }
-
-        for (const auto& track : tracks) {
-            if (!track.IsValid()) {
-                return false;
-            }
-        }
-
-        return true;
+        return Validate().IsSuccess();
     }
 };
+
+/// @brief 将 Auto 解析成当前发布角色对应的实际协议。
+PublishProtocol ResolvePublishProtocol(const PublisherConfig& config);

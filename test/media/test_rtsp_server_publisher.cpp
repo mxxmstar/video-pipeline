@@ -114,6 +114,7 @@ PublisherConfig MakeAudioVideoConfig(std::uint16_t port,
     audio_track.channels = 2;
     audio_track.time_base_num = 1;
     audio_track.time_base_den = 1000000;
+    audio_track.rtp_payload_type = 97;
     audio_track.rtp_clock_rate = 48000;
     // AAC-LC, 48kHz, stereo AudioSpecificConfig。
     audio_track.extra_data = {0x11, 0x90};
@@ -1060,14 +1061,14 @@ bool InitializeCameraAvPublishers(CameraAvPipelineState& state,
         MakeCameraRtspServerPublisherConfig(video_track, local_audio_track);
 
     state.zlm_publisher = IPublisher::Create(zlm_config);
-    if (!state.zlm_publisher || !state.zlm_publisher->Start(zlm_config)) {
+    if (!state.zlm_publisher || !state.zlm_publisher->Start()) {
         state.error = "failed to start FFmpeg RTSP publisher to ZLMediaKit";
         return false;
     }
 
     state.rtsp_server_publisher = IPublisher::Create(rtsp_config);
     if (!state.rtsp_server_publisher ||
-        !state.rtsp_server_publisher->Start(rtsp_config)) {
+        !state.rtsp_server_publisher->Start()) {
         state.error = "failed to start local RTSP server publisher";
         return false;
     }
@@ -1332,7 +1333,7 @@ void TestTcpInterleavedPublisher() {
     auto config = MakeConfig(kTcpTestPort, false);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
-    assert(publisher->Start(config));
+    assert(publisher->Start());
 
     boost::asio::io_context io;
     boost::asio::ip::tcp::socket socket(io);
@@ -1412,7 +1413,7 @@ void TestTcpInterleavedAudioVideoPublisher() {
     auto config = MakeAudioVideoConfig(kAudioVideoTestPort);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
-    assert(publisher->Start(config));
+    assert(publisher->Start());
 
     boost::asio::io_context io;
     boost::asio::ip::tcp::socket socket(io);
@@ -1505,7 +1506,7 @@ void TestUdpUnicastAudioTrackPublisher() {
     auto config = MakeAudioVideoConfig(kAudioUdpTestPort, true);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
-    assert(publisher->Start(config));
+    assert(publisher->Start());
 
     boost::asio::io_context io;
     boost::asio::ip::tcp::socket rtsp_socket(io);
@@ -1596,7 +1597,7 @@ void TestUdpUnicastPublisher() {
     auto config = MakeConfig(kUdpTestPort, true);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
-    assert(publisher->Start(config));
+    assert(publisher->Start());
 
     boost::asio::io_context io;
     boost::asio::ip::tcp::socket rtsp_socket(io);
@@ -1681,7 +1682,7 @@ void TestUdpMulticastPublisher() {
     auto config = MakeConfig(kMulticastTestPort, true, multicast_rtp_port);
     auto publisher = IPublisher::Create(config);
     assert(publisher);
-    assert(publisher->Start(config));
+    assert(publisher->Start());
 
     boost::asio::io_context io;
     boost::asio::ip::udp::socket rtp_socket(io);

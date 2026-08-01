@@ -6,22 +6,6 @@
 
 
 
-namespace {
-
-PublishProtocol ResolveProtocol(const PublisherConfig& config) {
-    if (config.protocol != PublishProtocol::Auto) {
-        return config.protocol;
-    }
-
-    if (config.mode == PublishMode::PullServer) {
-        return PublishProtocol::RtspServer;
-    }
-
-    return PublishProtocol::FfmpegMux;
-}
-
-} // namespace
-
 DefaultPublisher::DefaultPublisher(PublisherConfig config)
     : config_(std::move(config)) {
 }
@@ -30,33 +14,50 @@ DefaultPublisher::~DefaultPublisher() {
     Stop();
 }
 
-bool DefaultPublisher::Start(const PublisherConfig& config) {
+PublisherResult DefaultPublisher::Start() {
     Stop();
 
-    config_ = config;
-    config_.protocol = ResolveProtocol(config_);
-    if (!config_.IsValid()) {
-        LOG_ERROR("DefaultPublisher: invalid publisher config");
-        return false;
+    config_.protocol = ResolvePublishProtocol(config_);
+    last_result_ = config_.Validate();
+    if (!last_result_) {
+        LOG_ERROR("DefaultPublisher: invalid publisher config: {}",
+                  last_result_.message);
+        return last_result_;
     }
 
     adapter_ = CreateProtocolAdapter(config_.protocol);
     if (!adapter_) {
-        LOG_ERROR("DefaultPublisher: unsupported publish protocol {}",
+        last_result_ = PublisherResult::Failure(
+            PublisherErrorCode::UnsupportedProtocol,
+            "no adapter is registered for the selected publish protocol");
+        LOG_ERROR("DefaultPublisher: {} ({})",
+                  last_result_.message,
                   static_cast<int>(config_.protocol));
-        return false;
+        return last_result_;
     }
 
-    started_ = adapter_->Open(config_);
-    return started_;
+    last_result_ = adapter_->Open(config_);
+    started_ = last_result_.IsSuccess();
+    if (!started_) {
+        adapter_->Close();
+        adapter_.reset();
+    }
+    return last_result_;
 }
 
-bool DefaultPublisher::Publish(const MediaPacket& packet) {
+PublisherResult DefaultPublisher::Publish(const MediaPacket& packet) {
     if (!started_ || !adapter_) {
-        return false;
+        last_result_ = PublisherResult::Failure(
+            PublisherErrorCode::InvalidState,
+            "publisher must be started before publishing packets");
+        return last_result_;
     }
 
-    return adapter_->Send(packet);
+    last_result_ = adapter_->Send(packet);
+    if (last_result_.code == PublisherErrorCode::RuntimeDisconnected) {
+        started_ = false;
+    }
+    return last_result_;
 }
 
 void DefaultPublisher::Stop() {
@@ -75,8 +76,10 @@ PublisherStats DefaultPublisher::GetStats() const {
     return adapter_ ? adapter_->GetStats() : PublisherStats{};
 }
 
+PublisherResult DefaultPublisher::GetLastResult() const {
+    return last_result_;
+}
+
 std::unique_ptr<IPublisher> IPublisher::Create(PublisherConfig config) {
     return std::make_unique<DefaultPublisher>(std::move(config));
 }
-
-

@@ -451,7 +451,7 @@ bool InitializePipeline(PipelineState& state,
     publisher_config.tracks.push_back(std::move(track));
 
     state.publisher = IPublisher::Create(publisher_config);
-    if (!state.publisher || !state.publisher->Start(publisher_config)) {
+    if (!state.publisher || !state.publisher->Start()) {
         state.error = "failed to start local RTSP publisher";
         return false;
     }

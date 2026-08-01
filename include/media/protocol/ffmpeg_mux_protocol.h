@@ -15,17 +15,19 @@ public:
     FfmpegMuxProtocol(const FfmpegMuxProtocol&) = delete;
     FfmpegMuxProtocol& operator=(const FfmpegMuxProtocol&) = delete;
 
-    bool Start(const PublisherConfig& config,
-               const std::vector<MediaTrackConfig>& tracks) override;
-    bool Write(const EncodedAccessUnit& access_unit) override;
+    PublisherResult Start(
+        const PublisherConfig& config,
+        const std::vector<MediaTrackConfig>& tracks) override;
+    PublisherResult Write(const EncodedAccessUnit& access_unit) override;
     void Stop() override;
 
     std::string GetOutputUrl() const override;
     PublisherStats GetStats() const override;
 
 private:
-    bool BuildStreams(const std::vector<MediaTrackConfig>& tracks);
-    bool BuildPacket(const EncodedAccessUnit& access_unit, AVPacket* out) const;
+    PublisherResult BuildStreams(const std::vector<MediaTrackConfig>& tracks);
+    PublisherResult BuildPacket(const EncodedAccessUnit& access_unit,
+                                AVPacket* out) const;
     void FreeContext(bool write_trailer);
 
     static int MapCodecType(CodecType type);

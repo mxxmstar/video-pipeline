@@ -20,13 +20,14 @@ class IPublisher {
 public:
     virtual ~IPublisher() = default;
 
-    virtual bool Start(const PublisherConfig& config) = 0;
-    virtual bool Publish(const MediaPacket& packet) = 0;
+    /// @brief 使用 Create() 时固定的配置启动发布任务。
+    virtual PublisherResult Start() = 0;
+    virtual PublisherResult Publish(const MediaPacket& packet) = 0;
     virtual void Stop() = 0;
 
     virtual std::string GetPlayUrl() const = 0;
     virtual PublisherStats GetStats() const = 0;
+    virtual PublisherResult GetLastResult() const = 0;
 
     static std::unique_ptr<IPublisher> Create(PublisherConfig config);
 };
-
