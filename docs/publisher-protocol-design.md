@@ -2,7 +2,7 @@
 
 本文档说明当前 Publisher 模块的架构、接口契约、协议实现、测试现状和后续改进计划。文档以当前代码为准，覆盖 FFmpeg 复用推流和本机 RTSP Server 两条发布链路。
 
-最后更新：2026-07-29。
+最后更新：2026-08-03。
 
 ## 1. 模块定位
 
@@ -583,6 +583,8 @@ Stop
 
 `RtspServerProtocol` 使用 Boost.Asio 实现本机 RTSP Server。它拥有一个 `io_context` 线程，并为每个 RTSP TCP 连接创建 `ClientSession`。
 
+RTSP 请求由独立的 `RtspRequestParser` 按 RFC 2326 的 request-line 和 message-header 语法增量解析。parser 负责严格 CRLF、token/absolute URI/RTSP version 校验、大小写不敏感和重复 header、兼容 RFC 2326 的折叠 header、`Content-Length` body 边界以及 pipelined request 的精确消费，并对 request-line、单个 header、header 总量和 body 设置上限。`ClientSession` 只在一条完整 request 到达后分发方法；无法恢复消息边界的语法错误会返回 `400 Bad Request` 后关闭连接。
+
 已实现的 RTSP 方法：
 
 - `OPTIONS`
@@ -780,6 +782,9 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### RTSP Server
 
 - RTSP request parser 是最小可用实现，不是完整 RFC 解析器。
+  - 状态：已修复。
+  - 修复日期：2026-08-03。
+  - 修复方法：新增独立、可增量调用的 `RtspRequestParser`，实现 RFC 2326 RTSP/1.0 request-line、header（字段名大小写不敏感、重复字段和折叠行）、`Content-Length` entity body 与 pipelining 消息边界解析；严格拒绝非法 CRLF、token、absolute URI、version、header 控制字符和冲突长度，并增加 request-line/header/body 资源上限。`ClientSession` 改为消费结构化 request，强制唯一数字 `CSeq`，版本不支持时返回 505，语法错误返回 400 后关闭连接。新增 `test_rtsp_request_parser` CTest，覆盖分片、body、流水线和畸形输入。
 - 没有 Basic/Digest 鉴权、RTSPS、会话 idle timeout、访问控制和连接数限制。
 - 只支持 H264 视频，尚未支持 H265。
 - multicast 只有单 H264 track，共享一组 RTP/RTCP 端口、SSRC 和 sequence。
@@ -1062,9 +1067,11 @@ RTSP Server publisher：
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
+- `include/media/protocol/rtsp_request_parser.h`
 - `include/media/protocol/rtsp_transport_spec.h`
 - `src/media/protocol/rtsp_server_protocol_adapter.cpp`
 - `src/media/protocol/rtsp_server_protocol.cpp`
+- `src/media/protocol/rtsp_request_parser.cpp`
 - `src/media/protocol/rtsp_transport_spec.cpp`
 
 RTP/bitstream 工具：

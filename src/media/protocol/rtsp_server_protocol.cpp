@@ -1,6 +1,7 @@
 #include "media/protocol/rtsp_server_protocol.h"
 
 #include "common/log/logger.h"
+#include "media/protocol/rtsp_request_parser.h"
 #include "media/protocol/rtsp_transport_spec.h"
 
 #include <algorithm>
@@ -46,23 +47,6 @@ struct RtcpReportBlock {
     std::uint32_t last_sender_report{0};
     std::uint32_t delay_since_last_sender_report{0};
 };
-
-std::string Trim(std::string value) {
-    const auto not_space = [](unsigned char ch) {
-        return !std::isspace(ch);
-    };
-    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
-    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(),
-                value.end());
-    return value;
-}
-
-std::string ToUpper(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::toupper(ch));
-    });
-    return value;
-}
 
 bool IsIpv4Multicast(const boost::asio::ip::address& address) {
     if (!address.is_v4()) {
@@ -235,39 +219,6 @@ std::string ProfileLevelId(const std::vector<std::uint8_t>& sps) {
     return "42e01f";
 }
 
-std::map<std::string, std::string> ParseHeaders(const std::string& request) {
-    std::map<std::string, std::string> headers;
-    std::istringstream iss(request);
-    std::string line;
-    std::getline(iss, line);
-
-    while (std::getline(iss, line)) {
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        if (line.empty()) {
-            break;
-        }
-
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-
-        auto key = Trim(line.substr(0, colon));
-        auto value = Trim(line.substr(colon + 1));
-        headers[std::move(key)] = std::move(value);
-    }
-
-    return headers;
-}
-
-std::string HeaderValue(const std::map<std::string, std::string>& headers,
-                        const std::string& key) {
-    auto it = headers.find(key);
-    return it == headers.end() ? std::string{} : it->second;
-}
-
 std::string BuildResponse(int status_code,
                           const std::string& status_reason,
                           const std::string& cseq,
@@ -296,18 +247,20 @@ std::string BuildResponse(int status_code,
     return oss.str();
 }
 
-std::size_t FindHeaderEnd(const std::vector<std::uint8_t>& buffer) {
-    if (buffer.size() < 4) {
-        return std::string::npos;
+bool ExtractCSeq(const RtspRequest& request, std::string& cseq) {
+    // CSeq 是 RTSP 每条请求都必须携带的关联号。解析器保留重复字段，
+    // 这里显式要求唯一且只含数字，防止响应被错误关联到客户端事务。
+    const auto values = request.HeaderValues("CSeq");
+    if (values.size() != 1 || values.front().empty()) {
+        return false;
+    }
+    if (!std::all_of(values.front().begin(), values.front().end(),
+                     [](unsigned char ch) { return ch >= '0' && ch <= '9'; })) {
+        return false;
     }
 
-    for (std::size_t i = 0; i + 3 < buffer.size(); ++i) {
-        if (buffer[i] == '\r' && buffer[i + 1] == '\n' &&
-            buffer[i + 2] == '\r' && buffer[i + 3] == '\n') {
-            return i + 4;
-        }
-    }
-    return std::string::npos;
+    cseq.assign(values.front());
+    return true;
 }
 
 bool ParseTrackIdFromUrl(const std::string& url, int& track_id) {
@@ -628,13 +581,18 @@ private:
                                           self->read_chunk_.data(),
                                           self->read_chunk_.data() + bytes);
                 self->ProcessReadBuffer();
-                self->DoRead();
+                if (!self->closed_ && !self->close_after_write_) {
+                    self->DoRead();
+                }
             });
     }
 
     void ProcessReadBuffer() {
         while (!read_buffer_.empty()) {
             if (read_buffer_[0] == '$') {
+                // RTSP over TCP 的 interleaved RTP/RTCP frame 与文本 request
+                // 共用一条连接。只有首字节是 '$' 才进入二进制 framing；否则
+                // 把 buffer 交给 request parser，避免把 '$' 误当作 request-line。
                 if (read_buffer_.size() < 4) {
                     return;
                 }
@@ -658,44 +616,55 @@ private:
                 continue;
             }
 
-            const auto header_end = FindHeaderEnd(read_buffer_);
-            if (header_end == std::string::npos) {
+            RtspRequest request;
+            // parser 只消费一条完整 request，剩余字节继续留在 read_buffer_，
+            // 从而同时支持 TCP 分片、pipelining 和 request 后紧跟 interleaved
+            // frame 的情况。
+            const auto parse_result = request_parser_.Parse(
+                std::span<const std::uint8_t>{read_buffer_}, request);
+            if (parse_result.status == RtspRequestParseStatus::NeedMoreData) {
+                return;
+            }
+            if (parse_result.status == RtspRequestParseStatus::Error) {
+                LOG_WARN("RTSP request parse failed at byte {}: {}",
+                         parse_result.error_offset,
+                         parse_result.error);
+                read_buffer_.clear();
+                // framing 错误后无法可靠定位下一条 request。停止 RTP 发送，
+                // 先把 400 写完再关闭 TCP，避免错误数据继续堆入发送队列。
+                playing_ = false;
+                close_after_write_ = true;
+                SendRtsp(BuildResponse(400, "Bad Request", {}));
                 return;
             }
 
-            std::string request(reinterpret_cast<const char*>(read_buffer_.data()),
-                                header_end);
             read_buffer_.erase(read_buffer_.begin(),
                                read_buffer_.begin() +
-                                   static_cast<std::ptrdiff_t>(header_end));
+                                   static_cast<std::ptrdiff_t>(parse_result.consumed));
             HandleRequest(request);
         }
     }
 
-    void HandleRequest(const std::string& request) {
-        std::istringstream iss(request);
-        std::string request_line;
-        std::getline(iss, request_line);
-        if (!request_line.empty() && request_line.back() == '\r') {
-            request_line.pop_back();
+    void HandleRequest(const RtspRequest& request) {
+        // 解析器负责语法，ClientSession 负责 RTSP 语义状态机。这里先处理
+        // 所有请求都需要的 CSeq/version，再进入具体方法的状态校验。
+        std::string cseq;
+        if (!ExtractCSeq(request, cseq)) {
+            SendRtsp(BuildResponse(400, "Bad Request", {}));
+            return;
         }
 
-        std::istringstream line_stream(request_line);
-        std::string method;
-        std::string url;
-        std::string version;
-        line_stream >> method >> url >> version;
+        if (request.version_major != 1 || request.version_minor != 0) {
+            SendRtsp(BuildResponse(505, "RTSP Version Not Supported", cseq));
+            return;
+        }
 
-        const auto headers = ParseHeaders(request);
-        const auto cseq = HeaderValue(headers, "CSeq");
-        const auto upper_method = ToUpper(method);
-
-        if (version != "RTSP/1.0") {
+        if (request.uri == "*" && request.method != "OPTIONS") {
             SendRtsp(BuildResponse(400, "Bad Request", cseq));
             return;
         }
 
-        if (upper_method == "OPTIONS") {
+        if (request.method == "OPTIONS") {
             SendRtsp(BuildResponse(
                 200,
                 "OK",
@@ -704,8 +673,8 @@ private:
             return;
         }
 
-        if (upper_method == "DESCRIBE") {
-            requested_url_ = url;
+        if (request.method == "DESCRIBE") {
+            requested_url_ = request.uri;
             const auto sdp = owner_.BuildSdp(LocalAddress());
             SendRtsp(BuildResponse(
                 200,
@@ -716,16 +685,16 @@ private:
             return;
         }
 
-        if (upper_method == "SETUP") {
-            requested_url_ = url;
-            const auto* track = FindTrackForSetupUrl(url);
+        if (request.method == "SETUP") {
+            requested_url_ = request.uri;
+            const auto* track = FindTrackForSetupUrl(request.uri);
             if (!track) {
-                LOG_WARN("RTSP SETUP rejected unknown track url '{}'", url);
+                LOG_WARN("RTSP SETUP rejected unknown track url '{}'", request.uri);
                 SendRtsp(BuildResponse(404, "Not Found", cseq));
                 return;
             }
 
-            const auto transport = HeaderValue(headers, "Transport");
+            const auto transport = request.HeaderValue("Transport");
             std::string transport_error;
             RtspTransportSpec transport_spec;
             if (!RtspTransportSpec::Parse(transport, transport_spec, &transport_error)) {
@@ -798,14 +767,14 @@ private:
             return;
         }
 
-        if (upper_method == "PLAY") {
+        if (request.method == "PLAY") {
             if (!HasReadyTrack()) {
                 SendRtsp(BuildResponse(455, "Method Not Valid In This State", cseq));
                 return;
             }
 
             playing_ = true;
-            const auto play_url = url.empty() ? requested_url_ : url;
+            const auto play_url = request.uri.empty() ? requested_url_ : request.uri;
             SendRtsp(BuildResponse(
                 200,
                 "OK",
@@ -815,18 +784,18 @@ private:
             return;
         }
 
-        if (upper_method == "PAUSE") {
+        if (request.method == "PAUSE") {
             playing_ = false;
             SendRtsp(BuildResponse(200, "OK", cseq, {{"Session", session_id_}}));
             return;
         }
 
-        if (upper_method == "GET_PARAMETER") {
+        if (request.method == "GET_PARAMETER") {
             SendRtsp(BuildResponse(200, "OK", cseq, {{"Session", session_id_}}));
             return;
         }
 
-        if (upper_method == "TEARDOWN") {
+        if (request.method == "TEARDOWN") {
             playing_ = false;
             SendRtsp(BuildResponse(200, "OK", cseq, {{"Session", session_id_}}));
             Close();
@@ -1404,6 +1373,10 @@ private:
                     return;
                 }
                 self->write_queue_.pop_front();
+                if (self->write_queue_.empty() && self->close_after_write_) {
+                    self->Close();
+                    return;
+                }
                 self->DoWrite();
             });
     }
@@ -1456,12 +1429,14 @@ private:
     std::string requested_url_;
     std::array<std::uint8_t, 8192> read_chunk_{};
     std::vector<std::uint8_t> read_buffer_;
+    RtspRequestParser request_parser_;
     std::deque<std::vector<std::uint8_t>> write_queue_;
     // key 对应 MediaTrackConfig::track_id，也就是 SDP/SETUP 中的 trackN。
     std::map<int, TrackSessionState> track_states_;
     bool ready_{false};
     std::atomic_bool playing_{false};
     bool closed_{false};
+    bool close_after_write_{false};
 };
 
 RtspServerProtocol::RtspServerProtocol()
