@@ -2,108 +2,20 @@
 
 #include "common/log/logger.h"
 #include "media/protocol/audio_rtp_packetizer.h"
-#include "media/protocol/rtcp_packet_codec.h"
+#include "media/protocol/rtsp/rtsp_multicast_publisher.h"
 #include "media/protocol/rtsp/rtsp_builders.h"
 #include "media/protocol/rtsp/rtsp_session.h"
-#include "media/protocol/rtsp/rtsp_transport_spec.h"
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <memory>
-#include <random>
 #include <utility>
 
-#include <boost/asio/ip/multicast.hpp>
-#include <boost/asio/ip/udp.hpp>
 #include <boost/asio/post.hpp>
 
 
 
 namespace {
-
-constexpr std::size_t kRtpHeaderSize = 12;
-constexpr std::chrono::seconds kRtcpSenderReportInterval{5};
-
-bool IsIpv4Multicast(const boost::asio::ip::address& address) {
-    if (!address.is_v4()) {
-        return false;
-    }
-
-    const auto bytes = address.to_v4().to_bytes();
-    return bytes[0] >= 224 && bytes[0] <= 239;
-}
-
-std::uint32_t RandomU32() {
-    static thread_local std::mt19937 generator{std::random_device{}()};
-    return std::uniform_int_distribution<std::uint32_t>{}(generator);
-}
-
-std::uint16_t RandomU16() {
-    static thread_local std::mt19937 generator{std::random_device{}()};
-    return std::uniform_int_distribution<std::uint16_t>{}(generator);
-}
-
-void WriteU16(std::uint8_t* data, std::uint16_t value) {
-    data[0] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
-    data[1] = static_cast<std::uint8_t>(value & 0xFF);
-}
-
-void WriteU32(std::uint8_t* data, std::uint32_t value) {
-    data[0] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
-    data[1] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
-    data[2] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
-    data[3] = static_cast<std::uint8_t>(value & 0xFF);
-}
-
-std::uint16_t ReadU16(const std::uint8_t* data) {
-    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(data[0]) << 8) |
-                                      static_cast<std::uint16_t>(data[1]));
-}
-
-std::uint32_t ReadU32(const std::uint8_t* data) {
-    return (static_cast<std::uint32_t>(data[0]) << 24) |
-           (static_cast<std::uint32_t>(data[1]) << 16) |
-           (static_cast<std::uint32_t>(data[2]) << 8) |
-           static_cast<std::uint32_t>(data[3]);
-}
-
-std::vector<std::uint8_t> MakeRtpPacket(const RtpPayload& payload,
-                                        std::uint8_t payload_type,
-                                        std::uint32_t ssrc,
-                                        std::uint16_t& sequence,
-                                        std::uint32_t& last_rtp_timestamp) {
-    last_rtp_timestamp = payload.timestamp;
-
-    const auto rtp_size = kRtpHeaderSize + payload.payload.size();
-    std::vector<std::uint8_t> packet(rtp_size);
-
-    auto* rtp = packet.data();
-    rtp[0] = 0x80;
-    rtp[1] = static_cast<std::uint8_t>((payload.marker ? 0x80 : 0) |
-                                       (payload_type & 0x7F));
-    WriteU16(rtp + 2, sequence++);
-    WriteU32(rtp + 4, payload.timestamp);
-    WriteU32(rtp + 8, ssrc);
-
-    std::copy(payload.payload.begin(),
-              payload.payload.end(),
-              packet.begin() + static_cast<std::ptrdiff_t>(kRtpHeaderSize));
-    return packet;
-}
-
-bool ShouldSendRtcpSenderReport(
-    std::chrono::steady_clock::time_point& next_report_time) {
-    const auto now = std::chrono::steady_clock::now();
-    if (next_report_time != std::chrono::steady_clock::time_point{} &&
-        now < next_report_time) {
-        return false;
-    }
-
-    // 首个 RTP 包之后立即发送一次 SR，后续按固定间隔补发，方便播放器快速同步时钟。
-    next_report_time = now + kRtcpSenderReportInterval;
-    return true;
-}
 
 const MediaTrackConfig* FindTrackById(const std::vector<MediaTrackConfig>& tracks,
                                       int track_id) {
@@ -183,516 +95,6 @@ RtspServerProtocol::~RtspServerProtocol() {
     Stop();
 }
 
-bool RtspServerProtocol::ConfigureSharedMulticastTransport(
-    RtspTransportSpec& transport_spec,
-    const std::string& source_address) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    if (multicast_ready_) {
-        // 组播是共享传输，后续客户端复用同一个组播地址、端口和 RTP 序列空间。
-        transport_spec = multicast_transport_spec_;
-        return true;
-    }
-
-    auto destination_text = transport_spec.destination.empty()
-        ? config_.rtsp.multicast_address
-        : transport_spec.destination;
-    if (destination_text.empty()) {
-        LOG_WARN("RTSP SETUP multicast rejected: empty destination");
-        return false;
-    }
-
-    boost::system::error_code ec;
-    const auto destination = boost::asio::ip::make_address(destination_text, ec);
-    if (ec || !IsIpv4Multicast(destination)) {
-        LOG_WARN("RTSP SETUP multicast rejected destination '{}': {}",
-                 destination_text,
-                 ec ? ec.message() : "not an IPv4 multicast address");
-        return false;
-    }
-
-    if (transport_spec.server_rtp_port == 0) {
-        transport_spec.server_rtp_port = config_.rtsp.multicast_rtp_port;
-    }
-    if (transport_spec.server_rtcp_port == 0) {
-        transport_spec.server_rtcp_port = config_.rtsp.multicast_rtcp_port;
-    }
-    if (transport_spec.server_rtp_port == 0 ||
-        transport_spec.server_rtcp_port == 0) {
-        LOG_WARN("RTSP SETUP multicast rejected: invalid RTP/RTCP port");
-        return false;
-    }
-    if (transport_spec.ttl == 0) {
-        transport_spec.ttl = config_.rtsp.multicast_ttl == 0
-            ? std::uint8_t{16}
-            : config_.rtsp.multicast_ttl;
-    }
-
-    auto bind_address =
-        boost::asio::ip::address{boost::asio::ip::address_v4::any()};
-    boost::system::error_code source_ec;
-    const auto source = boost::asio::ip::make_address(source_address, source_ec);
-    if (!source_ec && source.is_v4()) {
-        bind_address = source;
-        transport_spec.source = source.to_string();
-    }
-
-    auto rtp_socket = std::make_shared<boost::asio::ip::udp::socket>(io_);
-    auto rtcp_socket = std::make_shared<boost::asio::ip::udp::socket>(io_);
-    auto rtcp_receiver_socket =
-        std::make_shared<boost::asio::ip::udp::socket>(io_);
-
-    rtp_socket->open(boost::asio::ip::udp::v4(), ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTP socket open failed: {}", ec.message());
-        return false;
-    }
-
-    rtcp_socket->open(boost::asio::ip::udp::v4(), ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTCP socket open failed: {}", ec.message());
-        return false;
-    }
-
-    rtcp_receiver_socket->open(boost::asio::ip::udp::v4(), ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTCP receiver socket open failed: {}",
-                 ec.message());
-        return false;
-    }
-
-    // RTP 和 RTCP SR 是发送 socket：绑定本地源地址的临时端口，然后发到组播组。
-    rtp_socket->bind(boost::asio::ip::udp::endpoint(bind_address, 0), ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTP socket bind failed: {}", ec.message());
-        return false;
-    }
-
-    rtcp_socket->bind(boost::asio::ip::udp::endpoint(bind_address, 0), ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTCP socket bind failed: {}", ec.message());
-        return false;
-    }
-
-    // RTCP RR 是接收 socket：必须绑定标准组播 RTCP 端口并 join group。
-    rtcp_receiver_socket->set_option(boost::asio::socket_base::reuse_address(true), ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTCP receiver set reuse failed: {}",
-                 ec.message());
-    }
-    rtcp_receiver_socket->bind(
-        boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(),
-                                       transport_spec.server_rtcp_port),
-        ec);
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTCP receiver bind failed: {}", ec.message());
-        return false;
-    }
-
-    if (bind_address.is_v4() &&
-        bind_address.to_v4() != boost::asio::ip::address_v4::any()) {
-        rtcp_receiver_socket->set_option(
-            boost::asio::ip::multicast::join_group(destination.to_v4(),
-                                                   bind_address.to_v4()),
-            ec);
-        if (ec) {
-            rtcp_receiver_socket->set_option(
-                boost::asio::ip::multicast::join_group(destination.to_v4()),
-                ec);
-        }
-    } else {
-        rtcp_receiver_socket->set_option(
-            boost::asio::ip::multicast::join_group(destination.to_v4()),
-            ec);
-    }
-    if (ec) {
-        LOG_WARN("RTSP SETUP multicast RTCP receiver join group failed: {}",
-                 ec.message());
-        return false;
-    }
-
-    for (auto* socket : {rtp_socket.get(), rtcp_socket.get()}) {
-        socket->set_option(boost::asio::ip::multicast::hops(transport_spec.ttl), ec);
-        if (ec) {
-            LOG_WARN("RTSP SETUP multicast set TTL failed: {}", ec.message());
-        }
-        socket->set_option(boost::asio::ip::multicast::enable_loopback(true), ec);
-        if (ec) {
-            LOG_WARN("RTSP SETUP multicast enable loopback failed: {}", ec.message());
-        }
-        if (bind_address.is_v4() &&
-            bind_address.to_v4() != boost::asio::ip::address_v4::any()) {
-            socket->set_option(
-                boost::asio::ip::multicast::outbound_interface(bind_address.to_v4()),
-                ec);
-            if (ec) {
-                LOG_WARN("RTSP SETUP multicast outbound interface failed: {}",
-                         ec.message());
-            }
-        }
-    }
-
-    transport_spec.destination = destination.to_string();
-    multicast_rtp_endpoint_ =
-        boost::asio::ip::udp::endpoint(destination, transport_spec.server_rtp_port);
-    multicast_rtcp_endpoint_ =
-        boost::asio::ip::udp::endpoint(destination, transport_spec.server_rtcp_port);
-    multicast_transport_spec_ = transport_spec;
-    multicast_rtp_socket_ = std::move(rtp_socket);
-    multicast_rtcp_socket_ = std::move(rtcp_socket);
-    multicast_rtcp_receiver_socket_ = std::move(rtcp_receiver_socket);
-    multicast_ssrc_ = RandomU32();
-    multicast_sequence_ = RandomU16();
-    multicast_last_rtp_timestamp_ = 0;
-    multicast_rtcp_packet_count_ = 0;
-    multicast_rtcp_octet_count_ = 0;
-    multicast_next_rtcp_sr_time_ = {};
-    multicast_rtcp_feedback_by_reporter_.clear();
-    multicast_ready_ = true;
-
-    const auto log_multicast_address = multicast_rtp_endpoint_.address().to_string();
-    const auto log_multicast_port = multicast_rtp_endpoint_.port();
-    const auto log_multicast_ttl = transport_spec.ttl;
-    lock.unlock();
-    StartMulticastRtcpReceive();
-
-    LOG_INFO("RTSP SETUP shared multicast transport: destination={}:{} ttl={}",
-             log_multicast_address,
-             log_multicast_port,
-             static_cast<int>(log_multicast_ttl));
-    return true;
-}
-
-void RtspServerProtocol::CloseSharedMulticastTransport() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    boost::system::error_code ignored;
-    if (multicast_rtp_socket_) {
-        multicast_rtp_socket_->cancel(ignored);
-        multicast_rtp_socket_->close(ignored);
-        multicast_rtp_socket_.reset();
-    }
-    if (multicast_rtcp_socket_) {
-        multicast_rtcp_socket_->cancel(ignored);
-        multicast_rtcp_socket_->close(ignored);
-        multicast_rtcp_socket_.reset();
-    }
-    if (multicast_rtcp_receiver_socket_) {
-        multicast_rtcp_receiver_socket_->cancel(ignored);
-        multicast_rtcp_receiver_socket_->close(ignored);
-        multicast_rtcp_receiver_socket_.reset();
-    }
-    multicast_transport_spec_ = {};
-    multicast_rtcp_packet_count_ = 0;
-    multicast_rtcp_octet_count_ = 0;
-    multicast_next_rtcp_sr_time_ = {};
-    multicast_rtcp_feedback_by_reporter_.clear();
-    multicast_ready_ = false;
-}
-
-void RtspServerProtocol::SendMulticastRtpPayload(
-    const RtpPayload& payload,
-    std::uint8_t payload_type) {
-    std::shared_ptr<boost::asio::ip::udp::socket> socket;
-    std::shared_ptr<std::vector<std::uint8_t>> packet;
-    boost::asio::ip::udp::endpoint endpoint;
-    bool send_sender_report = false;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!multicast_ready_ || !multicast_rtp_socket_ ||
-            !multicast_rtp_socket_->is_open()) {
-            return;
-        }
-
-        socket = multicast_rtp_socket_;
-        endpoint = multicast_rtp_endpoint_;
-        // multicast 必须使用共享 SSRC/sequence，不能按每个 RTSP client 单独递增。
-        packet = std::make_shared<std::vector<std::uint8_t>>(
-            MakeRtpPacket(payload,
-                          payload_type,
-                          multicast_ssrc_,
-                          multicast_sequence_,
-                          multicast_last_rtp_timestamp_));
-        // multicast 的 RTCP SR 也必须按共享 sender 统计，不能按 RTSP 会话重复累计。
-        ++multicast_rtcp_packet_count_;
-        multicast_rtcp_octet_count_ +=
-            static_cast<std::uint32_t>(payload.payload.size());
-        send_sender_report =
-            ShouldSendRtcpSenderReport(multicast_next_rtcp_sr_time_);
-    }
-
-    boost::asio::post(
-        io_,
-        [socket, endpoint, packet]() {
-            if (!socket || !socket->is_open()) {
-                return;
-            }
-
-            socket->async_send_to(
-                boost::asio::buffer(*packet),
-                endpoint,
-                [packet](boost::system::error_code ec, std::size_t) {
-                    if (ec && ec != boost::asio::error::operation_aborted) {
-                        LOG_WARN("RTSP multicast RTP send failed: {}", ec.message());
-                    }
-                });
-        });
-
-    if (send_sender_report) {
-        SendMulticastRtcpSenderReport();
-    }
-}
-
-void RtspServerProtocol::SendMulticastRtcpSenderReport() {
-    std::shared_ptr<boost::asio::ip::udp::socket> socket;
-    std::shared_ptr<std::vector<std::uint8_t>> report;
-    boost::asio::ip::udp::endpoint endpoint;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!multicast_ready_ || !multicast_rtcp_socket_ ||
-            !multicast_rtcp_socket_->is_open() ||
-            multicast_rtcp_packet_count_ == 0) {
-            return;
-        }
-
-        socket = multicast_rtcp_socket_;
-        endpoint = multicast_rtcp_endpoint_;
-        report = std::make_shared<std::vector<std::uint8_t>>(
-            RtcpPacketCodec::BuildSenderReport(multicast_ssrc_,
-                                               multicast_last_rtp_timestamp_,
-                                               multicast_rtcp_packet_count_,
-                                               multicast_rtcp_octet_count_));
-    }
-
-    boost::asio::post(
-        io_,
-        [socket, endpoint, report]() {
-            if (!socket || !socket->is_open()) {
-                return;
-            }
-
-            socket->async_send_to(
-                boost::asio::buffer(*report),
-                endpoint,
-                [report](boost::system::error_code ec, std::size_t) {
-                    if (ec && ec != boost::asio::error::operation_aborted) {
-                        LOG_WARN("RTSP multicast RTCP sender report send failed: {}",
-                                 ec.message());
-                    }
-                });
-        });
-}
-
-void RtspServerProtocol::StartMulticastRtcpReceive() {
-    std::shared_ptr<boost::asio::ip::udp::socket> socket;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!multicast_ready_ || !multicast_rtcp_receiver_socket_ ||
-            !multicast_rtcp_receiver_socket_->is_open()) {
-            return;
-        }
-        socket = multicast_rtcp_receiver_socket_;
-    }
-
-    // multicast RR 接收是 protocol 级共享状态；一次只挂一个 receive，完成后再续订。
-    socket->async_receive_from(
-        boost::asio::buffer(multicast_rtcp_read_buffer_),
-        multicast_rtcp_sender_endpoint_,
-        [this, socket](boost::system::error_code ec, std::size_t bytes) {
-            if (ec) {
-                if (ec != boost::asio::error::operation_aborted) {
-                    LOG_DEBUG("RTSP multicast RTCP receive failed: {}",
-                              ec.message());
-                }
-                return;
-            }
-
-            const auto sender_endpoint = multicast_rtcp_sender_endpoint_;
-            HandleMulticastRtcpPacket(multicast_rtcp_read_buffer_.data(),
-                                      bytes,
-                                      sender_endpoint);
-
-            bool should_continue = false;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                should_continue = started_ && multicast_ready_ &&
-                                  multicast_rtcp_receiver_socket_ == socket;
-            }
-            if (should_continue) {
-                StartMulticastRtcpReceive();
-            }
-        });
-}
-
-void RtspServerProtocol::HandleMulticastRtcpPacket(
-    const std::uint8_t* data,
-    std::size_t size,
-    const boost::asio::ip::udp::endpoint& sender_endpoint) {
-    const auto parsed = RtcpPacketCodec::ParseCompound(data, size);
-    if (!parsed.valid) {
-        LOG_DEBUG("RTSP multicast RTCP packet ignored: endpoint={}:{} "
-                  "version={}, size={}, remaining={}",
-                  sender_endpoint.address().to_string(),
-                  sender_endpoint.port(),
-                  static_cast<int>(parsed.invalid_version),
-                  parsed.invalid_packet_size,
-                  size - parsed.error_offset);
-        return;
-    }
-
-    for (const auto& parsed_packet : parsed.packets) {
-        const auto* packet = parsed_packet.bytes.data();
-        const auto packet_size = parsed_packet.bytes.size();
-        const auto packet_type = parsed_packet.packet_type;
-        const auto report_count = parsed_packet.report_count;
-        if (packet_type == RtcpPacketCodec::kReceiverReportPacketType) {
-            ParseMulticastRtcpReceiverReport(packet,
-                                             packet_size,
-                                             report_count,
-                                             sender_endpoint);
-        } else if (packet_type == RtcpPacketCodec::kSenderReportPacketType) {
-            ParseMulticastRtcpSenderReport(packet,
-                                           packet_size,
-                                           report_count,
-                                           sender_endpoint);
-        } else {
-            // SDES/BYE/APP 暂时只识别并忽略，保留日志用于排查播放器行为。
-            LOG_DEBUG("RTSP multicast RTCP {} received: endpoint={}:{} size={}",
-                      RtcpPacketCodec::PacketTypeName(packet_type),
-                      sender_endpoint.address().to_string(),
-                      sender_endpoint.port(),
-                      packet_size);
-        }
-    }
-
-    if (parsed.trailing_bytes != 0) {
-        LOG_DEBUG("RTSP multicast RTCP trailing bytes ignored: endpoint={}:{} "
-                  "bytes={}",
-                  sender_endpoint.address().to_string(),
-                  sender_endpoint.port(),
-                  parsed.trailing_bytes);
-    }
-}
-
-void RtspServerProtocol::ParseMulticastRtcpReceiverReport(
-    const std::uint8_t* packet,
-    std::size_t packet_size,
-    std::uint8_t report_count,
-    const boost::asio::ip::udp::endpoint& sender_endpoint) {
-    if (packet_size < 8U + static_cast<std::size_t>(report_count) * 24U) {
-        LOG_DEBUG("RTSP multicast RTCP RR ignored: endpoint={}:{} size={}, rc={}",
-                  sender_endpoint.address().to_string(),
-                  sender_endpoint.port(),
-                  packet_size,
-                  static_cast<int>(report_count));
-        return;
-    }
-
-    const auto reporter_ssrc = ReadU32(packet + 4);
-    ParseMulticastRtcpReportBlocks(packet + 8,
-                                   report_count,
-                                   reporter_ssrc,
-                                   "RR",
-                                   sender_endpoint);
-}
-
-void RtspServerProtocol::ParseMulticastRtcpSenderReport(
-    const std::uint8_t* packet,
-    std::size_t packet_size,
-    std::uint8_t report_count,
-    const boost::asio::ip::udp::endpoint& sender_endpoint) {
-    if (packet_size < 28U + static_cast<std::size_t>(report_count) * 24U) {
-        LOG_DEBUG("RTSP multicast RTCP SR ignored: endpoint={}:{} size={}, rc={}",
-                  sender_endpoint.address().to_string(),
-                  sender_endpoint.port(),
-                  packet_size,
-                  static_cast<int>(report_count));
-        return;
-    }
-
-    const auto reporter_ssrc = ReadU32(packet + 4);
-    ParseMulticastRtcpReportBlocks(packet + 28,
-                                   report_count,
-                                   reporter_ssrc,
-                                   "SR",
-                                   sender_endpoint);
-}
-
-void RtspServerProtocol::ParseMulticastRtcpReportBlocks(
-    const std::uint8_t* blocks,
-    std::uint8_t report_count,
-    std::uint32_t reporter_ssrc,
-    const char* packet_type_name,
-    const boost::asio::ip::udp::endpoint& sender_endpoint) {
-    if (report_count == 0) {
-        LOG_DEBUG("RTSP multicast RTCP {} received without report blocks: "
-                  "endpoint={}:{} reporter_ssrc={}",
-                  packet_type_name,
-                  sender_endpoint.address().to_string(),
-                  sender_endpoint.port(),
-                  reporter_ssrc);
-        return;
-    }
-
-    for (std::uint8_t index = 0; index < report_count; ++index) {
-        RtcpReportBlock block;
-        if (!RtcpPacketCodec::ReadReportBlock(
-                blocks + static_cast<std::size_t>(index) * 24U,
-                24,
-                block)) {
-            return;
-        }
-
-        bool matches_sender = false;
-        std::uint64_t reports_received = 0;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            matches_sender = multicast_ready_ &&
-                             block.source_ssrc == multicast_ssrc_;
-            if (matches_sender) {
-                // 每个 multicast receiver 用自己的 reporter SSRC 聚合最新反馈。
-                auto& feedback = multicast_rtcp_feedback_by_reporter_[reporter_ssrc];
-                feedback.media_ssrc = block.source_ssrc;
-                feedback.fraction_lost = block.fraction_lost;
-                feedback.cumulative_lost = block.cumulative_lost;
-                feedback.extended_highest_sequence =
-                    block.extended_highest_sequence;
-                feedback.jitter = block.jitter;
-                feedback.last_sender_report = block.last_sender_report;
-                feedback.delay_since_last_sender_report =
-                    block.delay_since_last_sender_report;
-                reports_received = ++feedback.reports_received;
-                ++stats_.rtcp_receiver_reports_received;
-            }
-        }
-
-        LOG_DEBUG("RTSP multicast RTCP {} block: endpoint={}:{} reporter_ssrc={}, "
-                  "media_ssrc={}, match={}, receiver_reports={}, fraction_lost={}, "
-                  "cumulative_lost={}, highest_seq={}, jitter={}, lsr={}, dlsr={}",
-                  packet_type_name,
-                  sender_endpoint.address().to_string(),
-                  sender_endpoint.port(),
-                  reporter_ssrc,
-                  block.source_ssrc,
-                  matches_sender,
-                  reports_received,
-                  static_cast<int>(block.fraction_lost),
-                  block.cumulative_lost,
-                  block.extended_highest_sequence,
-                  block.jitter,
-                  block.last_sender_report,
-                  block.delay_since_last_sender_report);
-    }
-}
-
-std::uint16_t RtspServerProtocol::GetMulticastSequence() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return multicast_sequence_;
-}
-
-std::uint32_t RtspServerProtocol::GetMulticastLastRtpTimestamp() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return multicast_last_rtp_timestamp_;
-}
-
 PublisherResult RtspServerProtocol::Start(
     const PublisherConfig& config,
     const std::vector<MediaTrackConfig>& tracks) {
@@ -736,14 +138,17 @@ PublisherResult RtspServerProtocol::Start(
     session_context_->configure_multicast =
         [this](RtspTransportSpec& transport_spec,
                const std::string& source_address) {
-            return ConfigureSharedMulticastTransport(transport_spec,
-                                                     source_address);
+            return multicast_publisher_ &&
+                   multicast_publisher_->Configure(transport_spec,
+                                                    source_address);
         };
     session_context_->get_multicast_sequence = [this]() {
-        return GetMulticastSequence();
+        return multicast_publisher_ ? multicast_publisher_->GetSequence() : 0;
     };
     session_context_->get_multicast_last_rtp_timestamp = [this]() {
-        return GetMulticastLastRtpTimestamp();
+        return multicast_publisher_
+            ? multicast_publisher_->GetLastRtpTimestamp()
+            : 0;
     };
     session_context_->add_receiver_reports = [this](std::uint64_t count) {
         AddRtcpReceiverReportsReceived(count);
@@ -762,6 +167,23 @@ PublisherResult RtspServerProtocol::Start(
             "invalid RTSP listen host: " + ec.message(),
             ec.value());
     }
+
+    const auto multicast_payload_type = h264_track == tracks_.end()
+        ? std::uint8_t{96}
+        : h264_track->rtp_payload_type;
+    const auto multicast_clock_rate = h264_track == tracks_.end()
+        ? std::uint32_t{90000}
+        : h264_track->rtp_clock_rate;
+    // S6 将组播 socket、共享 RtpSender 和 RR 聚合移入独立 publisher；
+    // callback 只把匹配到的 RR 数量汇总回 façade 统计。
+    multicast_publisher_ = std::make_shared<RtspMulticastPublisher>(
+        io_.get_executor(),
+        config_.rtsp,
+        multicast_payload_type,
+        multicast_clock_rate,
+        [this](std::uint64_t count) {
+            AddRtcpReceiverReportsReceived(count);
+        });
 
     boost::asio::ip::tcp::endpoint endpoint(address, config_.listen_port);
     acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_);
@@ -873,8 +295,11 @@ PublisherResult RtspServerProtocol::Write(
                 session->SendRtpPayload(track->track_id, packet, payload_type);
             }
         }
-        if (has_multicast_receiver && track->codec_type == CodecType::H264) {
-            SendMulticastRtpPayload(packet, payload_type);
+        if (has_multicast_receiver && track->codec_type == CodecType::H264 &&
+            multicast_publisher_) {
+            // publisher 内部只有一份共享 sender/socket；多个 session 只影响
+            // 是否需要发布，不会让同一 access unit 重复产生 multicast packet。
+            multicast_publisher_->Publish(packet, payload_type);
         }
     }
 
@@ -913,7 +338,9 @@ void RtspServerProtocol::Stop() {
         acceptor_->close(ignored);
         acceptor_.reset();
     }
-    CloseSharedMulticastTransport();
+    if (multicast_publisher_) {
+        multicast_publisher_->Close();
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -929,6 +356,7 @@ void RtspServerProtocol::Stop() {
         session_manager_->Clear();
         session_manager_.reset();
     }
+    multicast_publisher_.reset();
     session_context_.reset();
     io_.restart();
 }

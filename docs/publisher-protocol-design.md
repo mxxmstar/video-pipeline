@@ -796,7 +796,7 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 可维护性与测试
 
 - `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
-  - 状态：S0 基线、目录分层、S1 纯组件拆分、S2 TCP connection 拆分、S3 session/manager 拆分、S4 media transport 拆分和 S5 RTP sender 拆分已完成，S6-S7 类拆分尚待实施。
+  - 状态：S0 基线、目录分层、S1 纯组件拆分、S2 TCP connection 拆分、S3 session/manager 拆分、S4 media transport 拆分、S5 RTP sender 拆分和 S6 multicast publisher 拆分已完成，S7 façade/统计/关闭路径收缩尚待实施。
   - 规划日期：2026-08-03。
   - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
   - S0 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S0 实施记录。
@@ -805,6 +805,7 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
   - S3 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S3 实施记录。
   - S4 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S4 实施记录。
   - S5 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S5 实施记录。
+  - S6 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S6 实施记录。
 - 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
 - TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
 - 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
@@ -1119,7 +1120,7 @@ src/media/protocol/
 
 ##### 12.9.7 详细执行计划
 
-计划状态：S0、S1 已完成，S2 到 S7 待实施。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过未完成步骤直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
+计划状态：S0 到 S6 已完成，S7 待实施。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过未完成步骤直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
 
 ###### 12.9.7.1 每个阶段的固定工作流
 
@@ -1289,13 +1290,26 @@ S5 gate：`TrackSession` 不再直接保存 SSRC、sequence、last timestamp、R
 
 | 编号 | 任务 | 迁移内容 | 验证重点 |
 |---|---|---|---|
-| S6-1 | 定义生命周期接口 | `Configure()` 返回不可变 transport snapshot，`Publish()` 接收 access unit/payload，`Close()` 幂等，`GetStats()` 返回 snapshot | 未配置时不发送，重复 SETUP 复用同一 spec，关闭后不能重新进入 receive loop |
+| S6-1 | 定义生命周期接口 | `Configure()` 返回不可变 transport snapshot，`Publish()` 接收已由 H264 packetizer 生成的 `RtpPayload`，`Close()` 幂等，`GetStats()` 返回 snapshot | 未配置时不发送，重复 SETUP 复用同一 spec，关闭后不能重新进入 receive loop |
 | S6-2 | 迁移共享 UDP 资源 | 移入三个 multicast socket、RTP/RTCP endpoint、TTL/interface/join group 和 RTCP read buffer | 端口/地址错误不泄漏 socket，RTP 与 SR 发送 endpoint 正确，RR socket 正确 join group |
-| S6-3 | 复用 packetizer/sender/codec | multicast 调用 H264 packetizer、`RtpSender` 和 `RtcpPacketCodec`，不再保留独立 RTP header/RTCP parser 副本 | sequence/SSRC 全客户端共享，两个 client 不导致 packet count 翻倍 |
+| S6-3 | 复用 packetizer/sender/codec | façade 继续调用 H264 packetizer；publisher 复用 `RtpSender` 和 `RtcpPacketCodec`，不再保留独立 RTP header/RTCP parser 副本 | sequence/SSRC 全客户端共享，两个 client 不导致 packet count 翻倍 |
 | S6-4 | 迁移 receiver feedback | 按 reporter SSRC 聚合 RR snapshot，通过窄统计回调上报 façade | compound RR/SR、多个 reporter、错误 report block、统计累计保持一致 |
 | S6-5 | 切换 session 协调 | SETUP 获取共享 spec；`Write()` 只在至少一个对应 multicast track 处于 PLAY 时向 publisher 投递一次 | session 关闭不关闭共享 socket，最后一个 client 离开后的发送语义与基线一致 |
 
 S6 gate：`RtspServerProtocol` 头文件不再包含 multicast socket、endpoint、SSRC/sequence、RTCP buffer、feedback map 或 multicast helper；multicast S0 回归全部通过。
+
+###### S6 实施记录（2026-08-04）
+
+- **publisher 文件与所有权**：新增 `include/media/protocol/rtsp/rtsp_multicast_publisher.h` 和 `src/media/protocol/rtsp/rtsp_multicast_publisher.cpp`，在一个头/源文件对中定义 `RtspMulticastPublisher`、反馈快照和统计快照。publisher 独占 RTP、RTCP Sender Report 和 RTCP Receiver Report 三个 UDP socket，server 只保留 `shared_ptr`。
+- **配置与生命周期**：`Configure()` 校验 IPv4 multicast 地址和 RTP/RTCP 端口，在局部 socket 完成 open/bind/options/join group 后才提交成员，失败路径不留下半初始化资源；重复 SETUP 复用同一 transport snapshot；`Close()` 幂等、释放 socket/sender 并永久拒绝再次 `Configure()`。
+- **媒体发送迁移**：publisher 复用 `RtpSender` 生成 RTP header、sequence、SSRC、packet/octet counters 和 Sender Report，再通过 Asio executor 异步发送；多个 RTSP session 只影响是否存在 PLAY 订阅，不会按客户端重复创建 socket 或递增共享 sender。
+- **RTCP feedback 迁移**：复用 `RtcpPacketCodec` 解析 compound RTCP，按 report block 的 source SSRC 匹配当前 sender，并按 reporter SSRC 聚合最近 RR 与累计次数；匹配数量通过窄回调汇总到 façade 的 `rtcp_receiver_reports_received`。
+- **并发与晚到回调**：RTCP receive callback 读取 `closed_`、`ready_` 和 socket identity 时持有 mutex；每次 receive 使用独立 endpoint shared ownership，`Close()` 后 reset socket 成员，晚到 callback 只能退出，不能重新进入 receive loop。
+- **façade/session 接入**：`RtspServerProtocol::Write()` 对每个 H264 RTP payload 最多调用一次 publisher；session context 的 multicast configure、sequence、timestamp 和 RR 统计回调均转发 publisher。session 关闭不会关闭 server 级 publisher，server `Stop()` 才统一关闭并释放它。
+- **兼容点与边界**：本阶段继续保持当前“单 H264 multicast track、共享一组 RTP/RTCP 端口、共享 SSRC/sequence”的协议行为；H264 packetizer 仍由 façade 调用，publisher 接收已经生成的 `RtpPayload`，multicast audio 和多 track 留待后续能力扩展。
+- **专项测试与验证**：新增 `test/media/test_rtsp_multicast_publisher.cpp` 和 `test_rtsp_multicast_publisher` CTest，覆盖非法地址/端口、重复配置、组播 RTP 发送、共享 sender 统计、RR reporter 聚合和关闭后禁止重启。Debug 串行构建通过；`test_publisher_protocol`、`test_rtsp_request_parser`、`test_rtsp_pure_components`、`test_rtsp_connection`、`test_rtsp_session`、`test_rtsp_media_transport`、`test_rtp_sender`、`test_rtsp_multicast_publisher`、`test_rtsp_server_protocol` 九项 CTest 全部通过。
+
+**阶段结论**：S6 gate 已满足。当前入口为 S7，重点是收缩 façade 头文件、统一各子组件 stats snapshot、整理 `Start()`/`Stop()` 顺序并删除迁移期适配代码。
 
 ###### 12.9.7.9 S7：收缩 façade、统一统计与关闭路径
 
@@ -1422,6 +1436,7 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | `test_rtsp_session` | session manager 的 ID、shared ownership、快照和关闭回收 |
 | `test_rtsp_media_transport` | transport factory 边界、UDP RTP/RTCP 发送、RTCP 来源校验和幂等关闭 |
 | `test_rtp_sender` | RTP header、sequence/timestamp 回绕、sender counters、SR 首包和 5 秒调度 |
+| `test_rtsp_multicast_publisher` | multicast 地址/端口校验、共享 RTP/SR 发送、RR reporter 聚合、幂等关闭和关闭后禁止重启 |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1470,7 +1485,7 @@ FFmpeg publisher：
 
 RTSP Server publisher：
 
-S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection，S3 已落地 session/manager，S4 已落地 media transport，S5 已落地 per-track RTP sender；以下为当前路径。后续 S6-S7 的目标布局和分批迁移范围见 12.9.5。
+S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection，S3 已落地 session/manager，S4 已落地 media transport，S5 已落地 per-track RTP sender，S6 已落地 server 级 multicast publisher；以下为当前路径。S7 的收缩范围和验收标准见 12.9.7.9。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
@@ -1482,6 +1497,7 @@ S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection�
 - `include/media/protocol/rtsp/rtsp_connection.h`
 - `include/media/protocol/rtsp/rtsp_media_transport.h`（统一声明 `IRtspMediaTransport`、TCP/UDP transport、factory 和 multicast subscription）
 - `include/media/protocol/rtsp/rtsp_session.h`（合并声明 `RtspSessionContext`、`RtspClientSession` 和 `RtspSessionManager`）
+- `include/media/protocol/rtsp/rtsp_multicast_publisher.h`（server 级共享 multicast socket、`RtpSender`、RTCP RR 聚合和统计快照）
 - `include/media/protocol/rtsp/rtsp_transport_spec.h`
 - `src/media/protocol/audio_rtp_packetizer.cpp`
 - `src/media/protocol/rtp_sender.cpp`
@@ -1494,6 +1510,7 @@ S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection�
 - `src/media/protocol/rtsp/rtsp_session.cpp`（统一实现 `RtspClientSession` 和 `RtspSessionManager`）
 - `src/media/protocol/rtsp/rtsp_transport_spec.cpp`
 - `src/media/protocol/rtsp/rtsp_builders.cpp`（统一实现 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
+- `src/media/protocol/rtsp/rtsp_multicast_publisher.cpp`（统一实现共享 multicast RTP/RTCP 发送、RR 接收和关闭）
 
 RTP/bitstream 工具：
 
@@ -1510,6 +1527,7 @@ RTP/bitstream 工具：
 - `test/media/test_rtsp_session.cpp`（`RtspClientSession`/`RtspSessionManager` 的所有权、ID 和关闭回收测试）
 - `test/media/test_rtsp_media_transport.cpp`（TCP/UDP transport factory 和 UDP socket 边界测试）
 - `test/media/test_rtp_sender.cpp`（RTP sender header、回绕、统计和 SR 调度测试）
+- `test/media/test_rtsp_multicast_publisher.cpp`（共享 multicast publisher 的 socket、sender、RR 聚合和生命周期测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`
