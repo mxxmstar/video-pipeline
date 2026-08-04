@@ -177,6 +177,19 @@ PublisherResult PublisherConfig::ValidateProtocol() const {
         if (rtsp.max_payload_size <= 0) {
             return Invalid("RTSP maximum RTP payload size must be positive");
         }
+        if (rtsp.session_idle_timeout_ms < 0) {
+            return Invalid("RTSP session idle timeout must not be negative");
+        }
+        for (const auto& client_address : rtsp.allowed_client_addresses) {
+            if (client_address.empty()) {
+                return Invalid("RTSP allowed client addresses must not be empty");
+            }
+            address_error.clear();
+            boost::asio::ip::make_address(client_address, address_error);
+            if (address_error) {
+                return Invalid("RTSP allowed client address must be an IP address");
+            }
+        }
         if (rtsp.enable_multicast) {
             if (!rtsp.enable_udp) {
                 return Invalid("RTSP multicast requires UDP to be enabled");

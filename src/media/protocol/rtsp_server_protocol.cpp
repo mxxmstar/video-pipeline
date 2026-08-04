@@ -533,12 +533,14 @@ void RtspServerProtocol::OnAccepted(boost::system::error_code ec,
     if (!ec) {
         if (session_manager) {
             auto session = session_manager->Create(std::move(socket));
-            const auto client_count = session_manager->Size();
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stats_.clients_connected = client_count;
+            if (session) {
+                const auto client_count = session_manager->Size();
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    stats_.clients_connected = client_count;
+                }
+                session->Start();
             }
-            session->Start();
         }
     } else if (ec != boost::asio::error::operation_aborted) {
         LOG_WARN("RtspServerProtocol: accept failed: {}", ec.message());

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <iomanip>
@@ -17,6 +18,7 @@
 
 #include <boost/asio/any_io_executor.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/steady_timer.hpp>
 
 #include "media/publisher/publisher_config.h"
 #include "media/protocol/h264_rtp_packetizer.h"
@@ -86,6 +88,22 @@ inline const MediaTrackConfig* FindTrackById(
         tracks.end(),
         [track_id](const auto& track) { return track.track_id == track_id; });
     return it == tracks.end() ? nullptr : &*it;
+}
+
+/// @brief 按精确 IP 地址判断新连接是否允许进入 session registry。
+///
+/// allowlist 为空时保持旧行为，允许所有客户端；配置非空时只比较
+/// address().to_string() 的规范文本，不把 CIDR 或主机名偷偷解释成另一种语义。
+inline bool IsClientAddressAllowed(
+    const RtspServerOptions& options,
+    const boost::asio::ip::tcp::endpoint& endpoint) {
+    if (options.allowed_client_addresses.empty()) {
+        return true;
+    }
+    const auto address = endpoint.address().to_string();
+    return std::find(options.allowed_client_addresses.begin(),
+                     options.allowed_client_addresses.end(),
+                     address) != options.allowed_client_addresses.end();
 }
 
 } // namespace rtsp_session_detail
@@ -261,10 +279,19 @@ private:
     void CloseAllTransports();
 
 
+    // 所有 session 控制状态都在 connection 所属 executor 上修改；timer 只
+    // 负责唤醒同一个 executor，不需要额外给 track_states_ 加锁。
+    void TouchActivity();
+
+
+    void OnIdleTimeout();
+
+
     void Close();
 
 
     std::shared_ptr<const RtspSessionContext> context_;
+    boost::asio::steady_timer idle_timer_;
     ClosedHandler on_closed_;
     std::shared_ptr<RtspConnection> connection_;
     std::uint64_t id_{0};

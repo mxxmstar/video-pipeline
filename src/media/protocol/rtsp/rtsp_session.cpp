@@ -43,6 +43,9 @@
     // Start 由 accept executor 调用，connection 会在同一 executor 上启动 read loop。
     void RtspClientSession::Start() {
         if (connection_) {
+            // 计时器从 session 建立时开始；后续 request、RTCP 和媒体发送
+            // 都会重新设置同一个 timer，避免空连接长期占用 session registry。
+            TouchActivity();
             connection_->Start();
         }
     }
@@ -102,6 +105,8 @@
             return;
         }
 
+        TouchActivity();
+
         auto* state = FindTrackState(track_id);
         if (!state || !state->ready) {
             return;
@@ -124,6 +129,7 @@ RtspClientSession::RtspClientSession(
     std::uint64_t id,
     ClosedHandler on_closed)
     : context_(std::move(context)),
+      idle_timer_(context_->io_executor),
       on_closed_(std::move(on_closed)),
       id_(id),
       session_id_(rtsp_session_detail::MakeSessionId(id)) {
@@ -134,6 +140,7 @@ RtspClientSession::RtspClientSession(
     void RtspClientSession::HandleInterleavedFrame(
         std::uint8_t channel,
         std::vector<std::uint8_t> payload) {
+        TouchActivity();
         auto* state = FindTrackStateByRtcpChannel(channel);
         if (state && !payload.empty()) {
             HandleRtcpPacket(*state,
@@ -171,6 +178,7 @@ RtspClientSession::RtspClientSession(
 
 
     void RtspClientSession::HandleRequest(const RtspRequest& request) {
+        TouchActivity();
         // 解析器负责语法，RtspClientSession 负责 RTSP 语义状态机。这里先处理
         // 所有请求都需要的 CSeq/version，再进入具体方法的状态校验。
         std::string cseq;
@@ -724,6 +732,9 @@ RtspClientSession::RtspClientSession(
             return;
         }
         closed_ = true;
+        // 当前项目使用的 Boost 版本只提供无参数 cancel()；timer 位于
+        // session 自己的 executor，取消失败不会改变 session 的关闭语义。
+        idle_timer_.cancel();
         playing_ = false;
         ready_ = false;
 
@@ -736,6 +747,44 @@ RtspClientSession::RtspClientSession(
         }
 }
 
+void RtspClientSession::TouchActivity() {
+    if (closed_ || !context_ ||
+        context_->config.rtsp.session_idle_timeout_ms <= 0) {
+        return;
+    }
+
+    idle_timer_.expires_after(std::chrono::milliseconds(
+        context_->config.rtsp.session_idle_timeout_ms));
+    const auto weak = weak_from_this();
+    idle_timer_.async_wait([weak](const boost::system::error_code& ec) {
+        if (ec == boost::asio::error::operation_aborted) {
+            return;
+        }
+        if (const auto self = weak.lock()) {
+            self->OnIdleTimeout();
+        }
+    });
+}
+
+void RtspClientSession::OnIdleTimeout() {
+    if (closed_) {
+        return;
+    }
+
+    // PLAY 状态代表客户端仍在消费媒体；如果 pipeline 暂时没有新帧，仍
+    // 保留 session，避免把“无帧”误判成控制面闲置。下一次媒体或 RTSP
+    // 活动会重新设置 timer，PAUSE/未 PLAY 状态则按配置主动关闭。
+    if (playing_.load()) {
+        TouchActivity();
+        return;
+    }
+
+    LOG_INFO("RTSP session {} closed after {} ms of control inactivity",
+             id_,
+             context_->config.rtsp.session_idle_timeout_ms);
+    Close();
+}
+
 RtspSessionManager::RtspSessionManager(
     std::shared_ptr<const RtspSessionContext> context)
     : context_(std::move(context)) {
@@ -743,6 +792,27 @@ RtspSessionManager::RtspSessionManager(
 
 RtspSessionManager::Session RtspSessionManager::Create(
     boost::asio::ip::tcp::socket socket) {
+    boost::system::error_code endpoint_error;
+    const auto remote_endpoint = socket.remote_endpoint(endpoint_error);
+    const auto& allowed_addresses =
+        context_->config.rtsp.allowed_client_addresses;
+    const bool rejected_by_allowlist =
+        (!allowed_addresses.empty() && endpoint_error) ||
+        (!endpoint_error &&
+         !rtsp_session_detail::IsClientAddressAllowed(
+             context_->config.rtsp,
+             remote_endpoint));
+    if (rejected_by_allowlist) {
+        // 在进入 registry 前拒绝连接，避免未授权客户端先占用 session
+        // ID、媒体 transport 或统计槽位；socket 仍由这里负责关闭。
+        LOG_WARN("RTSP client rejected by address allowlist: {}",
+                 endpoint_error ? endpoint_error.message()
+                                : remote_endpoint.address().to_string());
+        boost::system::error_code close_error;
+        socket.close(close_error);
+        return {};
+    }
+
     // ID 分配和 registry 插入分别受同一把锁保护；不在锁内启动 socket 或执行回调。
     std::uint64_t id = 0;
     {

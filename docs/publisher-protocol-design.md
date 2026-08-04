@@ -787,7 +787,11 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
   - 状态：已修复。
   - 修复日期：2026-08-03。
   - 修复方法：新增独立、可增量调用的 `RtspRequestParser`，实现 RFC 2326 RTSP/1.0 request-line、header（字段名大小写不敏感、重复字段和折叠行）、`Content-Length` entity body 与 pipelining 消息边界解析；严格拒绝非法 CRLF、token、absolute URI、version、header 控制字符和冲突长度，并增加 request-line/header/body 资源上限。`ClientSession` 改为消费结构化 request，强制唯一数字 `CSeq`，版本不支持时返回 505，语法错误返回 400 后关闭连接。新增 `test_rtsp_request_parser` CTest，覆盖分片、body、流水线和畸形输入。
-- 没有 Basic/Digest 鉴权、RTSPS、会话 idle timeout、访问控制和连接数限制。
+- 没有 Basic/Digest 鉴权和 RTSPS；这两项仍属于后续生产化阶段。
+- 会话 idle timeout 和客户端地址访问控制已实现基础版本：`session_idle_timeout_ms=0` 或空 `allowed_client_addresses` 时保持关闭/放行的兼容默认值；当前 allowlist 只支持精确 IP，不支持 CIDR。
+  - 修复日期：2026-08-04。
+  - 修复方法：`RtspClientSession` 在其 Asio executor 上维护可取消的 `steady_timer`，由 RTSP request、interleaved/RTCP 和媒体发送刷新；非 PLAY 状态控制面超时后走幂等 `Close()`。`RtspSessionManager` 在进入 registry 前读取 remote endpoint 并执行精确 IP allowlist，拒绝连接不会分配 session ID 或占用媒体资源。
+- 连接数限制、按地址限流和连接统计仍待在 `RtspSessionManager` 中实现。
 - 只支持 H264 视频，尚未支持 H265。
 - multicast 只有单 H264 track，共享一组 RTP/RTCP 端口、SSRC 和 sequence。
 - 没有 RTCP SDES/BYE，也没有基于 RR 的质量告警或码率反馈。
@@ -1393,11 +1397,22 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 
 类拆分稳定后再按新边界推进以下能力：
 
-- 在 `RtspClientSession` 前增加 Basic/Digest 鉴权、会话 idle timeout 和访问控制。
+- **P1：会话资源保护（已完成，2026-08-04）**：在 `RtspClientSession`/`RtspSessionManager` 边界增加控制面 idle timeout 和精确 IP allowlist；默认关闭，先不改变现有客户端行为。
+- **P2：RTSP 鉴权**：增加 Basic/Digest challenge、凭据校验、nonce 生命周期和鉴权失败限速；鉴权配置启用后再改变未授权请求的响应。
 - 在 `RtspSessionManager` 增加最大连接数、按地址限流和连接统计。
 - 在 `RtspConnection` 增加每客户端发送队列上限、慢客户端隔离和 RTSPS 支持。
 - 扩展 transport/地址抽象以支持 IPv6，并评估 RTSP aggregate control 和更完整的 RFC 错误响应。
 - 使用 VLC、FFmpeg、GStreamer 和常见 NVR 建立互操作矩阵测试。
+
+###### 12.9.9.1 P1 实施记录（2026-08-04）
+
+- **配置边界**：`RtspServerOptions` 新增 `session_idle_timeout_ms` 和 `allowed_client_addresses`。超时为 0 表示禁用；allowlist 为空表示允许所有地址；非空列表逐项校验 IP 文本，暂不把 CIDR、主机名或 DNS 解析引入配置语义。
+- **idle timeout 生命周期**：session 创建后在所属 Asio executor 上启动 `steady_timer`；每个 RTSP request、interleaved/RTCP 输入和实际 RTP 媒体发送都会刷新 timer。非 PLAY 状态超时调用同一幂等 `Close()`，关闭时取消 timer；PLAY 状态保留 session，避免暂时无帧被误判为空闲。
+- **访问控制时机**：`RtspSessionManager::Create()` 在分配 ID、插入 registry 和建立 media transport 之前读取 TCP remote endpoint 并比较 allowlist。未授权 socket 立即关闭并返回空 session，`RtspServerProtocol` 不更新客户端计数，也不启动 session read loop。
+- **兼容与线程边界**：默认配置不改变现有连接行为；timer、session 状态和 registry 回收仍在现有 IO executor/manager 边界内完成，没有向 façade 增加 socket 或认证状态。新增代码添加了中文注释，说明 timer 取消、捕获 weak_ptr、拒绝连接的资源顺序和未连接测试 socket 的兼容处理。
+- **测试补充**：扩展 `test_rtsp_server_lifecycle`，覆盖 50 ms 空 session 自动关闭、`127.0.0.2` allowlist 拒绝 `127.0.0.1` 客户端、失败后客户端计数保持为 0；原有 Stop/Start、并发 Write/Stop 和协议回归继续执行。
+- **验证结果**：通过项目 VS/NMake 环境编译 `video_pipeline_lib`、`test_rtsp_server_lifecycle` 和 `test_rtsp_server_protocol`；10 项 RTSP 定向 CTest 全部通过，结果为 10/10，总耗时约 1.88 秒。完整默认构建曾在无关测试目标阶段超时，但受影响目标均已成功编译。
+- **阶段结论**：P1 gate 已满足。下一步进入 P2 Basic/Digest 鉴权设计与实现，需先固定 `401` challenge、Session/CSeq 组合请求和 nonce 失效语义，再接入 session 状态机。
 
 #### 12.10 多目标和主备发布
 
@@ -1450,7 +1465,7 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | `test_rtsp_media_transport` | transport factory 边界、UDP RTP/RTCP 发送、RTCP 来源校验和幂等关闭 |
 | `test_rtp_sender` | RTP header、sequence/timestamp 回绕、sender counters、SR 首包和 5 秒调度 |
 | `test_rtsp_multicast_publisher` | multicast 地址/端口校验、共享 RTP/SR 发送、RR reporter 聚合、幂等关闭和关闭后禁止重启 |
-| `test_rtsp_server_lifecycle` | Start 失败回滚、停止后 Write、重复 Stop、停止后重启和并发 Write/Stop |
+| `test_rtsp_server_lifecycle` | Start 失败回滚、停止后 Write、重复 Stop、停止后重启、并发 Write/Stop、idle timeout 和 IP allowlist |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1542,7 +1557,7 @@ RTP/bitstream 工具：
 - `test/media/test_rtsp_media_transport.cpp`（TCP/UDP transport factory 和 UDP socket 边界测试）
 - `test/media/test_rtp_sender.cpp`（RTP sender header、回绕、统计和 SR 调度测试）
 - `test/media/test_rtsp_multicast_publisher.cpp`（共享 multicast publisher 的 socket、sender、RR 聚合和生命周期测试）
-- `test/media/test_rtsp_server_lifecycle.cpp`（`RtspServerProtocol` 启动失败回滚、Stop/Start 幂等和并发媒体关闭测试）
+- `test/media/test_rtsp_server_lifecycle.cpp`（`RtspServerProtocol` 启动失败回滚、Stop/Start 幂等、并发媒体关闭、idle timeout 和 IP allowlist 测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`

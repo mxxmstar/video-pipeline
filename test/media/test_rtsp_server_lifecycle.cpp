@@ -1,5 +1,6 @@
 #include "media/protocol/rtsp_server_protocol.h"
 
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -50,6 +51,66 @@ EncodedAccessUnit MakeAccessUnit() {
     access_unit.codec_type = CodecType::H264;
     access_unit.nals.push_back(NalUnit{{0x65, 0x88, 0x84, 0x21}});
     return access_unit;
+}
+
+bool WaitForPeerClose(boost::asio::ip::tcp::socket& socket) {
+    socket.non_blocking(true);
+    std::array<std::uint8_t, 64> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        boost::system::error_code ec;
+        socket.read_some(boost::asio::buffer(buffer), ec);
+        if (ec == boost::asio::error::eof ||
+            ec == boost::asio::error::connection_reset) {
+            return true;
+        }
+        if (ec == boost::asio::error::would_block ||
+            ec == boost::asio::error::try_again) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        if (!ec) {
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+void TestIdleTimeoutAndAddressAllowlist() {
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.session_idle_timeout_ms = 50;
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket client(client_io);
+        client.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        // 未发送 RTSP request 的空 session 必须在有限时间内释放，而不是
+        // 一直占用 manager 和 TCP socket。
+        assert(WaitForPeerClose(client));
+        protocol.Stop();
+    }
+
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.allowed_client_addresses = {"127.0.0.2"};
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket client(client_io);
+        client.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        // 当前客户端来自 127.0.0.1，而 allowlist 只允许 127.0.0.2；连接
+        // 在进入 session registry 前被关闭，不能收到 RTSP response。
+        assert(WaitForPeerClose(client));
+        assert(protocol.GetStats().clients_connected == 0);
+        protocol.Stop();
+    }
 }
 
 void TestFailureRollbackAndRestart() {
@@ -107,6 +168,7 @@ void TestConcurrentWriteAndStop() {
 } // namespace
 
 int main() {
+    TestIdleTimeoutAndAddressAllowlist();
     TestFailureRollbackAndRestart();
     TestConcurrentWriteAndStop();
     return 0;

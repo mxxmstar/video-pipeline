@@ -141,6 +141,19 @@ static void TestPublisherConfigValidation() {
     assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
 
     config = MakeRtspConfig();
+    config.rtsp.session_idle_timeout_ms = -1;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.rtsp.allowed_client_addresses = {"not-an-ip-address"};
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.rtsp.session_idle_timeout_ms = 50;
+    config.rtsp.allowed_client_addresses = {"127.0.0.1"};
+    assert(config.Validate().code == PublisherErrorCode::None);
+
+    config = MakeRtspConfig();
     config.tracks.front().codec_type = CodecType::H265;
     assert(config.Validate().code == PublisherErrorCode::UnsupportedCodec);
 

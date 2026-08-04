@@ -82,6 +82,12 @@ struct RtspServerOptions {
     bool enable_tcp_interleaved{true};  ///< 是否开启 TCP 交错模式.
     bool enable_udp{false};             ///< 是否开启 UDP 模式.
     bool enable_multicast{false};       ///< 是否在 SDP 中宣告并接受 UDP 组播.
+    // 控制面闲置超时时间，单位为毫秒。0 表示关闭超时；播放中的 session
+    // 会在收到 RTSP/interleaved/媒体活动时刷新计时器，避免正常推流被误关。
+    int session_idle_timeout_ms{0};
+    // 允许建立 RTSP session 的客户端 IP 精确列表。空列表表示允许所有地址；
+    // 当前不解析 CIDR，避免把配置中的网段语义误判成单个客户端地址。
+    std::vector<std::string> allowed_client_addresses;
     // 当 SETUP 请求 RTP/AVP;multicast 但没有指定 destination、port 或 ttl 时，
     // 使用这里的默认组播目标。
     std::string multicast_address{"239.255.0.1"};
