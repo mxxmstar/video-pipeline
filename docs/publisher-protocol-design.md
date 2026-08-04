@@ -796,11 +796,12 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 可维护性与测试
 
 - `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
-  - 状态：拆分方案已完成，代码和目录迁移尚未开始。
+  - 状态：S0 基线与目录分层已完成，S1 及后续类拆分尚未开始。
   - 规划日期：2026-08-03。
   - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
-- 手动摄像头链路和协议自动测试目前混在 `test_rtsp_server_publisher`，并通过常量选择；当前默认进入不设时长的摄像头循环。
-- 部分协议测试函数在 `main()` 中被注释，没有作为 CTest 自动回归执行。
+  - S0 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S0 实施记录。
+- 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
+- TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
 - 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
 
 ## 11. 扩展方法
@@ -1115,7 +1116,7 @@ src/media/protocol/
 
 ##### 12.9.7 详细执行计划
 
-计划状态：待实施，当前代码和文件路径均未按本计划迁移。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过 `S0` 直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
+计划状态：S0 已完成，S1 到 S7 待实施。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过未完成步骤直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
 
 ###### 12.9.7.1 每个阶段的固定工作流
 
@@ -1136,7 +1137,7 @@ src/media/protocol/
 
 | 编号 | 任务 | 产物或改动位置 | 验证证据 |
 |---|---|---|---|
-| S0-1 | 将本地 socket 协议测试与真实摄像头循环分开；保留摄像头程序为手动测试 | 新增 `test/media/test_rtsp_server_protocol.cpp`；公共客户端辅助代码可放入 `test/media/rtsp_test_utils.h`；不改变 `avtp_decode_rtsp_publisher.cpp` | 新测试无需摄像头、固定文件或外部 RTSP server，单次执行可自行结束 |
+| S0-1 | 将本地 socket 协议测试与真实摄像头循环分开；保留摄像头程序为手动测试 | 为现有 `test/media/test_rtsp_server_publisher.cpp` 建立 `test_rtsp_server_protocol` 协议 target；通过 `VIDEO_PIPELINE_RUN_CAMERA` 编译宏区分入口，避免复制测试源 | 协议 target 无需摄像头、固定文件或外部 RTSP server，单次执行可自行结束 |
 | S0-2 | 恢复并整理 TCP interleaved、音视频、UDP unicast 和 multicast 现有测试函数 | 从 `test_rtsp_server_publisher.cpp` 迁移当前被注释的协议用例，手动摄像头入口继续独立保留 | 五类现有协议场景均实际执行，而不是只编译函数 |
 | S0-3 | 固化 RTSP 方法与错误响应 | 为七个已支持 method、未知 method、缺失/重复 CSeq、错误 version、非法 Session 和错误状态转换增加断言 | 状态码、CSeq、Session、Transport、RTP-Info、Content-Length 和 Public header 有明确断言 |
 | S0-4 | 固化媒体字节行为 | 记录 H264 单 NAL/FU-A、AAC AU header/ADTS、G711、RTP header、首次 SR 和 RR 统计 | 对 payload type、marker、sequence、timestamp、SSRC、packet/octet count 做字段级断言 |
@@ -1145,6 +1146,16 @@ src/media/protocol/
 | S0-7 | 建立 RTSP 子目录 | 新增 `include/media/protocol/rtsp` 和 `src/media/protocol/rtsp`，迁移 `rtsp_request_parser.*`、`rtsp_transport_spec.*`，更新生产代码和测试 include | 只发生路径变化；重新 configure/build 后新路径被编译，旧路径不存在且无残留引用 |
 
 S0 gate：自动测试能够覆盖当前 TCP、UDP unicast、multicast、RTCP 和 RTSP method 基线，且不再依赖 `test_rtsp_server_publisher` 中默认无限循环的摄像头路径；parser/transport spec 已迁入 `media/protocol/rtsp`，路径迁移前后测试输出一致。
+
+###### S0 实施记录（2026-08-04）
+
+- **测试入口分离**：在 `test/CMakeLists.txt` 新增 `test_rtsp_server_protocol` target 和 CTest；`test_rtsp_server_publisher` 保留手动摄像头入口，并通过 `VIDEO_PIPELINE_RUN_CAMERA=1` 显式开启。协议 target 复用现有测试源但默认关闭 camera 模式，避免复制近千行辅助代码。
+- **协议用例启用**：恢复 `main()` 中的 TCP interleaved、TCP 音视频、UDP audio、UDP unicast 和 UDP multicast 用例。所有用例均使用本地 socket 和有限超时，不依赖外部摄像头或 ZLMediaKit。
+- **测试稳定性修复**：`FindFreeUdpPortPair()` 现在只返回偶数 RTP 端口及相邻奇数 RTCP 端口，避免随机奇数 RTP 端口触发 multicast 配置校验失败。新增逻辑带有中文注释，说明 RTP/RTCP 端口配对约束。
+- **目录迁移**：将 `RtspRequestParser`、`RtspTransportSpec` 的头文件和源文件迁入 `include/media/protocol/rtsp`、`src/media/protocol/rtsp`；同步更新 server、parser/spec 自包含和测试 include。`RtspServerProtocol`/adapter 及通用 H264/RTP 文件保持在 protocol 根目录。
+- **构建验证**：Debug 串行构建通过：`test_rtsp_request_parser`、`test_publisher_protocol`、`test_rtsp_server_protocol` 和 `test_rtsp_server_publisher`。首次全量 NMake 构建遇到环境级 `C1041` PDB 并发写入，改用 `--parallel 1` 的定向构建后通过。
+- **CTest 验证**：`test_publisher_protocol`、`test_rtsp_request_parser`、`test_rtsp_server_protocol` 三项串行执行全部通过，结果为 3/3，协议 target 用时约 0.65 秒。手动摄像头 target 仅构建验证，未启动其无限时长链路。
+- **阶段结论**：S0 gate 已满足；S1 从 `RtspResponseBuilder`、`RtspSdpBuilder`、`RtcpPacketCodec` 和 `AudioRtpPacketizer` 的纯组件提取开始。
 
 ###### 12.9.7.3 S1：提取无状态和纯数据组件
 
@@ -1349,7 +1360,8 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | 测试 | 覆盖内容 |
 |---|---|
 | `test_publisher_protocol` | 配置基础校验、Annex-B/AVCC、H264 FU-A、RTSP Transport 解析 |
-| `test_rtsp_server_publisher` | TCP/UDP/multicast、音视频 SDP、RTP、RTCP，以及手动摄像头双路发布 |
+| `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
+| `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
 | `test_rtsp_decode_encode_push_zlm` | RTSP 拉流、解码、编码并通过 FFmpeg publisher 推送 ZLM |
 
@@ -1396,16 +1408,16 @@ FFmpeg publisher：
 
 RTSP Server publisher：
 
-以下为当前路径；代码迁移尚未开始。目标目录布局和分批迁移范围见 12.9.5。
+S0 已完成目录迁移；以下为当前路径。后续 S1-S7 的目标布局和分批迁移范围见 12.9.5。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
-- `include/media/protocol/rtsp_request_parser.h`
-- `include/media/protocol/rtsp_transport_spec.h`
+- `include/media/protocol/rtsp/rtsp_request_parser.h`
+- `include/media/protocol/rtsp/rtsp_transport_spec.h`
 - `src/media/protocol/rtsp_server_protocol_adapter.cpp`
 - `src/media/protocol/rtsp_server_protocol.cpp`
-- `src/media/protocol/rtsp_request_parser.cpp`
-- `src/media/protocol/rtsp_transport_spec.cpp`
+- `src/media/protocol/rtsp/rtsp_request_parser.cpp`
+- `src/media/protocol/rtsp/rtsp_transport_spec.cpp`
 
 RTP/bitstream 工具：
 
@@ -1417,7 +1429,7 @@ RTP/bitstream 工具：
 测试：
 
 - `test/media/test_publisher_protocol.cpp`
-- `test/media/test_rtsp_server_publisher.cpp`
+- `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`
 

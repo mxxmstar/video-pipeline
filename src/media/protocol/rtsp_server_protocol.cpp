@@ -1,8 +1,8 @@
 #include "media/protocol/rtsp_server_protocol.h"
 
 #include "common/log/logger.h"
-#include "media/protocol/rtsp_request_parser.h"
-#include "media/protocol/rtsp_transport_spec.h"
+#include "media/protocol/rtsp/rtsp_request_parser.h"
+#include "media/protocol/rtsp/rtsp_transport_spec.h"
 
 #include <algorithm>
 #include <array>

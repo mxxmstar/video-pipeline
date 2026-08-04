@@ -50,7 +50,12 @@ constexpr std::uint16_t kAudioUdpTestPort = 18558;
 
 // 摄像头端到端手动测试配置全部写死在这里，不再从命令行读取参数。
 constexpr std::uint16_t kManualRtspServerPort = 7852;
+#if defined(VIDEO_PIPELINE_RUN_CAMERA) && VIDEO_PIPELINE_RUN_CAMERA
+// 手动摄像头 target 显式打开该宏；协议 CTest target 保持关闭，避免进入无限摄像头循环。
 constexpr bool kRunCameraAudioVideoPipeline = true;
+#else
+constexpr bool kRunCameraAudioVideoPipeline = false;
+#endif
 constexpr const char* kMulticastAddress = "239.255.42.1";
 constexpr const char* kManualCameraSourceUrl = "rtsp://192.168.66.83/live/mainstream";
 constexpr const char* kManualRtspServerPath = "/camera/mainstream";
@@ -387,7 +392,9 @@ std::uint16_t FindFreeUdpPortPair() {
         rtp_socket.bind({boost::asio::ip::udp::v4(), 0});
 
         const auto rtp_port = rtp_socket.local_endpoint().port();
-        if (rtp_port == 65535) {
+        // RTSP multicast 配置约定 RTP 使用偶数端口，紧邻的奇数端口用于 RTCP。
+        // 系统随机分配的端口可能是奇数，不能直接把它作为 RTP/RTCP 端口对。
+        if (rtp_port >= 65534 || (rtp_port % 2) != 0) {
             continue;
         }
 
@@ -405,7 +412,14 @@ std::uint16_t FindFreeUdpPortPair() {
         }
     }
 
-    return FindFreeUdpPort();
+    auto fallback_port = FindFreeUdpPort();
+    if (fallback_port >= 65534) {
+        fallback_port = 5004;
+    }
+    if ((fallback_port % 2) != 0) {
+        --fallback_port;
+    }
+    return fallback_port;
 }
 
 void BindAndJoinMulticastSocket(boost::asio::ip::udp::socket& socket,
@@ -1782,10 +1796,10 @@ int main() {
         return 0;
     }
 
-    // TestTcpInterleavedPublisher();
-    // TestTcpInterleavedAudioVideoPublisher();
-    // TestUdpUnicastAudioTrackPublisher();
-    // TestUdpUnicastPublisher();
-    // TestUdpMulticastPublisher();
+    TestTcpInterleavedPublisher();
+    TestTcpInterleavedAudioVideoPublisher();
+    TestUdpUnicastAudioTrackPublisher();
+    TestUdpUnicastPublisher();
+    TestUdpMulticastPublisher();
     return 0;
 }

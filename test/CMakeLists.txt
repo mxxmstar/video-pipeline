@@ -210,6 +210,7 @@ target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_lib)
 target_compile_definitions(test_rtsp_server_publisher
     PRIVATE
         VIDEO_PIPELINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        VIDEO_PIPELINE_RUN_CAMERA=1
 )
 if(TARGET video_pipeline_common_process)
     target_link_libraries(test_rtsp_server_publisher PRIVATE video_pipeline_common_process)
@@ -224,6 +225,29 @@ if(MSVC)
 else()
     target_compile_options(test_rtsp_server_publisher PRIVATE -Wall -Wextra)
 endif()
+
+# 协议回归复用同一组有限时长的本地 socket 用例，但不打开手动摄像头模式。
+add_executable(test_rtsp_server_protocol media/test_rtsp_server_publisher.cpp)
+target_link_libraries(test_rtsp_server_protocol PRIVATE video_pipeline_lib)
+target_compile_definitions(test_rtsp_server_protocol
+    PRIVATE
+        VIDEO_PIPELINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+if(TARGET video_pipeline_common_process)
+    target_link_libraries(test_rtsp_server_protocol PRIVATE video_pipeline_common_process)
+    target_compile_definitions(test_rtsp_server_protocol
+        PRIVATE
+            VIDEO_PIPELINE_HAS_COMMON_PROCESS=1
+    )
+endif()
+video_pipeline_copy_runtime_dlls(test_rtsp_server_protocol)
+if(MSVC)
+    target_compile_options(test_rtsp_server_protocol PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_rtsp_server_protocol PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_rtsp_server_protocol COMMAND test_rtsp_server_protocol)
+
 add_executable(test_local_mp4_decode_rtsp_publisher media/test_local_mp4_decode_rtsp_publisher.cpp)
 target_link_libraries(test_local_mp4_decode_rtsp_publisher PRIVATE video_pipeline_lib)
 target_compile_definitions(test_local_mp4_decode_rtsp_publisher

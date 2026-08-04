@@ -1,7 +1,7 @@
 #include "media/protocol/h264_bitstream.h"
 #include "media/protocol/h264_rtp_packetizer.h"
 #include "media/protocol/ffmpeg_protocol_adapter.h"
-#include "media/protocol/rtsp_transport_spec.h"
+#include "media/protocol/rtsp/rtsp_transport_spec.h"
 #include "media/simple_buffer.h"
 #include "media/publisher/i_publisher.h"
 
