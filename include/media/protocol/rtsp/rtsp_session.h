@@ -1,0 +1,384 @@
+#pragma once
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <functional>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/ip/tcp.hpp>
+
+#include "media/publisher/publisher_config.h"
+#include "media/protocol/h264_rtp_packetizer.h"
+#include "media/protocol/rtcp_packet_codec.h"
+#include "media/protocol/rtsp/rtsp_builders.h"
+#include "media/protocol/rtsp/rtsp_connection.h"
+#include "media/protocol/rtsp/rtsp_media_transport.h"
+#include "media/protocol/rtsp/rtsp_request_parser.h"
+#include "media/protocol/rtsp/rtsp_transport_spec.h"
+
+namespace rtsp_session_detail {
+
+constexpr std::size_t kRtpHeaderSize = 12;
+constexpr std::chrono::seconds kRtcpSenderReportInterval{5};
+
+inline std::uint32_t RandomU32() {
+    static thread_local std::mt19937 generator{std::random_device{}()};
+    return std::uniform_int_distribution<std::uint32_t>{}(generator);
+}
+
+inline std::uint16_t RandomU16() {
+    static thread_local std::mt19937 generator{std::random_device{}()};
+    return std::uniform_int_distribution<std::uint16_t>{}(generator);
+}
+
+inline void WriteU16(std::uint8_t* data, std::uint16_t value) {
+    data[0] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    data[1] = static_cast<std::uint8_t>(value & 0xFF);
+}
+
+inline void WriteU32(std::uint8_t* data, std::uint32_t value) {
+    data[0] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
+    data[1] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+    data[2] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+    data[3] = static_cast<std::uint8_t>(value & 0xFF);
+}
+
+inline std::uint32_t ReadU32(const std::uint8_t* data) {
+    return (static_cast<std::uint32_t>(data[0]) << 24) |
+           (static_cast<std::uint32_t>(data[1]) << 16) |
+           (static_cast<std::uint32_t>(data[2]) << 8) |
+           static_cast<std::uint32_t>(data[3]);
+}
+
+inline std::vector<std::uint8_t> MakeRtpPacket(
+    const RtpPayload& payload,
+    std::uint8_t payload_type,
+    std::uint32_t ssrc,
+    std::uint16_t& sequence,
+    std::uint32_t& last_rtp_timestamp) {
+    last_rtp_timestamp = payload.timestamp;
+    const auto rtp_size = kRtpHeaderSize + payload.payload.size();
+    std::vector<std::uint8_t> packet(rtp_size);
+    auto* rtp = packet.data();
+    rtp[0] = 0x80;
+    rtp[1] = static_cast<std::uint8_t>((payload.marker ? 0x80 : 0) |
+                                       (payload_type & 0x7F));
+    WriteU16(rtp + 2, sequence++);
+    WriteU32(rtp + 4, payload.timestamp);
+    WriteU32(rtp + 8, ssrc);
+    std::copy(payload.payload.begin(),
+              payload.payload.end(),
+              packet.begin() + static_cast<std::ptrdiff_t>(kRtpHeaderSize));
+    return packet;
+}
+
+inline bool ShouldSendRtcpSenderReport(
+    std::chrono::steady_clock::time_point& next_report_time) {
+    const auto now = std::chrono::steady_clock::now();
+    if (next_report_time != std::chrono::steady_clock::time_point{} &&
+        now < next_report_time) {
+        return false;
+    }
+    next_report_time = now + kRtcpSenderReportInterval;
+    return true;
+}
+
+inline std::string MakeSessionId(std::uint64_t id) {
+    std::ostringstream oss;
+    oss << std::hex << std::setw(8) << std::setfill('0') << id;
+    return oss.str();
+}
+
+inline bool ExtractCSeq(const RtspRequest& request, std::string& cseq) {
+    const auto values = request.HeaderValues("CSeq");
+    if (values.size() != 1 || values.front().empty()) {
+        return false;
+    }
+    if (!std::all_of(values.front().begin(), values.front().end(),
+                     [](unsigned char ch) { return ch >= '0' && ch <= '9'; })) {
+        return false;
+    }
+    cseq.assign(values.front());
+    return true;
+}
+
+inline bool ParseTrackIdFromUrl(const std::string& url, int& track_id) {
+    const auto marker = url.rfind("track");
+    if (marker == std::string::npos) {
+        return false;
+    }
+    const auto digits_begin = marker + std::string{"track"}.size();
+    if (digits_begin >= url.size() ||
+        !std::isdigit(static_cast<unsigned char>(url[digits_begin]))) {
+        return false;
+    }
+    int value = 0;
+    for (std::size_t i = digits_begin; i < url.size(); ++i) {
+        const auto ch = static_cast<unsigned char>(url[i]);
+        if (!std::isdigit(ch)) {
+            break;
+        }
+        value = value * 10 + static_cast<int>(ch - '0');
+    }
+    track_id = value;
+    return true;
+}
+
+inline const MediaTrackConfig* FindTrackById(
+    const std::vector<MediaTrackConfig>& tracks,
+    int track_id) {
+    const auto it = std::find_if(
+        tracks.begin(),
+        tracks.end(),
+        [track_id](const auto& track) { return track.track_id == track_id; });
+    return it == tracks.end() ? nullptr : &*it;
+}
+
+} // namespace rtsp_session_detail
+
+/// @brief 供单个 RTSP 客户端使用的窄化上下文。
+///
+/// 上下文只保存规范化后的只读配置、Asio executor 和 server 提供的功能回调；
+/// session 不持有 RtspServerProtocol 引用，因此状态机可以独立测试和迁移。
+struct RtspSessionContext {
+    PublisherConfig config;
+    std::vector<MediaTrackConfig> tracks;
+    boost::asio::any_io_executor io_executor;
+    std::function<std::string(const std::string&)> build_sdp;
+    std::function<bool(RtspTransportSpec&, const std::string&)> configure_multicast;
+    std::function<std::uint16_t()> get_multicast_sequence;
+    std::function<std::uint32_t()> get_multicast_last_rtp_timestamp;
+    std::function<void(std::uint64_t)> add_receiver_reports;
+};
+
+/// @brief RTSP 会话
+/// @note 管理单个客户端连接的核心类，负责处理一个客户端从连接到断开的完整生命周期。
+class RtspClientSession
+    : public std::enable_shared_from_this<RtspClientSession> {
+public:
+    using ClosedHandler = std::function<void(std::uint64_t)>;
+
+    static std::shared_ptr<RtspClientSession> Create(
+        boost::asio::ip::tcp::socket socket,
+        std::shared_ptr<const RtspSessionContext> context,
+        std::uint64_t id,
+        ClosedHandler on_closed);
+
+
+    void Start();
+
+
+    void Stop();
+
+
+    bool IsPlaying() const;
+
+
+    bool IsMulticastTransport() const;
+
+
+    bool IsPlayingMulticast() const;
+
+
+    bool IsPlayingMulticastTrack(int track_id) const;
+
+
+    std::uint64_t Id() const;
+
+
+    void SendRtpPayload(int track_id,
+                        const RtpPayload& payload,
+                        std::uint8_t payload_type);
+
+
+private:
+    RtspClientSession(std::shared_ptr<const RtspSessionContext> context,
+                      std::uint64_t id,
+                      ClosedHandler on_closed);
+
+
+    // 每个 SDP track 都有独立的 RTP/RTCP 状态。音频和视频不能共用 SSRC、
+    // sequence 或 timestamp，否则播放器会把不同媒体流混到同一条 RTP 时间线里。
+    struct TrackSessionState {
+        int track_id{0};
+        const MediaTrackConfig* track{nullptr};
+        RtspTransportSpec transport_spec;
+        // unicast/TCP 的 socket 和异步 receive 归 transport 所有；multicast
+        // 这里只记录共享 publisher 返回的订阅描述，不创建客户端 socket。
+        std::shared_ptr<IRtspMediaTransport> media_transport;
+        std::optional<RtspMulticastSubscription> multicast_subscription;
+        std::uint32_t ssrc{0};
+        std::uint16_t sequence{0};
+        std::uint32_t last_rtp_timestamp{0};
+        std::uint32_t rtcp_packet_count{0};
+        std::uint32_t rtcp_octet_count{0};
+        std::chrono::steady_clock::time_point next_rtcp_sr_time{};
+        RtcpReportBlock last_receiver_report{};
+        std::uint32_t last_receiver_reporter_ssrc{0};
+        std::uint64_t receiver_reports_received{0};
+        int rtp_channel{0};
+        int rtcp_channel{1};
+        bool has_receiver_report{false};
+        bool ready{false};
+    };
+
+    void HandleInterleavedFrame(
+        std::uint8_t channel,
+        std::vector<std::uint8_t> payload);
+
+
+    void HandleConnectionParseError(
+        const RtspRequestParseResult& parse_result);
+
+
+    void OnConnectionClosed(const boost::system::error_code&);
+
+
+    void HandleRequest(const RtspRequest& request);
+
+
+    TrackSessionState* FindTrackState(int track_id);
+
+
+    const TrackSessionState* FindTrackState(int track_id) const;
+
+
+    TrackSessionState* FindTrackStateByRtcpChannel(std::uint8_t channel);
+
+
+    const MediaTrackConfig* FindTrackForSetupUrl(const std::string& url) const;
+
+
+    TrackSessionState& PrepareTrackState(const MediaTrackConfig& track);
+
+
+    void FinishTrackSetup(TrackSessionState& state,
+                          const RtspTransportSpec& transport_spec);
+
+
+    bool HasReadyTrack() const;
+
+
+    std::string BuildTrackUrl(const std::string& play_url, int track_id) const;
+
+
+    std::string BuildRtpInfo(const std::string& play_url) const;
+
+
+    std::vector<std::uint8_t> BuildRtpPacket(
+        TrackSessionState& state,
+        const RtpPayload& payload,
+        std::uint8_t payload_type);
+
+
+    void RecordRtcpSenderStats(TrackSessionState& state,
+                               const RtpPayload& payload);
+
+
+    void MaybeSendRtcpSenderReport(TrackSessionState& state);
+
+
+    void HandleRtcpPacket(TrackSessionState& state,
+                          const std::uint8_t* data,
+                          std::size_t size,
+                          const char* transport_name);
+
+
+    void ParseRtcpReceiverReport(TrackSessionState& state,
+                                 const std::uint8_t* packet,
+                                 std::size_t packet_size,
+                                 std::uint8_t report_count,
+                                 const char* transport_name);
+
+
+    void ParseRtcpSenderReport(TrackSessionState& state,
+                               const std::uint8_t* packet,
+                               std::size_t packet_size,
+                               std::uint8_t report_count,
+                               const char* transport_name);
+
+
+    void ParseRtcpReportBlocks(TrackSessionState& state,
+                               const std::uint8_t* blocks,
+                               std::uint8_t report_count,
+                               std::uint32_t reporter_ssrc,
+                               const char* transport_name,
+                               const char* packet_type_name);
+
+
+    bool CreateMediaTransport(TrackSessionState& state,
+                              RtspTransportSpec& transport_spec);
+
+
+    void SendRtsp(std::string response);
+
+
+    std::string LocalAddress() const;
+
+
+    void CloseTransport(TrackSessionState& state);
+
+
+    void CloseAllTransports();
+
+
+    void Close();
+
+
+    std::shared_ptr<const RtspSessionContext> context_;
+    ClosedHandler on_closed_;
+    std::shared_ptr<RtspConnection> connection_;
+    std::uint64_t id_{0};
+    std::string session_id_;
+    std::string requested_url_;
+    // key 对应 MediaTrackConfig::track_id，也就是 SDP/SETUP 中的 trackN。
+    std::map<int, TrackSessionState> track_states_;
+    bool ready_{false};
+    std::atomic_bool playing_{false};
+    bool closed_{false};
+};
+
+
+
+class RtspSessionManager
+    : public std::enable_shared_from_this<RtspSessionManager> {
+public:
+    using Session = std::shared_ptr<RtspClientSession>;
+
+    explicit RtspSessionManager(
+        std::shared_ptr<const RtspSessionContext> context);
+
+    RtspSessionManager(const RtspSessionManager&) = delete;
+    RtspSessionManager& operator=(const RtspSessionManager&) = delete;
+
+    /// 在 manager 锁内分配唯一内部 id；session 的连接回调只通过
+    /// manager 的窄化 Remove() 回收 registry 项。
+    Session Create(boost::asio::ip::tcp::socket socket);
+
+    void Remove(std::uint64_t session_id);
+
+    std::vector<Session> Snapshot() const;
+
+    std::size_t Size() const;
+
+    void Clear();
+
+private:
+    std::shared_ptr<const RtspSessionContext> context_;
+    mutable std::mutex mutex_;
+    std::vector<Session> sessions_;
+    std::uint64_t next_session_id_{1};
+};

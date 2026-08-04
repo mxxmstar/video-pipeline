@@ -796,12 +796,14 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 可维护性与测试
 
 - `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
-  - 状态：S0 基线、目录分层、S1 纯组件拆分和 S2 TCP connection 拆分已完成，S3-S7 类拆分尚待实施。
+  - 状态：S0 基线、目录分层、S1 纯组件拆分、S2 TCP connection 拆分、S3 session/manager 拆分和 S4 media transport 拆分已完成，S5-S7 类拆分尚待实施。
   - 规划日期：2026-08-03。
   - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
   - S0 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S0 实施记录。
   - S1 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S1 实施记录。
   - S2 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S2 实施记录。
+  - S3 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S3 实施记录。
+  - S4 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S4 实施记录。
 - 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
 - TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
 - 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
@@ -1220,6 +1222,16 @@ S2 gate：只有 `RtspConnection` 直接拥有并读写客户端 TCP socket；`C
 
 S3 gate：`ClientSession` 嵌套类、`owner_` 原始引用、`sessions_`、`next_session_id_`、`RemoveSession()` 和 `SnapshotSessions()` 从 façade 删除；所有 RTSP method 行为与 S0 基线一致。
 
+###### S3 实施记录（2026-08-04）
+
+- **窄化 session context**：新增 `include/media/protocol/rtsp/rtsp_session.h`，定义 `RtspSessionContext`，保存规范化后的 `PublisherConfig`/track 快照、Asio executor，以及 SDP、multicast transport、RTP-Info 时间线和 RR 统计等窄化回调。session 不再持有 `RtspServerProtocol&`，也不直接访问 façade 的配置、socket 或 registry。
+- **独立 session 状态机**：将原嵌套 `ClientSession` 迁移为独立的 `RtspClientSession`，保留 CSeq/version/method 校验、SETUP/PLAY/PAUSE/TEARDOWN 状态、track 状态、TCP/UDP RTP/RTCP 发送和关闭语义。`RtspClientSession` 与 manager 共用 `rtsp_session.h/.cpp`，减少小型文件数量；所有 TCP 字节读写仍由 S2 的 `RtspConnection` 承担。
+- **session manager**：新增 `RtspSessionManager`，独占活动 session 的 `shared_ptr` registry、ID 分配、快照、删除和清空操作。connection/session 的 closed callback 只回调 manager 的窄化删除入口，避免 session、connection、manager 形成循环引用；registry 锁内不执行 socket I/O 或用户回调。
+- **façade 收缩**：`RtspServerProtocol` 只创建 context/manager、处理 accept、取得 session 快照并编排 `Write()`/`Stop()`；删除嵌套 `ClientSession`、`sessions_`、`next_session_id_`、`RemoveSession()` 和 `SnapshotSessions()`。session 的活动数量由 manager 统计。
+- **测试补充**：新增 `test/media/test_rtsp_session.cpp` 和 `test_rtsp_session` CTest，覆盖 manager ID 唯一性、shared ownership、快照、session Stop 后 closed callback 回收；`test_rtsp_server_protocol` 继续覆盖所有 RTSP method、TCP/UDP/multicast 媒体行为。
+- **验证结果**：重新 configure 后使用 `cmake --build build --config Debug --target test_rtsp_session test_rtsp_server_protocol --parallel 1` 构建通过；`ctest --test-dir build -C Debug -R "test_rtsp_(session|server_protocol|connection)" --output-on-failure --timeout 30` 三项测试全部通过。
+- **阶段结论**：S3 gate 已满足；下一阶段入口为 S4 `IRtspMediaTransport`，继续把 session 内 UDP/TCP media socket 和 RTCP receive 边界迁移到 transport 组件。
+
 ###### 12.9.7.6 S4：引入媒体 transport 边界
 
 目标：把“发送什么”和“通过哪种 socket 发送”分开，session 不再直接管理 UDP socket。
@@ -1233,6 +1245,17 @@ S3 gate：`ClientSession` 嵌套类、`owner_` 原始引用、`sessions_`、`nex
 | S4-5 | 明确 multicast 订阅 | multicast SETUP 在 session 中只保存 `RtspMulticastSubscription` 值对象和共享 Transport response，不创建每客户端发送 socket，也不在每个 session 的媒体循环中重复发送 | 两个 multicast client 只产生一份共享 RTP packet |
 
 S4 gate：session 和 `TrackSession` 中不再出现 `udp::socket`、UDP endpoint/read buffer 或 `async_send_to`；TCP/UDP transport 测试和 S0 协议测试全部通过。
+
+###### S4 实施记录（2026-08-04）
+
+- **transport 接口与文件合并**：新增 `include/media/protocol/rtsp/rtsp_media_transport.h` 和 `src/media/protocol/rtsp/rtsp_media_transport.cpp`，在同一对文件中定义 `IRtspMediaTransport`、`RtspMediaTransportFactory`、TCP interleaved 和 UDP unicast 实现，避免为每个小类继续增加文件数量。接口只暴露 RTP/RTCP send、不可变 `RtspTransportSpec` 快照、TCP 模式查询和幂等 `Close()`，不依赖 RTSP method、codec packetizer 或 `RtspServerProtocol`。
+- **TCP interleaved 迁移**：`TcpInterleavedTransport` 只保存 channel 和 `RtspConnection` 弱引用，RTP/RTCP 直接进入 connection 唯一写队列；transport 不重复构造 `$` frame，因此 RTSP response、RTP 和 RTCP 的排队顺序保持 S2 行为。channel 超过一字节范围时 factory 拒绝创建，避免截断。
+- **UDP unicast 迁移**：`UdpUnicastTransport` 独占 RTP/RTCP socket、server/client endpoint 和 RTCP receive buffer；创建阶段完成地址族检查、socket open/bind、server port snapshot 和 receive loop，任一步失败都返回结构化错误且不把半初始化 transport 交给 session。RTCP 只接受 SETUP 声明的 client RTCP endpoint，发送和关闭均投递到 transport executor，异步 buffer 由 shared ownership 覆盖到回调结束。
+- **session 边界收缩**：`RtspClientSession::TrackSessionState` 删除 UDP socket、endpoint、read buffer、`async_send_to` 和 UDP receive helper，改为持有 `shared_ptr<IRtspMediaTransport>`；session 只负责 RTP/RTCP packet 内容和状态机，transport 负责 socket。重复 SETUP/关闭通过 transport 的幂等 `Close()` 清理旧资源。
+- **multicast 订阅显式化**：新增 `RtspMulticastSubscription` 值对象。multicast SETUP 在 session 中只保存共享 publisher 返回的 response snapshot，不创建每客户端 socket；当前 server 级 multicast sender 保持不变，完整迁移到 `RtspMulticastPublisher` 留在 S6，避免本阶段改变共享序列/SSRC 语义。
+- **测试补充**：新增 `test/media/test_rtsp_media_transport.cpp` 和 `test_rtsp_media_transport` CTest，覆盖未知/缺少 `client_port` 的 factory 拒绝、UDP RTP/RTCP 发送、RTCP 正确来源回调、意外来源忽略以及重复关闭；`test_rtsp_server_protocol` 继续覆盖 TCP interleaved、UDP unicast、UDP audio 和 multicast 端到端行为。
+- **验证结果**：`cmake --build build --config Debug --target test_rtsp_media_transport test_rtsp_server_protocol --parallel 1` 构建通过；`ctest --test-dir build -C Debug -R "test_rtsp_(media_transport|session|server_protocol|connection)" --output-on-failure --timeout 30` 全部通过。`rg` 检查确认 session/TrackSession 不再包含 `udp::socket`、UDP endpoint/read buffer 或 `async_send_to`。
+- **阶段结论**：S4 gate 已满足；下一阶段入口为 S5 per-track `RtpSender`，继续迁移 RTP header、sequence/timestamp 和 RTCP sender statistics。
 
 ###### 12.9.7.7 S5：提取 per-track `RtpSender`
 
@@ -1384,6 +1407,8 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | `test_rtsp_request_parser` | RTSP request 分片、body、pipelining、header 规范和畸形输入 |
 | `test_rtsp_pure_components` | RTSP response/SDP、AAC/G711 payload、RTCP SR/compound/report block 纯组件边界 |
 | `test_rtsp_connection` | TCP request 分片、RTSP/interleaved frame 分流、串行写队列和 `CloseAfterFlush` |
+| `test_rtsp_session` | session manager 的 ID、shared ownership、快照和关闭回收 |
+| `test_rtsp_media_transport` | transport factory 边界、UDP RTP/RTCP 发送、RTCP 来源校验和幂等关闭 |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1432,7 +1457,7 @@ FFmpeg publisher：
 
 RTSP Server publisher：
 
-S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection；以下为当前路径。后续 S3-S7 的目标布局和分批迁移范围见 12.9.5。
+S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection，S3 已落地 session/manager，S4 已落地 media transport；以下为当前路径。后续 S5-S7 的目标布局和分批迁移范围见 12.9.5。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
@@ -1441,6 +1466,8 @@ S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection�
 - `include/media/protocol/rtsp/rtsp_request_parser.h`
 - `include/media/protocol/rtsp/rtsp_builders.h`（统一声明 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
 - `include/media/protocol/rtsp/rtsp_connection.h`
+- `include/media/protocol/rtsp/rtsp_media_transport.h`（统一声明 `IRtspMediaTransport`、TCP/UDP transport、factory 和 multicast subscription）
+- `include/media/protocol/rtsp/rtsp_session.h`（合并声明 `RtspSessionContext`、`RtspClientSession` 和 `RtspSessionManager`）
 - `include/media/protocol/rtsp/rtsp_transport_spec.h`
 - `src/media/protocol/audio_rtp_packetizer.cpp`
 - `src/media/protocol/rtcp_packet_codec.cpp`
@@ -1448,6 +1475,8 @@ S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection�
 - `src/media/protocol/rtsp_server_protocol.cpp`
 - `src/media/protocol/rtsp/rtsp_request_parser.cpp`
 - `src/media/protocol/rtsp/rtsp_connection.cpp`
+- `src/media/protocol/rtsp/rtsp_media_transport.cpp`（统一实现 TCP interleaved、UDP unicast transport 和 factory）
+- `src/media/protocol/rtsp/rtsp_session.cpp`（统一实现 `RtspClientSession` 和 `RtspSessionManager`）
 - `src/media/protocol/rtsp/rtsp_transport_spec.cpp`
 - `src/media/protocol/rtsp/rtsp_builders.cpp`（统一实现 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
 
@@ -1463,6 +1492,8 @@ RTP/bitstream 工具：
 - `test/media/test_publisher_protocol.cpp`
 - `test/media/test_rtsp_pure_components.cpp`（`RtspResponseBuilder`、`RtspSdpBuilder`、`AudioRtpPacketizer`、`RtcpPacketCodec` 单元测试）
 - `test/media/test_rtsp_connection.cpp`（`RtspConnection` 的 socket fixture、framing、写队列和关闭测试）
+- `test/media/test_rtsp_session.cpp`（`RtspClientSession`/`RtspSessionManager` 的所有权、ID 和关闭回收测试）
+- `test/media/test_rtsp_media_transport.cpp`（TCP/UDP transport factory 和 UDP socket 边界测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`

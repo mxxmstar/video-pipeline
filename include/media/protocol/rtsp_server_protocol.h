@@ -20,6 +20,8 @@
 #include "media/protocol/i_protocol.h"
 #include "media/protocol/rtsp/rtsp_transport_spec.h"
 
+struct RtspSessionContext;
+class RtspSessionManager;
 
 
 class RtspServerProtocol : public IProtocol,
@@ -41,10 +43,8 @@ public:
     PublisherStats GetStats() const override;
 
     std::string BuildSdp(const std::string& host_for_sdp) const;
-    void RemoveSession(std::uint64_t session_id);
 
 private:
-    class ClientSession;
     struct MulticastRtcpFeedback {
         std::uint32_t media_ssrc{0};
         std::uint8_t fraction_lost{0};
@@ -59,7 +59,6 @@ private:
     void AcceptNext();
     void OnAccepted(boost::system::error_code ec,
                     boost::asio::ip::tcp::socket socket);
-    void SnapshotSessions(std::vector<std::shared_ptr<ClientSession>>& sessions) const;
     void UpdateH264ParameterSets(const EncodedAccessUnit& access_unit);
     void AddRtcpReceiverReportsReceived(std::uint64_t count);
     bool ConfigureSharedMulticastTransport(RtspTransportSpec& transport_spec,
@@ -122,10 +121,9 @@ private:
     bool multicast_ready_{false};
 
     mutable std::mutex mutex_;
-    // S2 阶段由 server registry 持有活动 session；connection 回调只保存
-    // weak_ptr，关闭时 RemoveSession 移除唯一 registry 所有权并允许释放。
-    mutable std::vector<std::shared_ptr<ClientSession>> sessions_;
-    std::uint64_t next_session_id_{1};
+    // S3 由独立 manager 持有活动 session；façade 不直接维护 registry、ID 或关闭回收。
+    std::shared_ptr<RtspSessionContext> session_context_;
+    std::shared_ptr<RtspSessionManager> session_manager_;
     PublisherStats stats_;
     bool started_{false};
 };
