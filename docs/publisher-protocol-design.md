@@ -795,8 +795,8 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 
 ### 可维护性与测试
 
-- `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
-  - 状态：S0 基线、目录分层、S1 纯组件拆分、S2 TCP connection 拆分、S3 session/manager 拆分、S4 media transport 拆分、S5 RTP sender 拆分和 S6 multicast publisher 拆分已完成，S7 façade/统计/关闭路径收缩尚待实施。
+- `RtspServerProtocol` 历史上同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
+  - 状态：已完成 S0 基线、目录分层、S1 纯组件拆分、S2 TCP connection 拆分、S3 session/manager 拆分、S4 media transport 拆分、S5 RTP sender 拆分、S6 multicast publisher 拆分和 S7 façade/统计/关闭路径收缩。
   - 规划日期：2026-08-03。
   - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
   - S0 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S0 实施记录。
@@ -806,9 +806,10 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
   - S4 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S4 实施记录。
   - S5 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S5 实施记录。
   - S6 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S6 实施记录。
+  - S7 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S7 实施记录。后续鉴权、慢客户端隔离、IPv6 和互操作矩阵属于独立生产化工作，不再扩大 façade 的职责。
 - 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
 - TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
-- 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
+- 慢客户端隔离、长时间运行、时间戳回绕和真实接收端互操作测试仍不充分；启动失败回滚、重复 Stop、停止后重启及并发 Write/Stop 已由 S7 生命周期测试覆盖。
 
 ## 11. 扩展方法
 
@@ -1120,7 +1121,7 @@ src/media/protocol/
 
 ##### 12.9.7 详细执行计划
 
-计划状态：S0 到 S6 已完成，S7 待实施。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过未完成步骤直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
+计划状态：S0 到 S7 已完成（截至 2026-08-04）。下面的 `S0` 到 `S7` 是已执行的迁移步骤；后续新增能力应按 12.9.9 的生产化工作单独立项，不再把协议能力混入 façade 拆分。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
 
 ###### 12.9.7.1 每个阶段的固定工作流
 
@@ -1326,6 +1327,18 @@ S6 gate：`RtspServerProtocol` 头文件不再包含 multicast socket、endpoint
 
 S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，专用 RTSP CTest 和完整默认测试通过。
 
+###### S7 实施记录（2026-08-04）
+
+- **façade 头文件收缩**：`RtspServerProtocol` 只保留规范化配置/track 快照、Asio `io_context`/acceptor、`RtspSessionManager`、`RtspMulticastPublisher`、顶层 `PublisherStats` 和生命周期状态；connection、session、transport、RTP/RTCP 字段解析和 socket 细节均由对应子组件持有。新增 `lifecycle_generation_` 作为每轮 Start/Stop 的代际标识。
+- **Start 资源提交与失败回滚**：`Start()` 先在局部变量中完成 track/config 规范化、H264 参数集和 packetizer、multicast publisher、session context/manager 以及 acceptor 的创建和监听。只有所有资源成功后才在 mutex 内一次性提交成员并递增 generation；非法监听地址、open/bind/listen 失败时直接返回结构化错误，不留下半初始化成员或依赖 `Stop()` 清理失败状态。
+- **Write 异步编排**：pipeline 线程只校验并复制 track、packetizer、session manager/publisher 快照，完成 packetize 后把 immutable RTP payload 和 generation 一起投递到 `io_context`。executor 中先检查 `started_` 和 generation，再读取 session 播放状态、调用 per-track sender/transport 和共享 multicast publisher；停止后或重启前一轮的晚到任务会被闸门丢弃，输入 buffer 生命周期覆盖异步执行。
+- **Stop 关闭顺序与幂等**：`Stop()` 首先关闭媒体入口（`started_ = false`、generation 递增），然后取消并关闭 acceptor、关闭 multicast publisher，再通过 `std::promise` barrier 等待所有 session 在 Asio executor 上执行 `Stop()`，最后释放 work guard、停止并 join IO thread，之后才 reset acceptor/context/manager/publisher。重复 Stop、发送中 Stop 和 Stop 后重新 Start 均走同一顺序；若 Stop 从 IO thread 自身触发则避免自 join。
+- **统计快照聚合**：façade 先在自身 mutex 下复制顶层 stats、manager 和 publisher shared snapshot，再分别读取 manager client count 与 publisher RR 统计，避免跨线程直接访问 session/sender 可变字段或在回调中重复写 façade。停止状态返回已累计的顶层计数，活动客户端数按 manager 当前快照计算。
+- **迁移期清理与中文注释**：删除 façade 中遗留的直接 framing、UDP/RTCP 发送和 session registry 细节；新增/调整的异步生命周期、资源所有权、线程边界、generation 闸门、barrier 和统计聚合代码均补充详细中文注释，说明捕获对象生命周期、失败状态和重复调用语义。
+- **生命周期测试**：新增 `test/media/test_rtsp_server_lifecycle.cpp` 和 `test_rtsp_server_lifecycle` CTest，覆盖非法 listen host 的失败回滚、Stop 后 Write 拒绝、重复 Stop、Stop 后重新 Start，以及并发 Write/Stop；测试使用本地端口和有限等待，不依赖摄像头或外部 RTSP 服务。
+- **验证结果**：Debug 串行构建和 10 项定向 CTest 全部通过：`test_publisher_protocol`、`test_rtsp_request_parser`、`test_rtsp_pure_components`、`test_rtsp_connection`、`test_rtsp_session`、`test_rtsp_media_transport`、`test_rtp_sender`、`test_rtsp_multicast_publisher`、`test_rtsp_server_lifecycle`、`test_rtsp_server_protocol`，结果为 10/10。`rg` 检查确认 façade 不再包含 framing、RTCP 字段解析、UDP send/receive 或 AAC AU header 细节。
+- **阶段结论**：S7 gate 已满足，S0-S7 拆分计划完成。下一步转入 12.9.9 的生产化工作，优先级按鉴权/连接限制、慢客户端隔离、IPv6 和真实接收端互操作测试另行安排。
+
 ###### 12.9.7.10 建议提交序列
 
 | 提交 | 内容 | 依赖 | 可回滚边界 |
@@ -1437,6 +1450,7 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | `test_rtsp_media_transport` | transport factory 边界、UDP RTP/RTCP 发送、RTCP 来源校验和幂等关闭 |
 | `test_rtp_sender` | RTP header、sequence/timestamp 回绕、sender counters、SR 首包和 5 秒调度 |
 | `test_rtsp_multicast_publisher` | multicast 地址/端口校验、共享 RTP/SR 发送、RR reporter 聚合、幂等关闭和关闭后禁止重启 |
+| `test_rtsp_server_lifecycle` | Start 失败回滚、停止后 Write、重复 Stop、停止后重启和并发 Write/Stop |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1485,7 +1499,7 @@ FFmpeg publisher：
 
 RTSP Server publisher：
 
-S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection，S3 已落地 session/manager，S4 已落地 media transport，S5 已落地 per-track RTP sender，S6 已落地 server 级 multicast publisher；以下为当前路径。S7 的收缩范围和验收标准见 12.9.7.9。
+S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection，S3 已落地 session/manager，S4 已落地 media transport，S5 已落地 per-track RTP sender，S6 已落地 server 级 multicast publisher，S7 已完成 façade/统计/关闭路径收缩；以下为当前路径。完整阶段记录见 12.9.7。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
@@ -1528,6 +1542,7 @@ RTP/bitstream 工具：
 - `test/media/test_rtsp_media_transport.cpp`（TCP/UDP transport factory 和 UDP socket 边界测试）
 - `test/media/test_rtp_sender.cpp`（RTP sender header、回绕、统计和 SR 调度测试）
 - `test/media/test_rtsp_multicast_publisher.cpp`（共享 multicast publisher 的 socket、sender、RR 聚合和生命周期测试）
+- `test/media/test_rtsp_server_lifecycle.cpp`（`RtspServerProtocol` 启动失败回滚、Stop/Start 幂等和并发媒体关闭测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`

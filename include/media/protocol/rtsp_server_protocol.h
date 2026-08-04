@@ -67,4 +67,7 @@ private:
     std::shared_ptr<RtspMulticastPublisher> multicast_publisher_;
     PublisherStats stats_;
     bool started_{false};
+    // 每次 Start/Stop 都递增；异步媒体任务携带 generation，避免旧一轮
+    // Write 在停止后恰好落入下一轮 Start 的 io_context。
+    std::uint64_t lifecycle_generation_{0};
 };

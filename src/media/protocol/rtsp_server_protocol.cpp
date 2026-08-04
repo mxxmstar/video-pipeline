@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <future>
 #include <memory>
 #include <utility>
 
@@ -109,58 +110,33 @@ PublisherResult RtspServerProtocol::Start(
             "RTSP server requires supported tracks and at least one transport");
     }
 
-    config_ = config;
-    tracks_ = tracks;
-    NormalizeRtspTrackDefaults(tracks_);
-    config_.tracks = tracks_;
-    stats_ = {};
-    h264_packetizer_ = H264RtpPacketizer(
-        config_.rtsp.max_payload_size > 0
-            ? static_cast<std::size_t>(config_.rtsp.max_payload_size)
-            : 1420);
-    auto h264_track = std::find_if(tracks_.begin(), tracks_.end(), [](const auto& track) {
-        return track.media_type == MediaType::VIDEO &&
-               track.codec_type == CodecType::H264;
-    });
-    h264_parameter_sets_ = h264_track == tracks_.end()
+    auto normalized_tracks = tracks;
+    NormalizeRtspTrackDefaults(normalized_tracks);
+    auto normalized_config = config;
+    normalized_config.tracks = normalized_tracks;
+
+    const auto max_payload_size = normalized_config.rtsp.max_payload_size > 0
+        ? static_cast<std::size_t>(normalized_config.rtsp.max_payload_size)
+        : std::size_t{1420};
+    H264RtpPacketizer h264_packetizer(max_payload_size);
+    auto h264_track = std::find_if(
+        normalized_tracks.begin(),
+        normalized_tracks.end(),
+        [](const auto& track) {
+            return track.media_type == MediaType::VIDEO &&
+                   track.codec_type == CodecType::H264;
+        });
+    const auto h264_parameter_sets = h264_track == normalized_tracks.end()
         ? H264ParameterSets{}
         : H264Bitstream::ExtractParameterSets(h264_track->extra_data);
 
-    // S3 将 session 所需依赖冻结为窄化 context。context 保存配置快照，
-    // 需要读取 server 动态状态的能力通过回调提供，session 不再反向持有 façade。
-    session_context_ = std::make_shared<RtspSessionContext>();
-    session_context_->config = config_;
-    session_context_->tracks = tracks_;
-    session_context_->io_executor = io_.get_executor();
-    session_context_->build_sdp = [this](const std::string& host) {
-        return BuildSdp(host);
-    };
-    session_context_->configure_multicast =
-        [this](RtspTransportSpec& transport_spec,
-               const std::string& source_address) {
-            return multicast_publisher_ &&
-                   multicast_publisher_->Configure(transport_spec,
-                                                    source_address);
-        };
-    session_context_->get_multicast_sequence = [this]() {
-        return multicast_publisher_ ? multicast_publisher_->GetSequence() : 0;
-    };
-    session_context_->get_multicast_last_rtp_timestamp = [this]() {
-        return multicast_publisher_
-            ? multicast_publisher_->GetLastRtpTimestamp()
-            : 0;
-    };
-    session_context_->add_receiver_reports = [this](std::uint64_t count) {
-        AddRtcpReceiverReportsReceived(count);
-    };
-    session_manager_ =
-        std::make_shared<RtspSessionManager>(session_context_);
-
     boost::system::error_code ec;
-    auto address = boost::asio::ip::make_address(config_.listen_host, ec);
+    const auto address = boost::asio::ip::make_address(
+        normalized_config.listen_host,
+        ec);
     if (ec) {
         LOG_ERROR("RtspServerProtocol: invalid listen host {}: {}",
-                  config_.listen_host,
+                  normalized_config.listen_host,
                   ec.message());
         return PublisherResult::Failure(
             PublisherErrorCode::InvalidConfiguration,
@@ -168,57 +144,80 @@ PublisherResult RtspServerProtocol::Start(
             ec.value());
     }
 
-    const auto multicast_payload_type = h264_track == tracks_.end()
+    const auto multicast_payload_type = h264_track == normalized_tracks.end()
         ? std::uint8_t{96}
         : h264_track->rtp_payload_type;
-    const auto multicast_clock_rate = h264_track == tracks_.end()
+    const auto multicast_clock_rate = h264_track == normalized_tracks.end()
         ? std::uint32_t{90000}
         : h264_track->rtp_clock_rate;
-    // S6 将组播 socket、共享 RtpSender 和 RR 聚合移入独立 publisher；
-    // callback 只把匹配到的 RR 数量汇总回 façade 统计。
-    multicast_publisher_ = std::make_shared<RtspMulticastPublisher>(
+    // publisher 和 context 先在局部变量中建立。回调捕获这个 shared_ptr 快照，
+    // 不再在 session 的异步路径中裸读 façade 的 multicast_publisher_ 成员。
+    auto multicast_publisher = std::make_shared<RtspMulticastPublisher>(
         io_.get_executor(),
-        config_.rtsp,
+        normalized_config.rtsp,
         multicast_payload_type,
         multicast_clock_rate,
-        [this](std::uint64_t count) {
-            AddRtcpReceiverReportsReceived(count);
-        });
+        RtspMulticastPublisher::ReceiverReportHandler{});
 
-    boost::asio::ip::tcp::endpoint endpoint(address, config_.listen_port);
-    acceptor_ = std::make_unique<boost::asio::ip::tcp::acceptor>(io_);
-    acceptor_->open(endpoint.protocol(), ec);
+    auto session_context = std::make_shared<RtspSessionContext>();
+    session_context->config = normalized_config;
+    session_context->tracks = normalized_tracks;
+    session_context->io_executor = io_.get_executor();
+    session_context->build_sdp = [this](const std::string& host) {
+        return BuildSdp(host);
+    };
+    session_context->configure_multicast =
+        [multicast_publisher](RtspTransportSpec& transport_spec,
+                              const std::string& source_address) {
+            return multicast_publisher->Configure(transport_spec,
+                                                   source_address);
+        };
+    session_context->get_multicast_sequence = [multicast_publisher]() {
+        return multicast_publisher->GetSequence();
+    };
+    session_context->get_multicast_last_rtp_timestamp =
+        [multicast_publisher]() {
+            return multicast_publisher->GetLastRtpTimestamp();
+        };
+    session_context->add_receiver_reports = [this](std::uint64_t count) {
+        AddRtcpReceiverReportsReceived(count);
+    };
+    auto session_manager = std::make_shared<RtspSessionManager>(
+        session_context);
+
+    // acceptor 也先在局部完成 open/bind/listen。只有监听资源完整可用时，
+    // 才把 config/context/manager/publisher 一起提交给 façade。
+    auto acceptor = std::make_unique<boost::asio::ip::tcp::acceptor>(io_);
+    boost::asio::ip::tcp::endpoint endpoint(address, normalized_config.listen_port);
+    acceptor->open(endpoint.protocol(), ec);
     if (ec) {
         LOG_ERROR("RtspServerProtocol: acceptor open failed: {}", ec.message());
-        Stop();
         return PublisherResult::Failure(
             PublisherErrorCode::ResourceOpenFailed,
             "failed to open RTSP acceptor: " + ec.message(),
             ec.value());
     }
 
-    acceptor_->set_option(boost::asio::socket_base::reuse_address(true), ec);
+    acceptor->set_option(boost::asio::socket_base::reuse_address(true), ec);
     if (ec) {
         LOG_WARN("RtspServerProtocol: set reuse_address failed: {}", ec.message());
     }
 
-    acceptor_->bind(endpoint, ec);
+    acceptor->bind(endpoint, ec);
     if (ec) {
         LOG_ERROR("RtspServerProtocol: bind {}:{} failed: {}",
-                  config_.listen_host,
-                  config_.listen_port,
+                  normalized_config.listen_host,
+                  normalized_config.listen_port,
                   ec.message());
-        Stop();
         return PublisherResult::Failure(
             PublisherErrorCode::BindFailed,
             "failed to bind RTSP listen endpoint: " + ec.message(),
             ec.value());
     }
 
-    acceptor_->listen(boost::asio::socket_base::max_listen_connections, ec);
+    acceptor->listen(boost::asio::socket_base::max_listen_connections, ec);
     if (ec) {
         LOG_ERROR("RtspServerProtocol: listen failed: {}", ec.message());
-        Stop();
         return PublisherResult::Failure(
             PublisherErrorCode::ResourceOpenFailed,
             "failed to listen on RTSP endpoint: " + ec.message(),
@@ -227,9 +226,20 @@ PublisherResult RtspServerProtocol::Start(
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        config_ = std::move(normalized_config);
+        tracks_ = std::move(normalized_tracks);
+        h264_parameter_sets_ = h264_parameter_sets;
+        h264_packetizer_ = h264_packetizer;
+        session_context_ = std::move(session_context);
+        session_manager_ = std::move(session_manager);
+        multicast_publisher_ = std::move(multicast_publisher);
+        acceptor_ = std::move(acceptor);
+        stats_ = {};
+        ++lifecycle_generation_;
         started_ = true;
     }
 
+    io_.restart();
     work_guard_ = std::make_unique<WorkGuard>(io_.get_executor());
     AcceptNext();
     io_thread_ = std::thread([this]() {
@@ -242,13 +252,11 @@ PublisherResult RtspServerProtocol::Start(
 
 PublisherResult RtspServerProtocol::Write(
     const EncodedAccessUnit& access_unit) {
-    const auto* track = FindTrackById(tracks_, access_unit.track_id);
-    if (!track || access_unit.codec_type != track->codec_type) {
-        return PublisherResult::Failure(
-            PublisherErrorCode::InvalidMediaPacket,
-            "access unit does not match a configured RTSP track");
-    }
-
+    MediaTrackConfig track;
+    H264RtpPacketizer h264_packetizer;
+    std::shared_ptr<RtspSessionManager> session_manager;
+    std::shared_ptr<RtspMulticastPublisher> multicast_publisher;
+    std::uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!started_) {
@@ -256,21 +264,32 @@ PublisherResult RtspServerProtocol::Write(
                 PublisherErrorCode::InvalidState,
                 "RTSP server protocol must be started before writing");
         }
+
+        const auto* configured_track = FindTrackById(tracks_, access_unit.track_id);
+        if (!configured_track || access_unit.codec_type != configured_track->codec_type) {
+            return PublisherResult::Failure(
+                PublisherErrorCode::InvalidMediaPacket,
+                "access unit does not match a configured RTSP track");
+        }
+        track = *configured_track;
+        h264_packetizer = h264_packetizer_;
+        session_manager = session_manager_;
+        multicast_publisher = multicast_publisher_;
+        generation = lifecycle_generation_;
     }
 
     std::vector<RtpPayload> packets;
-    if (track->codec_type == CodecType::H264) {
+    if (track.codec_type == CodecType::H264) {
         if (access_unit.nals.empty()) {
             return PublisherResult::Failure(
                 PublisherErrorCode::InvalidMediaPacket,
                 "H264 access unit does not contain NAL units");
         }
         UpdateH264ParameterSets(access_unit);
-        packets = h264_packetizer_.Packetize(access_unit);
-    } else if (track->codec_type == CodecType::AAC) {
-        packets = AudioRtpPacketizer::Packetize(access_unit);
-    } else if (track->codec_type == CodecType::G711A ||
-               track->codec_type == CodecType::G711U) {
+        packets = h264_packetizer.Packetize(access_unit);
+    } else if (track.codec_type == CodecType::AAC ||
+               track.codec_type == CodecType::G711A ||
+               track.codec_type == CodecType::G711U) {
         packets = AudioRtpPacketizer::Packetize(access_unit);
     }
     if (packets.empty()) {
@@ -279,29 +298,57 @@ PublisherResult RtspServerProtocol::Write(
             "access unit could not be packetized for RTP");
     }
 
-    const auto sessions = session_manager_
-        ? session_manager_->Snapshot()
+    const auto sessions = session_manager
+        ? session_manager->Snapshot()
         : std::vector<std::shared_ptr<RtspClientSession>>{};
-    const auto payload_type = track->rtp_payload_type;
-    const auto has_multicast_receiver =
-        std::any_of(sessions.begin(), sessions.end(), [track](const auto& session) {
-            return session && session->IsPlayingMulticastTrack(track->track_id);
-        });
+    const auto payload_type = track.rtp_payload_type;
+    const auto track_id = track.track_id;
+    const auto is_h264 = track.codec_type == CodecType::H264;
 
-    for (const auto& packet : packets) {
-        for (const auto& session : sessions) {
-            if (session && session->IsPlaying() &&
-                !session->IsPlayingMulticastTrack(track->track_id)) {
-                session->SendRtpPayload(track->track_id, packet, payload_type);
+    // pipeline 线程只复制 session/publisher 快照和 immutable RTP payload，
+    // 实际读取 session 状态、修改 per-track sender 以及调用 transport 全部
+    // 在 io_context 上执行。这样 Stop() 可以通过 started_ 闸门阻止晚到媒体任务。
+    boost::asio::post(
+        io_,
+        [this,
+         sessions,
+         multicast_publisher,
+         packets = std::move(packets),
+         track_id,
+         payload_type,
+         is_h264,
+         generation]() mutable {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!started_ || lifecycle_generation_ != generation) {
+                    return;
+                }
             }
-        }
-        if (has_multicast_receiver && track->codec_type == CodecType::H264 &&
-            multicast_publisher_) {
-            // publisher 内部只有一份共享 sender/socket；多个 session 只影响
-            // 是否需要发布，不会让同一 access unit 重复产生 multicast packet。
-            multicast_publisher_->Publish(packet, payload_type);
-        }
-    }
+
+            const auto has_multicast_receiver =
+                is_h264 &&
+                std::any_of(
+                    sessions.begin(),
+                    sessions.end(),
+                    [track_id](const auto& session) {
+                        return session &&
+                               session->IsPlayingMulticastTrack(track_id);
+                    });
+
+            for (const auto& packet : packets) {
+                for (const auto& session : sessions) {
+                    if (session && session->IsPlaying() &&
+                        !session->IsPlayingMulticastTrack(track_id)) {
+                        session->SendRtpPayload(track_id, packet, payload_type);
+                    }
+                }
+                if (has_multicast_receiver && multicast_publisher) {
+                    // 共享 publisher 只接受一次 packet；客户端数量不会改变
+                    // multicast sender 的 sequence、SSRC 或 packet count。
+                    multicast_publisher->Publish(packet, payload_type);
+                }
+            }
+        });
 
     const auto data_size = access_unit.encoded_data
         ? access_unit.encoded_data->Size()
@@ -313,55 +360,101 @@ PublisherResult RtspServerProtocol::Write(
               return total;
           }();
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++stats_.packets_published;
-    stats_.bytes_published += data_size;
-    stats_.clients_connected = sessions.size();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++stats_.packets_published;
+        stats_.bytes_published += data_size;
+        stats_.clients_connected = sessions.size();
+    }
     return PublisherResult::Success();
 }
 
 void RtspServerProtocol::Stop() {
-    const auto sessions = session_manager_
-        ? session_manager_->Snapshot()
-        : std::vector<std::shared_ptr<RtspClientSession>>{};
-    for (auto& session : sessions) {
-        if (session) {
-            boost::asio::post(io_, [session]() {
-                session->Stop();
-            });
-        }
+    std::shared_ptr<RtspSessionManager> session_manager;
+    std::shared_ptr<RtspMulticastPublisher> multicast_publisher;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // 先关掉媒体入口，再处理 socket 和 session。已经排队的媒体任务会
+        // 在 executor 上再次检查这个闸门，避免 Stop() 之后产生新的发送。
+        started_ = false;
+        ++lifecycle_generation_;
+        session_manager = session_manager_;
+        multicast_publisher = multicast_publisher_;
     }
 
     boost::system::error_code ignored;
     if (acceptor_) {
+        // acceptor 的成员所有权暂不 reset，必须等 io thread join 后才能销毁，
+        // 避免最后一个 async_accept callback 与 unique_ptr 释放并发访问。
         acceptor_->cancel(ignored);
         acceptor_->close(ignored);
-        acceptor_.reset();
     }
-    if (multicast_publisher_) {
-        multicast_publisher_->Close();
+    if (multicast_publisher) {
+        // publisher 的 Close() 自身线程安全；先关闭 socket 可以立即阻止
+        // 已经从 pipeline 投递但尚未执行的 multicast send。
+        multicast_publisher->Close();
     }
 
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        started_ = false;
+    const auto sessions = session_manager
+        ? session_manager->Snapshot()
+        : std::vector<std::shared_ptr<RtspClientSession>>{};
+    const auto on_io_thread =
+        io_thread_.joinable() &&
+        io_thread_.get_id() == std::this_thread::get_id();
+
+    if (on_io_thread || !io_thread_.joinable()) {
+        // 没有可等待的 io thread 时只能同步执行 session close；正常 Stop
+        // 路径由下面的 barrier 在 Asio executor 上执行这一段。
+        for (const auto& session : sessions) {
+            if (session) {
+                session->Stop();
+            }
+        }
+    } else {
+        // 等待 session close handler 在停止 io_context 前执行完，确保
+        // connection、transport 和 manager 的关闭顺序真正发生在 executor 上。
+        auto closed = std::make_shared<std::promise<void>>();
+        auto closed_future = closed->get_future();
+        boost::asio::post(
+            io_,
+            [sessions, closed]() {
+                for (const auto& session : sessions) {
+                    if (session) {
+                        session->Stop();
+                    }
+                }
+                closed->set_value();
+            });
+        closed_future.wait();
     }
 
     work_guard_.reset();
     io_.stop();
-    if (io_thread_.joinable()) {
+    if (io_thread_.joinable() && !on_io_thread) {
         io_thread_.join();
     }
-    if (session_manager_) {
-        session_manager_->Clear();
-        session_manager_.reset();
+
+    if (!on_io_thread) {
+        if (session_manager) {
+            session_manager->Clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (session_manager_ == session_manager) {
+                session_manager_.reset();
+            }
+            if (multicast_publisher_ == multicast_publisher) {
+                multicast_publisher_.reset();
+            }
+            session_context_.reset();
+            acceptor_.reset();
+        }
+        io_.restart();
     }
-    multicast_publisher_.reset();
-    session_context_.reset();
-    io_.restart();
 }
 
 std::string RtspServerProtocol::GetOutputUrl() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!config_.url.empty()) {
         return config_.url;
     }
@@ -375,12 +468,26 @@ std::string RtspServerProtocol::GetOutputUrl() const {
 }
 
 PublisherStats RtspServerProtocol::GetStats() const {
-    const auto clients_connected = session_manager_
-        ? session_manager_->Size()
+    std::shared_ptr<RtspSessionManager> session_manager;
+    std::shared_ptr<RtspMulticastPublisher> multicast_publisher;
+    PublisherStats stats;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats = stats_;
+        session_manager = session_manager_;
+        multicast_publisher = multicast_publisher_;
+    }
+    // manager 自己保护 registry；protocol mutex 不跨越 Size()，避免统计读取
+    // 与 session closed callback 形成锁顺序反转。
+    stats.clients_connected = session_manager
+        ? session_manager->Size()
         : std::size_t{0};
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto stats = stats_;
-    stats.clients_connected = clients_connected;
+    // multicast RR 由 publisher 自己累计并输出 snapshot；session RR 仍由
+    // session context 的窄回调累计到 stats_，两条来源在这里统一合并。
+    if (multicast_publisher) {
+        stats.rtcp_receiver_reports_received +=
+            multicast_publisher->GetStats().receiver_reports_received;
+    }
     return stats;
 }
 
@@ -396,6 +503,12 @@ std::string RtspServerProtocol::BuildSdp(const std::string& host_for_sdp) const 
 }
 
 void RtspServerProtocol::AcceptNext() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!started_ || !acceptor_) {
+            return;
+        }
+    }
     if (!acceptor_) {
         return;
     }
@@ -408,19 +521,22 @@ void RtspServerProtocol::AcceptNext() {
 
 void RtspServerProtocol::OnAccepted(boost::system::error_code ec,
                                     boost::asio::ip::tcp::socket socket) {
+    std::shared_ptr<RtspSessionManager> session_manager;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!started_) {
             return;
         }
+        session_manager = session_manager_;
     }
 
     if (!ec) {
-        if (session_manager_) {
-            auto session = session_manager_->Create(std::move(socket));
+        if (session_manager) {
+            auto session = session_manager->Create(std::move(socket));
+            const auto client_count = session_manager->Size();
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                stats_.clients_connected = session_manager_->Size();
+                stats_.clients_connected = client_count;
             }
             session->Start();
         }
