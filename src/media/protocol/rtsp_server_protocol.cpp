@@ -3,6 +3,7 @@
 #include "common/log/logger.h"
 #include "media/protocol/audio_rtp_packetizer.h"
 #include "media/protocol/rtcp_packet_codec.h"
+#include "media/protocol/rtsp/rtsp_connection.h"
 #include "media/protocol/rtsp/rtsp_request_parser.h"
 #include "media/protocol/rtsp/rtsp_builders.h"
 #include "media/protocol/rtsp/rtsp_transport_spec.h"
@@ -30,7 +31,6 @@
 namespace {
 
 constexpr std::size_t kRtpHeaderSize = 12;
-constexpr std::size_t kTcpInterleavedHeaderSize = 4;
 constexpr std::chrono::seconds kRtcpSenderReportInterval{5};
 
 bool IsIpv4Multicast(const boost::asio::ip::address& address) {
@@ -234,27 +234,47 @@ void NormalizeRtspTrackDefaults(std::vector<MediaTrackConfig>& tracks) {
 class RtspServerProtocol::ClientSession
     : public std::enable_shared_from_this<RtspServerProtocol::ClientSession> {
 public:
-    ClientSession(boost::asio::ip::tcp::socket socket,
-                  RtspServerProtocol& owner,
-                  std::uint64_t id)
-        : socket_(std::move(socket)),
-          owner_(owner),
-          id_(id),
-          session_id_(MakeSessionId(id)) {
+    static std::shared_ptr<ClientSession> Create(
+        boost::asio::ip::tcp::socket socket,
+        RtspServerProtocol& owner,
+        std::uint64_t id) {
+        auto session = std::shared_ptr<ClientSession>(
+            new ClientSession(owner, id));
+        const auto weak = std::weak_ptr<ClientSession>(session);
+        session->connection_ = std::make_shared<RtspConnection>(
+            std::move(socket),
+            [weak](RtspRequest request) {
+                if (const auto self = weak.lock()) {
+                    self->HandleRequest(request);
+                }
+            },
+            [weak](std::uint8_t channel,
+                   std::vector<std::uint8_t> payload) {
+                if (const auto self = weak.lock()) {
+                    self->HandleInterleavedFrame(channel, std::move(payload));
+                }
+            },
+            [weak](const RtspRequestParseResult& parse_result) {
+                if (const auto self = weak.lock()) {
+                    self->HandleConnectionParseError(parse_result);
+                }
+            },
+            [weak](const boost::system::error_code& ec) {
+                if (const auto self = weak.lock()) {
+                    self->OnConnectionClosed(ec);
+                }
+            });
+        return session;
     }
 
     void Start() {
-        DoRead();
+        if (connection_) {
+            connection_->Start();
+        }
     }
 
     void Stop() {
-        playing_ = false;
-        ready_ = false;
-
-        boost::system::error_code ignored;
-        CloseAllUdpSockets();
-        socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
-        socket_.close(ignored);
+        Close();
     }
 
     bool IsPlaying() const {
@@ -310,6 +330,12 @@ public:
     }
 
 private:
+    ClientSession(RtspServerProtocol& owner, std::uint64_t id)
+        : owner_(owner),
+          id_(id),
+          session_id_(MakeSessionId(id)) {
+    }
+
     // 每个 SDP track 都有独立的 RTP/RTCP 状态。音频和视频不能共用 SSRC、
     // sequence 或 timestamp，否则播放器会把不同媒体流混到同一条 RTP 时间线里。
     struct TrackSessionState {
@@ -337,81 +363,37 @@ private:
         bool ready{false};
     };
 
-    void DoRead() {
-        auto self = shared_from_this();
-        socket_.async_read_some(
-            boost::asio::buffer(read_chunk_),
-            [self](boost::system::error_code ec, std::size_t bytes) {
-                if (ec) {
-                    self->Close();
-                    return;
-                }
-                self->read_buffer_.insert(self->read_buffer_.end(),
-                                          self->read_chunk_.data(),
-                                          self->read_chunk_.data() + bytes);
-                self->ProcessReadBuffer();
-                if (!self->closed_ && !self->close_after_write_) {
-                    self->DoRead();
-                }
-            });
+    void HandleInterleavedFrame(
+        std::uint8_t channel,
+        std::vector<std::uint8_t> payload) {
+        auto* state = FindTrackStateByRtcpChannel(channel);
+        if (state && !payload.empty()) {
+            HandleRtcpPacket(*state,
+                             payload.data(),
+                             payload.size(),
+                             "tcp-interleaved");
+        }
     }
 
-    void ProcessReadBuffer() {
-        while (!read_buffer_.empty()) {
-            if (read_buffer_[0] == '$') {
-                // RTSP over TCP 的 interleaved RTP/RTCP frame 与文本 request
-                // 共用一条连接。只有首字节是 '$' 才进入二进制 framing；否则
-                // 把 buffer 交给 request parser，避免把 '$' 误当作 request-line。
-                if (read_buffer_.size() < 4) {
-                    return;
-                }
-                const auto channel = read_buffer_[1];
-                const auto length = ReadU16(read_buffer_.data() + 2);
-                const auto frame_size = kTcpInterleavedHeaderSize + length;
-                if (read_buffer_.size() < frame_size) {
-                    return;
-                }
-
-                auto* state = FindTrackStateByRtcpChannel(channel);
-                if (state && length > 0) {
-                    HandleRtcpPacket(*state,
-                                     read_buffer_.data() + kTcpInterleavedHeaderSize,
-                                     length,
-                                     "tcp-interleaved");
-                }
-                read_buffer_.erase(read_buffer_.begin(),
-                                   read_buffer_.begin() +
-                                       static_cast<std::ptrdiff_t>(frame_size));
-                continue;
-            }
-
-            RtspRequest request;
-            // parser 只消费一条完整 request，剩余字节继续留在 read_buffer_，
-            // 从而同时支持 TCP 分片、pipelining 和 request 后紧跟 interleaved
-            // frame 的情况。
-            const auto parse_result = request_parser_.Parse(
-                std::span<const std::uint8_t>{read_buffer_}, request);
-            if (parse_result.status == RtspRequestParseStatus::NeedMoreData) {
-                return;
-            }
-            if (parse_result.status == RtspRequestParseStatus::Error) {
-                LOG_WARN("RTSP request parse failed at byte {}: {}",
-                         parse_result.error_offset,
-                         parse_result.error);
-                read_buffer_.clear();
-                // framing 错误后无法可靠定位下一条 request。停止 RTP 发送，
-                // 先把 400 写完再关闭 TCP，避免错误数据继续堆入发送队列。
-                playing_ = false;
-                close_after_write_ = true;
-                SendRtsp(RtspResponseBuilder::Build(400, "Bad Request", {}));
-                return;
-            }
-
-            read_buffer_.erase(read_buffer_.begin(),
-                               read_buffer_.begin() +
-                                   static_cast<std::ptrdiff_t>(parse_result.consumed));
-            HandleRequest(request);
+    void HandleConnectionParseError(
+        const RtspRequestParseResult& parse_result) {
+        LOG_WARN("RTSP request parse failed at byte {}: {}",
+                 parse_result.error_offset,
+                 parse_result.error);
+        // framing 错误后无法可靠定位下一条 request。停止 RTP 发送，
+        // 先把 400 写完再关闭 TCP，避免错误数据继续堆入发送队列。
+        playing_ = false;
+        if (!connection_ || closed_) {
+            return;
         }
+        connection_->SendRtsp(RtspResponseBuilder::Build(400, "Bad Request", {}));
+        connection_->CloseAfterFlush();
+    }
+
+    void OnConnectionClosed(const boost::system::error_code&) {
+        // connection 已经完成 socket cancel/close；session 只清理 UDP 状态
+        // 和 registry，不再次直接触碰 TCP socket。
+        Close();
     }
 
     void HandleRequest(const RtspRequest& request) {
@@ -574,22 +556,6 @@ private:
         SendRtsp(RtspResponseBuilder::Build(405, "Method Not Allowed", cseq));
     }
 
-    std::vector<std::uint8_t> BuildInterleavedFrame(
-        const std::vector<std::uint8_t>& packet,
-        int channel) const {
-        std::vector<std::uint8_t> frame(kTcpInterleavedHeaderSize + packet.size());
-
-        frame[0] = '$';
-        frame[1] = static_cast<std::uint8_t>(channel);
-        WriteU16(frame.data() + 2, static_cast<std::uint16_t>(packet.size()));
-
-        std::copy(packet.begin(),
-                  packet.end(),
-                  frame.begin() +
-                      static_cast<std::ptrdiff_t>(kTcpInterleavedHeaderSize));
-        return frame;
-    }
-
     TrackSessionState* FindTrackState(int track_id) {
         auto it = track_states_.find(track_id);
         return it == track_states_.end() ? nullptr : &it->second;
@@ -683,14 +649,6 @@ private:
         return oss.str();
     }
 
-    std::vector<std::uint8_t> BuildInterleavedRtpFrame(
-        TrackSessionState& state,
-        const RtpPayload& payload,
-        std::uint8_t payload_type) {
-        return BuildInterleavedFrame(BuildRtpPacket(state, payload, payload_type),
-                                     state.rtp_channel);
-    }
-
     std::vector<std::uint8_t> BuildRtpPacket(
         TrackSessionState& state,
         const RtpPayload& payload,
@@ -714,12 +672,13 @@ private:
     void SendTcpInterleavedRtpPayload(TrackSessionState& state,
                                       const RtpPayload& payload,
                                       std::uint8_t payload_type) {
-        auto self = shared_from_this();
-        auto frame = BuildInterleavedRtpFrame(state, payload, payload_type);
-        boost::asio::post(socket_.get_executor(),
-                          [self, frame = std::move(frame)]() mutable {
-                              self->EnqueueWrite(std::move(frame));
-                          });
+        if (connection_) {
+            // TCP framing 和唯一写队列由 RtspConnection 负责；session 只
+            // 提供裸 RTP packet，避免在两个层级重复维护 '$'/length header。
+            connection_->SendInterleaved(
+                static_cast<std::uint8_t>(state.rtp_channel),
+                BuildRtpPacket(state, payload, payload_type));
+        }
         MaybeSendRtcpSenderReport(state);
     }
 
@@ -733,7 +692,7 @@ private:
             BuildRtpPacket(state, payload, payload_type));
 
         boost::asio::post(
-            socket_.get_executor(),
+            owner_.io_.get_executor(),
             [self, track_id, packet]() {
                 auto* state = self->FindTrackState(track_id);
                 if (!state || !state->udp_rtp_socket ||
@@ -765,12 +724,11 @@ private:
             state.rtcp_packet_count,
             state.rtcp_octet_count);
         if (state.transport_spec.IsTcpInterleaved()) {
-            auto self = shared_from_this();
-            auto frame = BuildInterleavedFrame(report, state.rtcp_channel);
-            boost::asio::post(socket_.get_executor(),
-                              [self, frame = std::move(frame)]() mutable {
-                                  self->EnqueueWrite(std::move(frame));
-                              });
+            if (connection_) {
+                connection_->SendInterleaved(
+                    static_cast<std::uint8_t>(state.rtcp_channel),
+                    std::move(report));
+            }
             return;
         }
 
@@ -786,7 +744,7 @@ private:
             std::make_shared<std::vector<std::uint8_t>>(std::move(report));
 
         boost::asio::post(
-            socket_.get_executor(),
+            owner_.io_.get_executor(),
             [self, track_id, packet]() {
                 auto* state = self->FindTrackState(track_id);
                 if (!state || !state->udp_rtcp_socket ||
@@ -1011,7 +969,7 @@ private:
         CloseUdpSockets(state);
 
         boost::system::error_code ec;
-        const auto remote_tcp_endpoint = socket_.remote_endpoint(ec);
+        const auto remote_tcp_endpoint = connection_->RemoteEndpoint(ec);
         if (ec) {
             LOG_WARN("RTSP SETUP UDP failed to resolve client endpoint: {}",
                      ec.message());
@@ -1041,15 +999,15 @@ private:
             ? boost::asio::ip::address{boost::asio::ip::address_v6::any()}
             : boost::asio::ip::address{boost::asio::ip::address_v4::any()};
 
-        const auto local_tcp_endpoint = socket_.local_endpoint(ec);
+        const auto local_tcp_endpoint = connection_->LocalEndpoint(ec);
         if (!ec && local_tcp_endpoint.address().is_v6() == destination.is_v6()) {
             bind_address = local_tcp_endpoint.address();
         }
 
         state.udp_rtp_socket =
-            std::make_unique<boost::asio::ip::udp::socket>(socket_.get_executor());
+            std::make_unique<boost::asio::ip::udp::socket>(owner_.io_.get_executor());
         state.udp_rtcp_socket =
-            std::make_unique<boost::asio::ip::udp::socket>(socket_.get_executor());
+            std::make_unique<boost::asio::ip::udp::socket>(owner_.io_.get_executor());
 
         state.udp_rtp_socket->open(protocol, ec);
         if (ec) {
@@ -1112,44 +1070,17 @@ private:
     }
 
     void SendRtsp(std::string response) {
-        std::vector<std::uint8_t> bytes(response.begin(), response.end());
-        EnqueueWrite(std::move(bytes));
-    }
-
-    void EnqueueWrite(std::vector<std::uint8_t> data) {
-        const bool writing = !write_queue_.empty();
-        write_queue_.push_back(std::move(data));
-        if (!writing) {
-            DoWrite();
+        if (connection_) {
+            connection_->SendRtsp(std::move(response));
         }
-    }
-
-    void DoWrite() {
-        if (write_queue_.empty()) {
-            return;
-        }
-
-        auto self = shared_from_this();
-        boost::asio::async_write(
-            socket_,
-            boost::asio::buffer(write_queue_.front()),
-            [self](boost::system::error_code ec, std::size_t) {
-                if (ec) {
-                    self->Close();
-                    return;
-                }
-                self->write_queue_.pop_front();
-                if (self->write_queue_.empty() && self->close_after_write_) {
-                    self->Close();
-                    return;
-                }
-                self->DoWrite();
-            });
     }
 
     std::string LocalAddress() const {
+        if (!connection_) {
+            return "127.0.0.1";
+        }
         boost::system::error_code ec;
-        const auto endpoint = socket_.local_endpoint(ec);
+        const auto endpoint = connection_->LocalEndpoint(ec);
         return ec ? "127.0.0.1" : endpoint.address().to_string();
     }
 
@@ -1181,28 +1112,23 @@ private:
         playing_ = false;
         ready_ = false;
 
-        boost::system::error_code ignored;
         CloseAllUdpSockets();
-        socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ignored);
-        socket_.close(ignored);
+        if (connection_) {
+            connection_->Close();
+        }
         owner_.RemoveSession(id_);
     }
 
-    boost::asio::ip::tcp::socket socket_;
     RtspServerProtocol& owner_;
+    std::shared_ptr<RtspConnection> connection_;
     std::uint64_t id_{0};
     std::string session_id_;
     std::string requested_url_;
-    std::array<std::uint8_t, 8192> read_chunk_{};
-    std::vector<std::uint8_t> read_buffer_;
-    RtspRequestParser request_parser_;
-    std::deque<std::vector<std::uint8_t>> write_queue_;
     // key 对应 MediaTrackConfig::track_id，也就是 SDP/SETUP 中的 trackN。
     std::map<int, TrackSessionState> track_states_;
     bool ready_{false};
     std::atomic_bool playing_{false};
     bool closed_{false};
-    bool close_after_write_{false};
 };
 
 RtspServerProtocol::RtspServerProtocol()
@@ -1948,8 +1874,8 @@ PublisherStats RtspServerProtocol::GetStats() const {
     auto stats = stats_;
     std::vector<std::shared_ptr<ClientSession>> sessions;
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        if (auto session = it->lock()) {
-            sessions.push_back(std::move(session));
+        if (*it) {
+            sessions.push_back(*it);
             ++it;
         } else {
             it = sessions_.erase(it);
@@ -1975,8 +1901,7 @@ void RtspServerProtocol::RemoveSession(std::uint64_t session_id) {
     sessions_.erase(
         std::remove_if(sessions_.begin(),
                        sessions_.end(),
-                       [session_id](const std::weak_ptr<ClientSession>& weak) {
-                           auto session = weak.lock();
+                       [session_id](const std::shared_ptr<ClientSession>& session) {
                            return !session || session->Id() == session_id;
                        }),
         sessions_.end());
@@ -2010,7 +1935,7 @@ void RtspServerProtocol::OnAccepted(boost::system::error_code ec,
             session_id = next_session_id_++;
         }
 
-        auto session = std::make_shared<ClientSession>(std::move(socket), *this, session_id);
+        auto session = ClientSession::Create(std::move(socket), *this, session_id);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             sessions_.push_back(session);
@@ -2028,8 +1953,8 @@ void RtspServerProtocol::SnapshotSessions(
     std::vector<std::shared_ptr<ClientSession>>& sessions) const {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        if (auto session = it->lock()) {
-            sessions.push_back(std::move(session));
+        if (*it) {
+            sessions.push_back(*it);
             ++it;
         } else {
             it = sessions_.erase(it);

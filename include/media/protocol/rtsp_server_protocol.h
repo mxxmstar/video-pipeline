@@ -122,7 +122,9 @@ private:
     bool multicast_ready_{false};
 
     mutable std::mutex mutex_;
-    mutable std::vector<std::weak_ptr<ClientSession>> sessions_;
+    // S2 阶段由 server registry 持有活动 session；connection 回调只保存
+    // weak_ptr，关闭时 RemoveSession 移除唯一 registry 所有权并允许释放。
+    mutable std::vector<std::shared_ptr<ClientSession>> sessions_;
     std::uint64_t next_session_id_{1};
     PublisherStats stats_;
     bool started_{false};

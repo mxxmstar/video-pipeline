@@ -796,11 +796,12 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 可维护性与测试
 
 - `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
-  - 状态：S0 基线、目录分层和 S1 纯组件拆分已完成，S2 及后续类拆分尚未开始。
+  - 状态：S0 基线、目录分层、S1 纯组件拆分和 S2 TCP connection 拆分已完成，S3-S7 类拆分尚待实施。
   - 规划日期：2026-08-03。
   - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
   - S0 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S0 实施记录。
   - S1 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S1 实施记录。
+  - S2 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S2 实施记录。
 - 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
 - TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
 - 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
@@ -1195,6 +1196,16 @@ S1 gate：四个组件不依赖 `RtspServerProtocol`、Boost.Asio socket 或全�
 
 S2 gate：只有 `RtspConnection` 直接拥有并读写客户端 TCP socket；`ClientSession` 无法绕过 connection 发起 `async_write`。
 
+###### S2 实施记录（2026-08-04）
+
+- **connection 组件落地**：新增 `include/media/protocol/rtsp/rtsp_connection.h` 和 `src/media/protocol/rtsp/rtsp_connection.cpp`。`RtspConnection` 独占一个 TCP socket，负责 `RtspRequestParser`、TCP read buffer、RTSP/interleaved frame 分流、唯一串行 write queue、`SendRtsp()`/`SendInterleaved()`、`Close()`/`CloseAfterFlush()` 以及 local/remote endpoint 查询；组件不依赖 `RtspServerProtocol`、RTSP method、track 或 codec 状态。
+- **读取与错误边界**：迁移原 `ClientSession` 的 `DoRead()`/`ProcessReadBuffer()`，保留 request 分片、pipelining、文本与 `$` frame 交错和 interleaved frame 分片语义。parser error 通过窄化回调通知 session；没有上层错误回调时 connection 自行排队 400 response 并在写完后关闭。
+- **写入与关闭生命周期**：RTSP response、RTP 和 RTCP 均进入同一队列，任何时刻只允许一个 `async_write`。`CloseAfterFlush()` 停止继续读入并等待队列排空；`Close()`/对端断开/写失败均幂等关闭，`OnClosed` 最多回调一次。关闭时保留正在被 `async_write` 引用的 buffer，避免异步回调仍在使用 deque 元素时提前清空。
+- **session 接回与所有权修复**：`ClientSession` 改为通过 `Create()` 创建 connection，使用 `weak_ptr` 回调接收 request、interleaved frame、parse error 和 closed 事件，不再持有 TCP socket、read buffer、request parser 或 TCP write queue。UDP socket 改用 server `io_context` executor。为避免 accept 回调返回后 session 因 registry 只有 `weak_ptr` 而被释放，S2 将 `RtspServerProtocol::sessions_` 改为持有活动 session 的 `shared_ptr`；connection 回调仍为 `weak_ptr`，关闭时由 session 移除 registry，避免形成引用环。
+- **测试补充**：新增 `test/media/test_rtsp_connection.cpp` 和 `test_rtsp_connection` CTest，覆盖分片 RTSP request、request callback、RTSP response 与 interleaved frame 的串行写入、incoming interleaved frame callback 和 `CloseAfterFlush`。本地 socket fixture 使用回环地址和有限超时，避免把 `0.0.0.0` 作为客户端连接目标。
+- **验证结果**：使用 `cmake --build build --config Debug --target test_rtsp_connection --parallel 1` 构建通过；`ctest --test-dir build -C Debug -R "test_(rtsp_connection|rtsp_pure_components|rtsp_request_parser|rtsp_server_protocol|publisher_protocol)" --output-on-failure --timeout 30` 五项测试全部通过，总耗时约 1.20 秒。
+- **阶段结论**：S2 gate 已满足；下一阶段入口为 S3 `RtspClientSession` 与 `RtspSessionManager`，继续拆分 RTSP 状态机和 session registry，保持当前媒体发送行为不变。
+
 ###### 12.9.7.5 S3：提取 `RtspClientSession` 与 `RtspSessionManager`
 
 目标：把嵌套 session 变成可测试的独立状态机，并去除其对 façade 的原始反向引用。
@@ -1372,6 +1383,7 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | `test_publisher_protocol` | 配置基础校验、Annex-B/AVCC、H264 FU-A、RTSP Transport 解析 |
 | `test_rtsp_request_parser` | RTSP request 分片、body、pipelining、header 规范和畸形输入 |
 | `test_rtsp_pure_components` | RTSP response/SDP、AAC/G711 payload、RTCP SR/compound/report block 纯组件边界 |
+| `test_rtsp_connection` | TCP request 分片、RTSP/interleaved frame 分流、串行写队列和 `CloseAfterFlush` |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1420,7 +1432,7 @@ FFmpeg publisher：
 
 RTSP Server publisher：
 
-S0 已完成目录迁移，S1 已落地纯组件；以下为当前路径。后续 S2-S7 的目标布局和分批迁移范围见 12.9.5。
+S0 已完成目录迁移，S1 已落地纯组件，S2 已落地 TCP connection；以下为当前路径。后续 S3-S7 的目标布局和分批迁移范围见 12.9.5。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
@@ -1428,12 +1440,14 @@ S0 已完成目录迁移，S1 已落地纯组件；以下为当前路径。后�
 - `include/media/protocol/rtcp_packet_codec.h`
 - `include/media/protocol/rtsp/rtsp_request_parser.h`
 - `include/media/protocol/rtsp/rtsp_builders.h`（统一声明 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
+- `include/media/protocol/rtsp/rtsp_connection.h`
 - `include/media/protocol/rtsp/rtsp_transport_spec.h`
 - `src/media/protocol/audio_rtp_packetizer.cpp`
 - `src/media/protocol/rtcp_packet_codec.cpp`
 - `src/media/protocol/rtsp_server_protocol_adapter.cpp`
 - `src/media/protocol/rtsp_server_protocol.cpp`
 - `src/media/protocol/rtsp/rtsp_request_parser.cpp`
+- `src/media/protocol/rtsp/rtsp_connection.cpp`
 - `src/media/protocol/rtsp/rtsp_transport_spec.cpp`
 - `src/media/protocol/rtsp/rtsp_builders.cpp`（统一实现 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
 
@@ -1448,6 +1462,7 @@ RTP/bitstream 工具：
 
 - `test/media/test_publisher_protocol.cpp`
 - `test/media/test_rtsp_pure_components.cpp`（`RtspResponseBuilder`、`RtspSdpBuilder`、`AudioRtpPacketizer`、`RtcpPacketCodec` 单元测试）
+- `test/media/test_rtsp_connection.cpp`（`RtspConnection` 的 socket fixture、framing、写队列和关闭测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`
