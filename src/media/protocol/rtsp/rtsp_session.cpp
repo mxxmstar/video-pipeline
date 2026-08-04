@@ -107,8 +107,13 @@
             return;
         }
 
-        if (state->media_transport) {
-            auto packet = BuildRtpPacket(*state, payload, payload_type);
+        if (state->sender && state->media_transport) {
+            // sender 只负责把 payload 变成完整 RTP bytes；socket/framing 仍
+            // 完全由 transport 决定，TCP 和 UDP 因而共享同一套 sequence/SSRC。
+            auto packet = state->sender->BuildRtpPacket(payload, payload_type);
+            if (packet.empty()) {
+                return;
+            }
             state->media_transport->SendRtp(std::move(packet));
             MaybeSendRtcpSenderReport(*state);
         }
@@ -377,8 +382,9 @@ RtspClientSession::RtspClientSession(
         state = {};
         state.track_id = track.track_id;
         state.track = &track;
-        state.ssrc = rtsp_session_detail::RandomU32();
-        state.sequence = rtsp_session_detail::RandomU16();
+        state.sender = std::make_unique<RtpSender>(
+            RtpSender::CreateDefault(track.rtp_payload_type,
+                                     track.rtp_clock_rate));
         return state;
     }
 
@@ -423,14 +429,16 @@ RtspClientSession::RtspClientSession(
                 continue;
             }
 
-            const auto rtp_sequence =
-                state.transport_spec.mode == RtspTransportMode::UdpMulticast
-                    ? context_->get_multicast_sequence()
-                    : state.sequence;
-            const auto rtp_timestamp =
-                state.transport_spec.mode == RtspTransportMode::UdpMulticast
-                    ? context_->get_multicast_last_rtp_timestamp()
-                    : state.last_rtp_timestamp;
+            std::uint16_t rtp_sequence = 0;
+            std::uint32_t rtp_timestamp = 0;
+            if (state.transport_spec.mode == RtspTransportMode::UdpMulticast) {
+                rtp_sequence = context_->get_multicast_sequence();
+                rtp_timestamp = context_->get_multicast_last_rtp_timestamp();
+            } else if (state.sender) {
+                const auto snapshot = state.sender->Snapshot();
+                rtp_sequence = snapshot.next_sequence;
+                rtp_timestamp = snapshot.last_rtp_timestamp;
+            }
             if (!first) {
                 oss << ",";
             }
@@ -444,41 +452,15 @@ RtspClientSession::RtspClientSession(
 
 
 
-    std::vector<std::uint8_t> RtspClientSession::BuildRtpPacket(
-        RtspClientSession::TrackSessionState& state,
-        const RtpPayload& payload,
-        std::uint8_t payload_type) {
-        auto packet = rtsp_session_detail::MakeRtpPacket(payload,
-                                    payload_type,
-                                    state.ssrc,
-                                    state.sequence,
-                                    state.last_rtp_timestamp);
-        RecordRtcpSenderStats(state, payload);
-        return packet;
-    }
-
-
-
-    void RtspClientSession::RecordRtcpSenderStats(RtspClientSession::TrackSessionState& state,
-                               const RtpPayload& payload) {
-        // RTCP SR 的 sender octet count 只统计 RTP payload 字节数，不包含 RTP header。
-        ++state.rtcp_packet_count;
-        state.rtcp_octet_count += static_cast<std::uint32_t>(payload.payload.size());
-    }
-
-
-
     void RtspClientSession::MaybeSendRtcpSenderReport(RtspClientSession::TrackSessionState& state) {
-        if (state.rtcp_packet_count == 0 ||
-            !rtsp_session_detail::ShouldSendRtcpSenderReport(state.next_rtcp_sr_time)) {
+        if (!state.sender || !state.sender->ShouldSendSenderReport()) {
             return;
         }
 
-        auto report = RtcpPacketCodec::BuildSenderReport(
-            state.ssrc,
-            state.last_rtp_timestamp,
-            state.rtcp_packet_count,
-            state.rtcp_octet_count);
+        auto report = state.sender->BuildSenderReport();
+        if (report.empty()) {
+            return;
+        }
         if (state.media_transport) {
             state.media_transport->SendRtcp(std::move(report));
         }
@@ -615,7 +597,11 @@ RtspClientSession::RtspClientSession(
             }
 
             // Receiver Report 里的 source_ssrc 应该指向本 server 发送 RTP 使用的 SSRC。
-            const bool matches_sender = block.source_ssrc == state.ssrc;
+            const auto sender_ssrc = state.sender
+                ? state.sender->Snapshot().ssrc
+                : 0;
+            const bool matches_sender = state.sender &&
+                                        block.source_ssrc == sender_ssrc;
             if (matches_sender || !state.has_receiver_report) {
                 state.last_receiver_report = block;
                 state.last_receiver_reporter_ssrc = reporter_ssrc;

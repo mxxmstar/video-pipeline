@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <functional>
@@ -11,7 +10,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <random>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -23,6 +21,7 @@
 #include "media/publisher/publisher_config.h"
 #include "media/protocol/h264_rtp_packetizer.h"
 #include "media/protocol/rtcp_packet_codec.h"
+#include "media/protocol/rtp_sender.h"
 #include "media/protocol/rtsp/rtsp_builders.h"
 #include "media/protocol/rtsp/rtsp_connection.h"
 #include "media/protocol/rtsp/rtsp_media_transport.h"
@@ -31,69 +30,11 @@
 
 namespace rtsp_session_detail {
 
-constexpr std::size_t kRtpHeaderSize = 12;
-constexpr std::chrono::seconds kRtcpSenderReportInterval{5};
-
-inline std::uint32_t RandomU32() {
-    static thread_local std::mt19937 generator{std::random_device{}()};
-    return std::uniform_int_distribution<std::uint32_t>{}(generator);
-}
-
-inline std::uint16_t RandomU16() {
-    static thread_local std::mt19937 generator{std::random_device{}()};
-    return std::uniform_int_distribution<std::uint16_t>{}(generator);
-}
-
-inline void WriteU16(std::uint8_t* data, std::uint16_t value) {
-    data[0] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
-    data[1] = static_cast<std::uint8_t>(value & 0xFF);
-}
-
-inline void WriteU32(std::uint8_t* data, std::uint32_t value) {
-    data[0] = static_cast<std::uint8_t>((value >> 24) & 0xFF);
-    data[1] = static_cast<std::uint8_t>((value >> 16) & 0xFF);
-    data[2] = static_cast<std::uint8_t>((value >> 8) & 0xFF);
-    data[3] = static_cast<std::uint8_t>(value & 0xFF);
-}
-
 inline std::uint32_t ReadU32(const std::uint8_t* data) {
     return (static_cast<std::uint32_t>(data[0]) << 24) |
            (static_cast<std::uint32_t>(data[1]) << 16) |
            (static_cast<std::uint32_t>(data[2]) << 8) |
            static_cast<std::uint32_t>(data[3]);
-}
-
-inline std::vector<std::uint8_t> MakeRtpPacket(
-    const RtpPayload& payload,
-    std::uint8_t payload_type,
-    std::uint32_t ssrc,
-    std::uint16_t& sequence,
-    std::uint32_t& last_rtp_timestamp) {
-    last_rtp_timestamp = payload.timestamp;
-    const auto rtp_size = kRtpHeaderSize + payload.payload.size();
-    std::vector<std::uint8_t> packet(rtp_size);
-    auto* rtp = packet.data();
-    rtp[0] = 0x80;
-    rtp[1] = static_cast<std::uint8_t>((payload.marker ? 0x80 : 0) |
-                                       (payload_type & 0x7F));
-    WriteU16(rtp + 2, sequence++);
-    WriteU32(rtp + 4, payload.timestamp);
-    WriteU32(rtp + 8, ssrc);
-    std::copy(payload.payload.begin(),
-              payload.payload.end(),
-              packet.begin() + static_cast<std::ptrdiff_t>(kRtpHeaderSize));
-    return packet;
-}
-
-inline bool ShouldSendRtcpSenderReport(
-    std::chrono::steady_clock::time_point& next_report_time) {
-    const auto now = std::chrono::steady_clock::now();
-    if (next_report_time != std::chrono::steady_clock::time_point{} &&
-        now < next_report_time) {
-        return false;
-    }
-    next_report_time = now + kRtcpSenderReportInterval;
-    return true;
 }
 
 inline std::string MakeSessionId(std::uint64_t id) {
@@ -210,8 +151,8 @@ private:
                       ClosedHandler on_closed);
 
 
-    // 每个 SDP track 都有独立的 RTP/RTCP 状态。音频和视频不能共用 SSRC、
-    // sequence 或 timestamp，否则播放器会把不同媒体流混到同一条 RTP 时间线里。
+    // 每个 SDP track 都有独立的 sender/transport 状态。音频和视频不能共用
+    // SSRC、sequence 或 timestamp，否则播放器会把不同媒体流混到同一条 RTP 时间线里。
     struct TrackSessionState {
         int track_id{0};
         const MediaTrackConfig* track{nullptr};
@@ -220,12 +161,7 @@ private:
         // 这里只记录共享 publisher 返回的订阅描述，不创建客户端 socket。
         std::shared_ptr<IRtspMediaTransport> media_transport;
         std::optional<RtspMulticastSubscription> multicast_subscription;
-        std::uint32_t ssrc{0};
-        std::uint16_t sequence{0};
-        std::uint32_t last_rtp_timestamp{0};
-        std::uint32_t rtcp_packet_count{0};
-        std::uint32_t rtcp_octet_count{0};
-        std::chrono::steady_clock::time_point next_rtcp_sr_time{};
+        std::unique_ptr<RtpSender> sender;
         RtcpReportBlock last_receiver_report{};
         std::uint32_t last_receiver_reporter_ssrc{0};
         std::uint64_t receiver_reports_received{0};
@@ -276,16 +212,6 @@ private:
 
 
     std::string BuildRtpInfo(const std::string& play_url) const;
-
-
-    std::vector<std::uint8_t> BuildRtpPacket(
-        TrackSessionState& state,
-        const RtpPayload& payload,
-        std::uint8_t payload_type);
-
-
-    void RecordRtcpSenderStats(TrackSessionState& state,
-                               const RtpPayload& payload);
 
 
     void MaybeSendRtcpSenderReport(TrackSessionState& state);
