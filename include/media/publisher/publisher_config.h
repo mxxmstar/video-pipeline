@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -106,6 +107,14 @@ struct RtspServerOptions {
     std::string auth_realm{"video-pipeline"};
     // Digest nonce 的有效期，单位为毫秒；过期 nonce 只触发新的 401 challenge。
     int auth_nonce_ttl_ms{300000};
+    // 连接数和按地址限流均默认关闭。max_connections 限制全局活动 session；
+    // max_connections_per_address 限制同一精确 IP 的活动 session 数。
+    std::size_t max_connections{0};
+    std::size_t max_connections_per_address{0};
+    // 固定时间窗口内，同一 IP 允许的连接尝试/鉴权失败次数；0 表示不限制。
+    std::size_t connection_attempts_per_address{0};
+    std::size_t auth_failures_per_address{0};
+    int rate_limit_window_ms{60000};
     // 当 SETUP 请求 RTP/AVP;multicast 但没有指定 destination、port 或 ttl 时，
     // 使用这里的默认组播目标。
     std::string multicast_address{"239.255.0.1"};

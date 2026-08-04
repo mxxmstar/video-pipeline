@@ -217,6 +217,9 @@ PublisherResult PublisherConfig::ValidateProtocol() const {
         } else if (rtsp.auth_nonce_ttl_ms < 0) {
             return Invalid("RTSP authentication nonce TTL must not be negative");
         }
+        if (rtsp.rate_limit_window_ms <= 0) {
+            return Invalid("RTSP rate limit window must be positive");
+        }
         if (rtsp.enable_multicast) {
             if (!rtsp.enable_udp) {
                 return Invalid("RTSP multicast requires UDP to be enabled");

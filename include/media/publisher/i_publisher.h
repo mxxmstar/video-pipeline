@@ -14,6 +14,14 @@ struct PublisherStats {
     std::uint64_t bytes_published{0};
     std::uint64_t clients_connected{0};
     std::uint64_t rtcp_receiver_reports_received{0};
+    std::uint64_t connections_accepted{0};
+    std::uint64_t connections_closed{0};
+    std::uint64_t connections_rejected{0};
+    std::uint64_t connections_rejected_by_capacity{0};
+    std::uint64_t connections_rejected_by_address{0};
+    std::uint64_t connections_rejected_by_rate_limit{0};
+    std::uint64_t auth_failures{0};
+    std::uint64_t auth_failures_rejected{0};
 };
 
 class IPublisher {

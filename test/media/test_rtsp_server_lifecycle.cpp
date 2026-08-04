@@ -216,6 +216,83 @@ void TestBasicAndDigestAuthentication() {
     }
 }
 
+void TestConnectionLimitsAndStatistics() {
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.max_connections = 1;
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket first(client_io);
+        boost::asio::ip::tcp::socket second(client_io);
+        first.connect({boost::asio::ip::address_v4::loopback(),
+                       config.listen_port});
+        second.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        // 第二个连接在进入 registry 前被全局容量拒绝；第一个连接仍然
+        // 保持活动，证明 pending accept 不会错误释放已有 session。
+        assert(WaitForPeerClose(second));
+        const auto stats = protocol.GetStats();
+        assert(stats.clients_connected == 1);
+        assert(stats.connections_accepted == 1);
+        assert(stats.connections_rejected == 1);
+        assert(stats.connections_rejected_by_capacity == 1);
+        first.close();
+        protocol.Stop();
+    }
+
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.connection_attempts_per_address = 1;
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket first(client_io);
+        boost::asio::ip::tcp::socket second(client_io);
+        first.connect({boost::asio::ip::address_v4::loopback(),
+                       config.listen_port});
+        second.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        assert(WaitForPeerClose(second));
+        const auto stats = protocol.GetStats();
+        assert(stats.connections_accepted == 1);
+        assert(stats.connections_rejected_by_rate_limit == 1);
+        first.close();
+        protocol.Stop();
+    }
+
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.auth_mode = RtspAuthMode::Basic;
+        config.rtsp.auth_username = "admin";
+        config.rtsp.auth_password = "secret";
+        config.rtsp.auth_failures_per_address = 2;
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket client(client_io);
+        client.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        const std::string wrong_auth = "Basic YWRtaW46d3Jvbmc=";
+        std::string response;
+        SendOptions(client, wrong_auth);
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 401 Unauthorized") != std::string::npos);
+        response.clear();
+        SendOptions(client, wrong_auth);
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 401 Unauthorized") != std::string::npos);
+        assert(WaitForPeerClose(client));
+        const auto stats = protocol.GetStats();
+        assert(stats.auth_failures == 2);
+        assert(stats.auth_failures_rejected == 1);
+        protocol.Stop();
+    }
+}
+
 void TestIdleTimeoutAndAddressAllowlist() {
     {
         RtspServerProtocol protocol;
@@ -307,6 +384,7 @@ void TestConcurrentWriteAndStop() {
 
 int main() {
     TestBasicAndDigestAuthentication();
+    TestConnectionLimitsAndStatistics();
     TestIdleTimeoutAndAddressAllowlist();
     TestFailureRollbackAndRestart();
     TestConcurrentWriteAndStop();

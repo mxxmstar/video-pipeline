@@ -239,9 +239,13 @@ std::string MakeNonce(std::uint64_t session_id) {
         boost::asio::ip::tcp::socket socket,
         std::shared_ptr<const RtspSessionContext> context,
         std::uint64_t id,
+        std::string client_address,
         ClosedHandler on_closed) {
         auto session = std::shared_ptr<RtspClientSession>(
-            new RtspClientSession(std::move(context), id, std::move(on_closed)));
+            new RtspClientSession(std::move(context),
+                                  id,
+                                  std::move(client_address),
+                                  std::move(on_closed)));
         const auto weak = std::weak_ptr<RtspClientSession>(session);
         session->connection_ = std::make_shared<RtspConnection>(
             std::move(socket),
@@ -358,11 +362,13 @@ std::string MakeNonce(std::uint64_t session_id) {
 RtspClientSession::RtspClientSession(
     std::shared_ptr<const RtspSessionContext> context,
     std::uint64_t id,
+    std::string client_address,
     ClosedHandler on_closed)
     : context_(std::move(context)),
       idle_timer_(context_->io_executor),
       on_closed_(std::move(on_closed)),
       id_(id),
+      client_address_(std::move(client_address)),
       session_id_(rtsp_session_detail::MakeSessionId(id)) {
 }
 
@@ -1019,7 +1025,15 @@ bool RtspClientSession::AuthenticateRequest(const RtspRequest& request,
     }
 
     if (!authorized) {
+        const bool may_continue = context_->record_auth_failure
+            ? context_->record_auth_failure(client_address_)
+            : true;
         SendUnauthorized(cseq, stale_nonce);
+        if (!may_continue && connection_) {
+            // 先把最后一次 401 challenge 排进唯一写队列，再关闭连接，
+            // 让客户端能区分“凭据错误”与网络断开，同时释放限流资源。
+            connection_->CloseAfterFlush();
+        }
         return false;
     }
     return true;
@@ -1173,26 +1187,69 @@ RtspSessionManager::Session RtspSessionManager::Create(
     boost::asio::ip::tcp::socket socket) {
     boost::system::error_code endpoint_error;
     const auto remote_endpoint = socket.remote_endpoint(endpoint_error);
+    const auto client_address = endpoint_error
+        ? std::string{}
+        : remote_endpoint.address().to_string();
     const auto& allowed_addresses =
         context_->config.rtsp.allowed_client_addresses;
-    const bool rejected_by_allowlist =
-        (!allowed_addresses.empty() && endpoint_error) ||
-        (!endpoint_error &&
-         !rtsp_session_detail::IsClientAddressAllowed(
-             context_->config.rtsp,
-             remote_endpoint));
-    if (rejected_by_allowlist) {
-        // 在进入 registry 前拒绝连接，避免未授权客户端先占用 session
-        // ID、媒体 transport 或统计槽位；socket 仍由这里负责关闭。
-        LOG_WARN("RTSP client rejected by address allowlist: {}",
-                 endpoint_error ? endpoint_error.message()
-                                : remote_endpoint.address().to_string());
+    bool rejected = false;
+    std::string rejection_reason;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        auto& address_state = address_states_[client_address];
+        ResetAddressWindow(address_state, now);
+
+        if ((!allowed_addresses.empty() && endpoint_error) ||
+            (!endpoint_error &&
+             !rtsp_session_detail::IsClientAddressAllowed(
+                 context_->config.rtsp,
+                 remote_endpoint))) {
+            rejected = true;
+            rejection_reason = "address allowlist";
+            ++stats_.connections_rejected;
+            ++stats_.connections_rejected_by_address;
+        } else if (context_->config.rtsp.max_connections != 0 &&
+                   sessions_.size() + pending_connections_ >=
+                       context_->config.rtsp.max_connections) {
+            rejected = true;
+            rejection_reason = "global connection limit";
+            ++stats_.connections_rejected;
+            ++stats_.connections_rejected_by_capacity;
+        } else if (context_->config.rtsp.max_connections_per_address != 0 &&
+                   address_state.active_connections >=
+                       context_->config.rtsp.max_connections_per_address) {
+            rejected = true;
+            rejection_reason = "per-address connection limit";
+            ++stats_.connections_rejected;
+            ++stats_.connections_rejected_by_capacity;
+        } else if (context_->config.rtsp.connection_attempts_per_address != 0 &&
+                   address_state.connection_attempts >=
+                       context_->config.rtsp.connection_attempts_per_address) {
+            rejected = true;
+            rejection_reason = "per-address connection rate limit";
+            ++stats_.connections_rejected;
+            ++stats_.connections_rejected_by_rate_limit;
+        } else {
+            ++address_state.connection_attempts;
+            ++address_state.active_connections;
+            ++pending_connections_;
+        }
+    }
+
+    if (rejected) {
+        // 在进入 registry 前拒绝连接，避免未授权/超限客户端先占用
+        // session ID、媒体 transport 或统计槽位；socket 仍由这里关闭。
+        LOG_WARN("RTSP client rejected ({}): {}",
+                 rejection_reason,
+                 endpoint_error ? endpoint_error.message() : client_address);
         boost::system::error_code close_error;
         socket.close(close_error);
         return {};
     }
 
-    // ID 分配和 registry 插入分别受同一把锁保护；不在锁内启动 socket 或执行回调。
+    // 先在锁内预留 pending slot，再构造 session；这样并发 accept 不会绕过
+    // max_connections。构造本身不启动 socket，真正 Start 仍由 accept executor 调用。
     std::uint64_t id = 0;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1204,6 +1261,7 @@ RtspSessionManager::Session RtspSessionManager::Create(
         std::move(socket),
         context_,
         id,
+        client_address,
         [weak_manager](std::uint64_t closed_id) {
             if (const auto manager = weak_manager.lock()) {
                 manager->Remove(closed_id);
@@ -1211,7 +1269,10 @@ RtspSessionManager::Session RtspSessionManager::Create(
         });
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        --pending_connections_;
         sessions_.push_back(session);
+        session_addresses_[id] = client_address;
+        ++stats_.connections_accepted;
     }
     return session;
 }
@@ -1219,6 +1280,16 @@ RtspSessionManager::Session RtspSessionManager::Create(
 void RtspSessionManager::Remove(std::uint64_t session_id) {
     // closed callback 只做容器删除，实际 socket close 已由 session/connection 完成。
     std::lock_guard<std::mutex> lock(mutex_);
+    const auto address_it = session_addresses_.find(session_id);
+    if (address_it != session_addresses_.end()) {
+        const auto state_it = address_states_.find(address_it->second);
+        if (state_it != address_states_.end() &&
+            state_it->second.active_connections > 0) {
+            --state_it->second.active_connections;
+        }
+        session_addresses_.erase(address_it);
+    }
+    const auto previous_size = sessions_.size();
     sessions_.erase(
         std::remove_if(
             sessions_.begin(),
@@ -1227,6 +1298,9 @@ void RtspSessionManager::Remove(std::uint64_t session_id) {
                 return !session || session->Id() == session_id;
             }),
         sessions_.end());
+    if (sessions_.size() != previous_size) {
+        ++stats_.connections_closed;
+    }
 }
 
 std::vector<RtspSessionManager::Session> RtspSessionManager::Snapshot() const {
@@ -1240,7 +1314,46 @@ std::size_t RtspSessionManager::Size() const {
     return sessions_.size();
 }
 
+RtspSessionManagerStats RtspSessionManager::GetStats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto snapshot = stats_;
+    snapshot.active_connections = sessions_.size();
+    return snapshot;
+}
+
+bool RtspSessionManager::RecordAuthFailure(
+    const std::string& client_address) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.auth_failures;
+    auto& state = address_states_[client_address];
+    ResetAddressWindow(state, std::chrono::steady_clock::now());
+    ++state.auth_failures;
+    if (context_->config.rtsp.auth_failures_per_address != 0 &&
+        state.auth_failures >= context_->config.rtsp.auth_failures_per_address) {
+        ++stats_.auth_failures_rejected;
+        return false;
+    }
+    return true;
+}
+
+void RtspSessionManager::ResetAddressWindow(
+    AddressState& state,
+    std::chrono::steady_clock::time_point now) const {
+    const auto window = std::chrono::milliseconds(
+        context_->config.rtsp.rate_limit_window_ms);
+    if (state.window_started == std::chrono::steady_clock::time_point{} ||
+        now - state.window_started >= window) {
+        state.window_started = now;
+        state.connection_attempts = 0;
+        state.auth_failures = 0;
+    }
+}
+
 void RtspSessionManager::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     sessions_.clear();
+    session_addresses_.clear();
+    for (auto& [_, state] : address_states_) {
+        state.active_connections = 0;
+    }
 }

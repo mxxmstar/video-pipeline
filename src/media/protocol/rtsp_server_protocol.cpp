@@ -184,6 +184,15 @@ PublisherResult RtspServerProtocol::Start(
     };
     auto session_manager = std::make_shared<RtspSessionManager>(
         session_context);
+    const auto weak_session_manager = std::weak_ptr<RtspSessionManager>(
+        session_manager);
+    session_context->record_auth_failure =
+        [weak_session_manager](const std::string& client_address) {
+            if (const auto manager = weak_session_manager.lock()) {
+                return manager->RecordAuthFailure(client_address);
+            }
+            return true;
+        };
 
     // acceptor 也先在局部完成 open/bind/listen。只有监听资源完整可用时，
     // 才把 config/context/manager/publisher 一起提交给 façade。
@@ -436,7 +445,21 @@ void RtspServerProtocol::Stop() {
 
     if (!on_io_thread) {
         if (session_manager) {
+            const auto manager_stats = session_manager->GetStats();
             session_manager->Clear();
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.clients_connected = manager_stats.active_connections;
+            stats_.connections_accepted = manager_stats.connections_accepted;
+            stats_.connections_closed = manager_stats.connections_closed;
+            stats_.connections_rejected = manager_stats.connections_rejected;
+            stats_.connections_rejected_by_capacity =
+                manager_stats.connections_rejected_by_capacity;
+            stats_.connections_rejected_by_address =
+                manager_stats.connections_rejected_by_address;
+            stats_.connections_rejected_by_rate_limit =
+                manager_stats.connections_rejected_by_rate_limit;
+            stats_.auth_failures = manager_stats.auth_failures;
+            stats_.auth_failures_rejected = manager_stats.auth_failures_rejected;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -479,9 +502,23 @@ PublisherStats RtspServerProtocol::GetStats() const {
     }
     // manager 自己保护 registry；protocol mutex 不跨越 Size()，避免统计读取
     // 与 session closed callback 形成锁顺序反转。
-    stats.clients_connected = session_manager
-        ? session_manager->Size()
-        : std::size_t{0};
+    if (session_manager) {
+        const auto manager_stats = session_manager->GetStats();
+        stats.clients_connected = manager_stats.active_connections;
+        stats.connections_accepted = manager_stats.connections_accepted;
+        stats.connections_closed = manager_stats.connections_closed;
+        stats.connections_rejected = manager_stats.connections_rejected;
+        stats.connections_rejected_by_capacity =
+            manager_stats.connections_rejected_by_capacity;
+        stats.connections_rejected_by_address =
+            manager_stats.connections_rejected_by_address;
+        stats.connections_rejected_by_rate_limit =
+            manager_stats.connections_rejected_by_rate_limit;
+        stats.auth_failures = manager_stats.auth_failures;
+        stats.auth_failures_rejected = manager_stats.auth_failures_rejected;
+    } else {
+        stats.clients_connected = 0;
+    }
     // multicast RR 由 publisher 自己累计并输出 snapshot；session RR 仍由
     // session context 的窄回调累计到 stats_，两条来源在这里统一合并。
     if (multicast_publisher) {

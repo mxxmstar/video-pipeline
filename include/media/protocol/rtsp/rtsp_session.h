@@ -13,6 +13,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -121,6 +122,25 @@ struct RtspSessionContext {
     std::function<std::uint16_t()> get_multicast_sequence;
     std::function<std::uint32_t()> get_multicast_last_rtp_timestamp;
     std::function<void(std::uint64_t)> add_receiver_reports;
+    // manager 提供的窄化回调只记录鉴权失败和是否触发地址限流；session 不
+    // 直接持有 manager，避免形成 owner/session/manager 循环引用。
+    std::function<bool(const std::string&)> record_auth_failure;
+};
+
+/// @brief `RtspSessionManager` 的只读连接统计快照。
+///
+/// 计数均为当前 protocol 生命周期内的累计值；active_connections 是当前
+/// registry 中的活动 session 数，调用方拿到副本后无需继续持有 manager 锁。
+struct RtspSessionManagerStats {
+    std::uint64_t active_connections{0};
+    std::uint64_t connections_accepted{0};
+    std::uint64_t connections_closed{0};
+    std::uint64_t connections_rejected{0};
+    std::uint64_t connections_rejected_by_capacity{0};
+    std::uint64_t connections_rejected_by_address{0};
+    std::uint64_t connections_rejected_by_rate_limit{0};
+    std::uint64_t auth_failures{0};
+    std::uint64_t auth_failures_rejected{0};
 };
 
 /// @brief RTSP 会话
@@ -134,6 +154,7 @@ public:
         boost::asio::ip::tcp::socket socket,
         std::shared_ptr<const RtspSessionContext> context,
         std::uint64_t id,
+        std::string client_address,
         ClosedHandler on_closed);
 
 
@@ -166,6 +187,7 @@ public:
 private:
     RtspClientSession(std::shared_ptr<const RtspSessionContext> context,
                       std::uint64_t id,
+                      std::string client_address,
                       ClosedHandler on_closed);
 
 
@@ -310,6 +332,7 @@ private:
     ClosedHandler on_closed_;
     std::shared_ptr<RtspConnection> connection_;
     std::uint64_t id_{0};
+    std::string client_address_;
     std::string session_id_;
     std::string requested_url_;
     // nonce 只在当前 session 内复用，且由创建时间控制有效期；这样过期后
@@ -347,11 +370,32 @@ public:
 
     std::size_t Size() const;
 
+    /// 返回连接生命周期和限流拒绝原因的只读快照。
+    RtspSessionManagerStats GetStats() const;
+
+    /// 记录一次鉴权失败；返回 false 表示该地址达到失败阈值，session 应
+    /// 在写完当前 401 challenge 后关闭，避免继续占用连接资源。
+    bool RecordAuthFailure(const std::string& client_address);
+
     void Clear();
 
 private:
+    struct AddressState {
+        std::chrono::steady_clock::time_point window_started{};
+        std::size_t connection_attempts{0};
+        std::size_t auth_failures{0};
+        std::size_t active_connections{0};
+    };
+
+    void ResetAddressWindow(AddressState& state,
+                            std::chrono::steady_clock::time_point now) const;
+
     std::shared_ptr<const RtspSessionContext> context_;
     mutable std::mutex mutex_;
     std::vector<Session> sessions_;
+    std::unordered_map<std::string, AddressState> address_states_;
+    std::unordered_map<std::uint64_t, std::string> session_addresses_;
+    std::size_t pending_connections_{0};
     std::uint64_t next_session_id_{1};
+    RtspSessionManagerStats stats_;
 };

@@ -164,6 +164,17 @@ static void TestPublisherConfigValidation() {
     assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
 
     config = MakeRtspConfig();
+    config.rtsp.rate_limit_window_ms = 0;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
+    config = MakeRtspConfig();
+    config.rtsp.max_connections = 1;
+    config.rtsp.max_connections_per_address = 1;
+    config.rtsp.connection_attempts_per_address = 2;
+    config.rtsp.auth_failures_per_address = 3;
+    assert(config.Validate().code == PublisherErrorCode::None);
+
+    config = MakeRtspConfig();
     config.tracks.front().codec_type = CodecType::H265;
     assert(config.Validate().code == PublisherErrorCode::UnsupportedCodec);
 

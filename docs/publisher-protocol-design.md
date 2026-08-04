@@ -787,13 +787,13 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
   - 状态：已修复。
   - 修复日期：2026-08-03。
   - 修复方法：新增独立、可增量调用的 `RtspRequestParser`，实现 RFC 2326 RTSP/1.0 request-line、header（字段名大小写不敏感、重复字段和折叠行）、`Content-Length` entity body 与 pipelining 消息边界解析；严格拒绝非法 CRLF、token、absolute URI、version、header 控制字符和冲突长度，并增加 request-line/header/body 资源上限。`ClientSession` 改为消费结构化 request，强制唯一数字 `CSeq`，版本不支持时返回 505，语法错误返回 400 后关闭连接。新增 `test_rtsp_request_parser` CTest，覆盖分片、body、流水线和畸形输入。
-- Basic/Digest 鉴权已实现基础版本；RTSPS、鉴权失败限速和外部凭据存储仍待后续生产化阶段。
+- Basic/Digest 鉴权和按地址鉴权失败限速已实现基础版本；RTSPS、外部凭据存储和更细粒度封禁策略仍待后续生产化阶段。
   - 修复日期：2026-08-04。
   - 修复方法：`RtspClientSession` 支持配置启用 Basic 或 Digest-MD5/qop=auth，未授权请求返回 `401 Unauthorized` 和 `WWW-Authenticate` challenge；Digest nonce 按 session 隔离并受 TTL 限制，错误或过期 nonce 不进入 RTSP method 状态机。
 - 会话 idle timeout 和客户端地址访问控制已实现基础版本：`session_idle_timeout_ms=0` 或空 `allowed_client_addresses` 时保持关闭/放行的兼容默认值；当前 allowlist 只支持精确 IP，不支持 CIDR。
   - 修复日期：2026-08-04。
   - 修复方法：`RtspClientSession` 在其 Asio executor 上维护可取消的 `steady_timer`，由 RTSP request、interleaved/RTCP 和媒体发送刷新；非 PLAY 状态控制面超时后走幂等 `Close()`。`RtspSessionManager` 在进入 registry 前读取 remote endpoint 并执行精确 IP allowlist，拒绝连接不会分配 session ID 或占用媒体资源。
-- 连接数限制、按地址限流和连接统计仍待在 `RtspSessionManager` 中实现。
+- `RtspSessionManager` 已实现基础连接数限制、按地址连接尝试/鉴权失败窗口和连接生命周期统计；慢客户端隔离、持久化 metrics 和分布式限流仍待后续阶段。
 - 只支持 H264 视频，尚未支持 H265。
 - multicast 只有单 H264 track，共享一组 RTP/RTCP 端口、SSRC 和 sequence。
 - 没有 RTCP SDES/BYE，也没有基于 RR 的质量告警或码率反馈。
@@ -1400,8 +1400,8 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 类拆分稳定后再按新边界推进以下能力：
 
 - **P1：会话资源保护（已完成，2026-08-04）**：在 `RtspClientSession`/`RtspSessionManager` 边界增加控制面 idle timeout 和精确 IP allowlist；默认关闭，先不改变现有客户端行为。
-- **P2：RTSP 鉴权（基础版本已完成，2026-08-04）**：Basic/Digest challenge、凭据校验和 nonce 生命周期已接入；鉴权失败限速、外部凭据存储和 RTSPS 另行推进。
-- 在 `RtspSessionManager` 增加最大连接数、按地址限流和连接统计。
+- **P2：RTSP 鉴权（基础版本已完成，2026-08-04）**：Basic/Digest challenge、凭据校验和 nonce 生命周期已接入；鉴权失败限速已在 P3 接入，外部凭据存储和 RTSPS 另行推进。
+- **P3：连接资源保护（基础版本已完成，2026-08-04）**：`RtspSessionManager` 已接入最大连接数、按地址连接尝试/鉴权失败限流和连接统计；更复杂的封禁策略另行推进。
 - 在 `RtspConnection` 增加每客户端发送队列上限、慢客户端隔离和 RTSPS 支持。
 - 扩展 transport/地址抽象以支持 IPv6，并评估 RTSP aggregate control 和更完整的 RFC 错误响应。
 - 使用 VLC、FFmpeg、GStreamer 和常见 NVR 建立互操作矩阵测试。
@@ -1425,6 +1425,16 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 - **中文注释与测试**：新增代码注释覆盖 Base64/MD5 字节序、常量时间比较、Digest 参数解析、nonce 生命周期、nc 重放保护和 401 语义；扩展 `test_rtsp_server_lifecycle` 验证 Basic 401/200、Digest challenge/正确 response/重复 nc 拒绝，扩展 `test_publisher_protocol` 验证鉴权配置校验。
 - **验证结果**：`video_pipeline_lib`、`test_publisher_protocol`、`test_rtsp_server_lifecycle` 和 `test_rtsp_server_protocol` 在 VS/NMake Debug 环境编译通过；相关 3 项 CTest 全部通过，随后完整 10 项 RTSP 定向 CTest 继续回归。
 - **阶段结论**：P2 基础鉴权 gate 已满足。下一步为 `RtspSessionManager` 最大连接数、按地址限流和连接统计；鉴权失败限速应与该阶段的地址限流策略一起设计。
+
+###### 12.9.9.3 P3 实施记录（2026-08-04）
+
+- **配置边界**：`RtspServerOptions` 新增 `max_connections`、`max_connections_per_address`、`connection_attempts_per_address`、`auth_failures_per_address` 和 `rate_limit_window_ms`。所有数量限制默认 0 表示关闭，窗口必须为正数；因此现有配置不会因为新增 manager 策略改变行为。
+- **并发容量控制**：manager 在同一把 registry 锁内检查全局活动数、地址活动数和连接尝试窗口，并预留 `pending_connections_` slot 后再构造 session；并发 accept 不能绕过 `max_connections`，拒绝 socket 在创建 session/transport 前关闭。
+- **地址窗口与鉴权失败限速**：每个精确 IP 独立维护活动 session、连接尝试数和鉴权失败数，窗口到期时一起清零。鉴权失败达到阈值后仍发送最后一次 401 challenge，但通过 `CloseAfterFlush()` 关闭连接；该回调不让 session 直接持有 manager。
+- **连接统计快照**：`RtspSessionManagerStats` 输出活动数、接受数、关闭数、总拒绝数及 capacity/address/rate-limit 分类、鉴权失败和被限速失败数；`RtspServerProtocol::GetStats()` 将快照合并到 `PublisherStats`，Stop 后仍保留本轮累计值。
+- **测试与中文注释**：扩展 `test_rtsp_server_lifecycle` 覆盖全局连接上限、按地址连接尝试限流、鉴权失败达到阈值后的 401/关闭和统计断言；配置测试覆盖窗口与限制字段。新增代码注释说明 pending slot、registry 锁范围、地址窗口重置、401 flush 后关闭和统计快照线程边界。
+- **验证结果**：`video_pipeline_lib`、`test_publisher_protocol`、`test_rtsp_server_lifecycle` 和 `test_rtsp_server_protocol` 在 VS/NMake Debug 环境编译通过；3 项定向测试及完整 10 项 RTSP CTest 全部通过。
+- **阶段结论**：P3 基础连接资源保护 gate 已满足。下一步进入 `RtspConnection` 的发送队列上限、慢客户端隔离和 RTSPS 设计，连接统计字段可作为后续 metrics 接入基础。
 
 #### 12.10 多目标和主备发布
 
