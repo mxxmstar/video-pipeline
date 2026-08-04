@@ -605,6 +605,8 @@ RTSP 请求由独立的 `RtspRequestParser` 按 RFC 2326 的 request-line 和 me
 
 `RtspTransportSpec` 独立负责解析 Transport 候选项，以及生成 SETUP 响应。RTSP protocol 根据配置决定是否接受 TCP、UDP 和 multicast。
 
+`RtspServerProtocol` 当前仍集中承担连接、会话、RTP/RTCP 和 multicast 等职责。目标类拆分、依赖关系和渐进迁移方案见 12.9。
+
 ### 6.4 RTP 与 SDP
 
 当前 RTSP Server codec 能力：
@@ -794,6 +796,9 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 可维护性与测试
 
 - `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
+  - 状态：拆分方案已完成，代码和目录迁移尚未开始。
+  - 规划日期：2026-08-03。
+  - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
 - 手动摄像头链路和协议自动测试目前混在 `test_rtsp_server_publisher`，并通过常量选择；当前默认进入不设时长的摄像头循环。
 - 部分协议测试函数在 `main()` 中被注释，没有作为 CTest 自动回归执行。
 - 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
@@ -966,13 +971,339 @@ FFmpeg mux 路径已有 H265 codec 映射，但仍需针对目标格式和服务
 
 #### 12.9 RTSP Server 生产能力
 
-工作项：
+规划日期：2026-08-03。
 
-- 将 request parser、session、RTP sender、RTCP 和 multicast 拆为独立组件。
-- 增加 Basic/Digest 鉴权、会话超时、最大连接数和访问控制。
-- 评估 RTSPS、IPv6、RTSP aggregate control 和更完整的 RFC 错误响应。
-- 增加慢客户端隔离和每客户端发送队列上限。
-- 使用 VLC、FFmpeg、GStreamer 和常见 NVR 做互操作矩阵测试。
+当前 `RtspServerProtocol` 既是 `IProtocol` 实现，又负责 listener、TCP framing、RTSP 方法分发、会话状态、SDP、RTP sender、RTCP、unicast/multicast socket 和统计汇总。嵌套 `ClientSession` 也同时持有连接状态、协议状态和媒体发送状态，导致任一传输或协议能力的修改都需要改动同一个大类。
+
+已经独立的 `RtspRequestParser` 和 `RtspTransportSpec` 保持现有实现和行为，不重新实现 parser；文件路径按 12.9.5 的目录分层方案迁入 `media/protocol/rtsp`，路径迁移与功能修改分开提交。
+
+##### 12.9.1 拆分目标与约束
+
+- `RtspServerProtocol` 继续作为唯一的 `IProtocol` façade，对外 `Start()`、`Write()`、`Stop()` 和统计接口保持不变，调用方无需感知内部拆分。
+- 连接 framing、RTSP 状态机、媒体发送和 RTCP 解析形成单向依赖，任何子组件都不得通过 `RtspServerProtocol&` 原始反向引用访问整个 server。
+- socket、会话和 transport 的可变状态统一在 `io_context` 对应的 strand 上修改；跨线程入口只复制必要数据并投递任务。
+- `Write()` 只在短临界区内获取活动 session 快照，释放 registry 锁后再投递媒体；持有 mutex 时不得执行 socket I/O、packetize 或用户回调。
+- 同一 TCP 连接的 RTSP response、interleaved RTP 和 interleaved RTCP 必须复用唯一串行写队列，禁止多个组件并发调用 `async_write`。
+- multicast socket、共享 SSRC/sequence 和接收端反馈属于 server 级 publisher，不归属于任一客户端 session。
+- 第一轮拆分以行为等价为目标，不同时加入鉴权、超时、限流、H265 或新的 RTCP 语义，避免结构迁移与功能变化互相掩盖问题。
+- 新增实现需添加详细中文注释，重点说明对象所有权、异步回调生命周期、strand/锁的线程边界、RFC 字段与字节布局、时间戳和 sequence 回绕；对直接赋值、简单转发等自解释代码不写重复注释。
+
+##### 12.9.2 目标组件与职责
+
+| 组件 | 目录层级 | 单一职责 | 明确不负责 |
+|---|---|---|---|
+| `RtspServerProtocol` | `media/protocol` 公共入口 | 保留 `IProtocol` façade、不可变配置、listener/Asio runtime、顶层生命周期和统计汇总 | 不解析 RTSP 字节流，不拼装 RTP/RTCP，不直接维护每客户端 socket 状态 |
+| `RtspConnection` | `media/protocol/rtsp` | 管理一个 TCP socket、read buffer、RTSP 与 `$` interleaved frame 分流、唯一串行 write queue 和连接关闭时序 | 不理解 RTSP 方法、codec、track 或 RTP 时间戳 |
+| `RtspClientSession` | `media/protocol/rtsp` | 校验 CSeq/version/method 语义，执行 RTSP 会话状态机，维护 session id、请求 URL 和每 track 的 SETUP/PLAY/PAUSE 状态，决定 response | 不直接读写 TCP/UDP socket，不解析原始 request 字节 |
+| `RtspSessionManager` | `media/protocol/rtsp` | 创建、注册、删除和快照 session，集中处理连接数统计与后续最大连接数策略 | 不处理 RTSP 方法或媒体 packet |
+| `IRtspMediaTransport` | `media/protocol/rtsp` | 统一每个 track 的 RTP/RTCP 发送、RTCP 接收和关闭接口 | 不生成 RTP header，不决定 RTSP 状态 |
+| `TcpInterleavedTransport` | `media/protocol/rtsp` | 把 RTP/RTCP 封装为 interleaved frame，并通过 connection writer 的唯一写队列发送 | 不持有或直接写 TCP socket |
+| `UdpUnicastTransport` | `media/protocol/rtsp` | 管理 client/server RTP/RTCP endpoint、UDP socket 和 RTCP receive | 不参与 TCP 响应写入 |
+| `RtpSender` | `media/protocol` 通用 RTP 层 | 每 track 管理 SSRC、sequence、最近时间戳、RTP header，以及 RTCP sender packet/octet 计数 | 不理解 RTSP method，不选择 TCP/UDP socket |
+| `RtcpPacketCodec` | `media/protocol` 通用 RTP 层 | 无状态构建 Sender Report，解析 compound RTCP、SR/RR 和 report block | 不拥有 timer、socket、统计生命周期 |
+| `RtspMulticastPublisher` | `media/protocol/rtsp` | server 级拥有共享 multicast transport、每 track sender 状态、SR 调度和 receiver feedback | 不依附客户端 session 生命周期；首轮仍保持当前单 H264 track 限制 |
+| `RtspSdpBuilder` | `media/protocol/rtsp` | 根据 track、codec 参数集、payload type 和连接地址生成 SDP | 不访问 socket 或修改 session |
+| `RtspResponseBuilder` | `media/protocol/rtsp` | 统一 status line、公共 header、Session/Transport 等 response 序列化 | 不决定采用哪个状态码 |
+| `AudioRtpPacketizer` | `media/protocol` 通用 RTP 层 | 生成 AAC AU header、剥离合法 ADTS header，并处理 G711 payload | 不生成 RTP header；H264 继续复用 `H264RtpPacketizer` |
+
+`RtspClientSession` 内部为每个已 SETUP track 保存一个聚合对象，例如 `TrackSession { setup state, track config, RtpSender, IRtspMediaTransport }`。session 根据只读 track config 调用 `H264RtpPacketizer` 或 `AudioRtpPacketizer` 生成 payload/marker，再交给 `RtpSender` 添加 RTP header。这样 RTSP 状态、codec payload、RTP sender 状态和实际传输的边界清晰，各组件可以分别测试和替换。
+
+##### 12.9.3 依赖、所有权与数据流
+
+```text
+RtspServerProtocol
+  |-- owns RtspSessionManager
+  |     `-- owns shared_ptr<RtspClientSession>
+  |            |-- owns RtspConnection
+  |            `-- owns per-track RtpSender + IRtspMediaTransport
+  |                    |-- TcpInterleavedTransport -> weak connection writer
+  |                    `-- UdpUnicastTransport -> owns UDP sockets
+  `-- owns RtspMulticastPublisher
+          `-- owns shared transport + per-track RtpSender
+
+TCP bytes -> RtspConnection -> RtspRequestParser -> RtspClientSession
+MediaPacket -> RtspServerProtocol -> session snapshot -> codec packetizer -> RtpSender -> transport
+                                      `-> RtspMulticastPublisher -> codec packetizer -> RtpSender -> transport
+RTCP bytes -> transport/connection -> RtcpPacketCodec -> sender/session statistics
+```
+
+`RtspSessionManager` 对活动 session 持有 `shared_ptr`；异步 connection 回调通过 `weak_ptr<RtspClientSession>` 回到会话，关闭回调再通知 manager 删除 registry 项，避免 connection/session/manager 形成引用环。`TcpInterleavedTransport` 仅依赖窄化的 writer 接口或发送回调，不持有 `RtspServerProtocol`，也不绕过 `RtspConnection` 的写队列。
+
+不可变 server 配置、track 描述和 codec 参数通过只读 context 在组件间共享。统计由子组件返回 snapshot，`RtspServerProtocol` 只负责合并，不读取或修改子组件内部字段。
+
+##### 12.9.4 线程与关闭模型
+
+- accept、read、RTSP 方法处理、UDP RTCP receive、transport 状态变更和实际发送都在同一 `io_context`/strand 上串行执行。
+- pipeline 线程调用 `Write()` 时，先从 manager 取得 `shared_ptr` 快照，再分别 `post` 到 session 和 multicast publisher；媒体 buffer 的所有权必须延长到异步发送完成。
+- `Stop()` 先停止接收新连接，再阻止新的媒体投递，随后在 strand 上关闭 session、transport 和 multicast socket，最后停止 `io_context` 并 join 线程。
+- 每个对象的 close 操作必须幂等；晚到的异步回调仅观察 closed 状态并退出，不能再次触发 response、发送或 registry 删除。
+- 第一轮保留当前发送队列行为；拆分稳定后再为每客户端增加有界队列、排队字节数统计和慢客户端断开策略。
+
+##### 12.9.5 文件布局
+
+目录按公共协议入口、RTSP 专用实现和通用 RTP 工具分层。`RtspServerProtocol` 与 adapter 是 Publisher/Protocol 工厂可见的入口，继续保留在 `media/protocol` 根目录；连接、会话、RTSP message、Transport 协商和 multicast 编排放入 `media/protocol/rtsp`；不依赖 RTSP method/session 的 packetizer、RTP sender 和 RTCP codec 作为可复用工具留在协议公共层。
+
+目标布局如下：
+
+```text
+include/media/protocol/
+  i_protocol.h
+  i_protocol_adapter.h
+  protocol_types.h
+  rtsp_server_protocol.h                  # 对外 façade
+  rtsp_server_protocol_adapter.h          # 工厂接入层
+  h264_bitstream.h                        # 通用 codec/RTP 工具
+  h264_rtp_packetizer.h
+  audio_rtp_packetizer.h
+  rtp_sender.h
+  rtcp_packet_codec.h
+  rtsp/
+    rtsp_request_parser.h                 # 由 protocol 根目录迁入
+    rtsp_transport_spec.h                 # 由 protocol 根目录迁入
+    rtsp_connection.h
+    rtsp_client_session.h
+    rtsp_session_manager.h
+    rtsp_media_transport.h
+    rtsp_multicast_publisher.h
+    rtsp_sdp_builder.h
+    rtsp_response_builder.h
+
+src/media/protocol/
+  protocol_adapter_factory.cpp
+  rtsp_server_protocol.cpp                # 只保留编排和 IProtocol 实现
+  rtsp_server_protocol_adapter.cpp
+  h264_bitstream.cpp
+  h264_rtp_packetizer.cpp
+  audio_rtp_packetizer.cpp
+  rtp_sender.cpp
+  rtcp_packet_codec.cpp
+  rtsp/
+    rtsp_request_parser.cpp               # 由 protocol 根目录迁入
+    rtsp_transport_spec.cpp               # 由 protocol 根目录迁入
+    rtsp_connection.cpp
+    rtsp_client_session.cpp
+    rtsp_session_manager.cpp
+    rtsp_media_transport.cpp
+    rtsp_multicast_publisher.cpp
+    rtsp_sdp_builder.cpp
+    rtsp_response_builder.cpp
+```
+
+路径和 include 规则：
+
+- RTSP 专用头文件统一使用 `#include "media/protocol/rtsp/rtsp_xxx.h"`，文件名保留 `rtsp_` 前缀，与现有 `media/protocol/avtp/avtp_xxx.h` 约定一致。
+- `RtspRequestParser` 和 `RtspTransportSpec` 是第一批迁移文件，只修改路径、include 和构建引用，不修改类名、namespace、API 或行为。
+- `RtspServerProtocol` 与 adapter 暂不迁移，避免改变现有公共 include；如果未来需要统一移动，必须通过兼容转发头或单独的 API 变更任务处理。
+- `H264RtpPacketizer`、`RtpSender`、`RtcpPacketCodec` 和 `AudioRtpPacketizer` 不访问 RTSP request/session，因此不放入 `rtsp` 目录。
+- CMake 当前递归收集 `src/*.cpp`，源文件迁入子目录后无需手工枚举，但仍需重新 configure 并检查新旧路径没有被同时编译。
+- 仅供 RTSP 实现内部使用的类型不加入 Publisher 公共接口，也不由 protocol adapter 暴露。
+
+##### 12.9.6 分阶段实施
+
+| 阶段 | 改动 | 阶段完成条件 |
+|---|---|---|
+| 0. 建立基线与目录分层 | 建立有限时长的 RTSP server 自动测试；随后新增 `media/protocol/rtsp` 目录并仅迁移 `RtspRequestParser`、`RtspTransportSpec` | 路径迁移前后测试结果一致，旧路径不再被 include 或编译 |
+| 1. 提取纯组件 | 提取 `RtspSdpBuilder`、`RtspResponseBuilder`、`RtcpPacketCodec` 和 `AudioRtpPacketizer`，保留大类中的调用顺序 | 纯组件单元测试覆盖正常、边界和畸形输入；线上行为不变 |
+| 2. 提取 TCP 连接 | 将 read buffer、RTSP/interleaved framing、write queue 和 close 移入 `RtspConnection` | 分片、pipelined request、interleaved RTCP 和并发 response/RTP 写入测试通过 |
+| 3. 提取会话状态机 | 把嵌套 `ClientSession` 改为独立 `RtspClientSession`，引入 `RtspSessionManager` | 全部 RTSP method、CSeq、Session header 和状态转换回归通过 |
+| 4. 引入 transport | 定义 `IRtspMediaTransport`，分别迁移 TCP interleaved 与 UDP unicast | TCP/UDP 的 SETUP response、RTP 和 RTCP 行为保持一致 |
+| 5. 提取 RTP sender | 将 per-track SSRC、sequence、timestamp、RTP header 和 sender counters 移入 `RtpSender` | 多 track 独立序列、时间戳、SR 计数和回绕测试通过 |
+| 6. 提取 multicast | 将共享 socket、sender state、SR 和 feedback 移入 `RtspMulticastPublisher` | 当前单 H264 multicast 行为不变，session 关闭不会误关共享 socket |
+| 7. 收缩 façade | 删除大类中已迁移字段和 helper，统一统计 snapshot、线程断言和关闭路径 | façade 不再包含 framing、RTCP 字节解析和具体 transport 实现 |
+
+每个阶段独立提交、可单独回滚；先增加 characterization test 再搬迁实现，禁止在搬迁过程中顺带改变 response 文本、默认端口、payload type、SSRC 生成或时间戳规则。
+
+##### 12.9.7 详细执行计划
+
+计划状态：待实施，当前代码和文件路径均未按本计划迁移。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过 `S0` 直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
+
+###### 12.9.7.1 每个阶段的固定工作流
+
+每个阶段均按以下顺序执行，防止新旧实现长时间并存或在没有回归证据时删除旧逻辑：
+
+1. **锁定行为**：先为将要迁移的旧逻辑补 characterization test，记录 response 字节、RTP/RTCP 字段、状态转换或关闭顺序。
+2. **建立新边界**：新增目标类和最小接口，先让旧调用点通过适配函数调用新组件，不立即调整无关目录、命名或配置。
+3. **切换所有权**：把字段和资源的唯一所有者迁入新组件；切换后旧类不能再保留同一份可变状态。
+4. **删除旧实现**：确认所有调用点已迁移后，删除旧 helper、字段和兼容分支，避免形成两套实现。
+5. **阶段验证**：运行新增单元测试、RTSP 定向 CTest 和一次完整构建；检查 socket、线程、统计和错误路径。
+6. **独立提交**：测试与实现可以分成相邻提交，但不得把下一阶段的重构或新协议能力混入当前提交。
+
+所有新类、关键结构和非平凡函数都必须带详细中文注释。异步函数的注释至少说明执行线程、捕获对象的生命周期、失败后的状态变化以及是否允许重复调用；RTP/RTCP 序列化函数还需标明网络字节序、RFC 字段宽度和计数口径。
+
+###### 12.9.7.2 S0：建立自动化行为基线
+
+目标：把当前可工作的协议行为变成有限时长、可重复执行的自动测试，为后续纯重构提供判断依据。
+
+| 编号 | 任务 | 产物或改动位置 | 验证证据 |
+|---|---|---|---|
+| S0-1 | 将本地 socket 协议测试与真实摄像头循环分开；保留摄像头程序为手动测试 | 新增 `test/media/test_rtsp_server_protocol.cpp`；公共客户端辅助代码可放入 `test/media/rtsp_test_utils.h`；不改变 `avtp_decode_rtsp_publisher.cpp` | 新测试无需摄像头、固定文件或外部 RTSP server，单次执行可自行结束 |
+| S0-2 | 恢复并整理 TCP interleaved、音视频、UDP unicast 和 multicast 现有测试函数 | 从 `test_rtsp_server_publisher.cpp` 迁移当前被注释的协议用例，手动摄像头入口继续独立保留 | 五类现有协议场景均实际执行，而不是只编译函数 |
+| S0-3 | 固化 RTSP 方法与错误响应 | 为七个已支持 method、未知 method、缺失/重复 CSeq、错误 version、非法 Session 和错误状态转换增加断言 | 状态码、CSeq、Session、Transport、RTP-Info、Content-Length 和 Public header 有明确断言 |
+| S0-4 | 固化媒体字节行为 | 记录 H264 单 NAL/FU-A、AAC AU header/ADTS、G711、RTP header、首次 SR 和 RR 统计 | 对 payload type、marker、sequence、timestamp、SSRC、packet/octet count 做字段级断言 |
+| S0-5 | 固化生命周期与并发行为 | 增加两个客户端、客户端中途关闭、发送中 `Stop()`、重复 `Start()`/`Stop()`、端口占用和停止后重新启动测试 | 所有用例有限超时，无永久阻塞；断言并记录当前返回语义，关闭后无额外发送或崩溃 |
+| S0-6 | 注册专用 CTest | 更新 `test/CMakeLists.txt`，注册 `test_rtsp_server_protocol`；保留真实摄像头测试不进入默认 CTest | `ctest -R "rtsp_(request_parser|server_protocol)"` 可独立通过 |
+| S0-7 | 建立 RTSP 子目录 | 新增 `include/media/protocol/rtsp` 和 `src/media/protocol/rtsp`，迁移 `rtsp_request_parser.*`、`rtsp_transport_spec.*`，更新生产代码和测试 include | 只发生路径变化；重新 configure/build 后新路径被编译，旧路径不存在且无残留引用 |
+
+S0 gate：自动测试能够覆盖当前 TCP、UDP unicast、multicast、RTCP 和 RTSP method 基线，且不再依赖 `test_rtsp_server_publisher` 中默认无限循环的摄像头路径；parser/transport spec 已迁入 `media/protocol/rtsp`，路径迁移前后测试输出一致。
+
+###### 12.9.7.3 S1：提取无状态和纯数据组件
+
+目标：优先迁移不拥有 socket、线程和 session 生命周期的逻辑，降低后续 I/O 拆分时的代码体积。
+
+| 编号 | 任务 | 迁移内容 | 单元测试重点 |
+|---|---|---|---|
+| S1-1 | 新增 `RtspResponseBuilder` | 迁移 `BuildResponse()` 及公共 header 序列化；输入为 status、reason、CSeq、header 列表和可选 body | CRLF、header 顺序、Content-Length、空 body、SDP body 和 400/405/455/461/505 响应 |
+| S1-2 | 新增 `RtspSdpBuilder` | 迁移 `BuildSdp()` 及 codec SDP helper；通过只读 `Input` 传入 tracks、H264 参数集、session path、地址和 multicast 参数 | H264/AAC/G711、多 track、缺失 SPS/PPS、unicast/multicast connection line |
+| S1-3 | 新增 `RtcpPacketCodec` | 迁移 RTCP 常量、网络字节序 helper、`RtcpReportBlock`、SR 构建与 compound SR/RR/report block 解析 | 截断 packet、错误 version/length、多个 compound packet、有/无 report block、signed 24-bit cumulative lost |
+| S1-4 | 新增 `AudioRtpPacketizer` | 迁移 AAC AU header、合法 ADTS header 去除和 G711 payload 生成；输出继续使用 `RtpPayload` | AAC raw/7-byte ADTS/9-byte ADTS、截断 ADTS、G711A/G711U、空 payload |
+| S1-5 | 切换 façade 和 session 调用点 | `RtspServerProtocol`/旧 `ClientSession` 调用新组件，删除匿名 namespace 中对应旧函数 | S0 全量回归输出不变，新旧实现不并存 |
+
+S1 gate：四个组件不依赖 `RtspServerProtocol`、Boost.Asio socket 或全局可变状态；每个组件有独立单元测试，`rtsp_server_protocol.cpp` 中对应旧 helper 已删除。
+
+###### 12.9.7.4 S2：提取 `RtspConnection`
+
+目标：让 TCP 字节流、framing 和写入顺序脱离 RTSP 会话状态机。
+
+| 编号 | 任务 | 接口与所有权 | 验证重点 |
+|---|---|---|---|
+| S2-1 | 定义 connection 事件边界 | `RtspConnection` 对上只发出 `OnRequest(RtspRequest)`、`OnInterleavedFrame(channel, bytes)`、`OnClosed(error)`；handler 使用 `weak_ptr` 或显式窄接口 | connection header 不包含 `RtspServerProtocol` 或 codec 类型 |
+| S2-2 | 迁移读取路径 | 移入 TCP socket、`read_chunk_`、`read_buffer_`、`RtspRequestParser`、`DoRead()` 和 `ProcessReadBuffer()` | request 分片、pipelining、`$` frame 分片、文本/frame 交错、超限和 parser error 后关闭 |
+| S2-3 | 迁移唯一写队列 | 提供 `SendRtsp()`、`SendInterleaved()`、`CloseAfterFlush()`；移入 `write_queue_`、`EnqueueWrite()` 和 `DoWrite()` | response、RTP 和 RTCP 混合排队时字节不交叉，任何时刻最多一个 `async_write` |
+| S2-4 | 迁移地址与关闭 | connection 提供只读 local/remote endpoint snapshot；实现幂等 `Close()`，明确 cancel、shutdown、close 和 `OnClosed` 只通知一次 | 对端断开、写失败、parser error 延迟关闭、重复 close 和析构晚到回调 |
+| S2-5 | 接回旧 session | 暂时保留旧 `ClientSession` 的 RTSP 方法和 track 状态，只把所有 TCP 操作改走 connection | S0/S1 回归通过，旧 session 不再含 socket/read/write queue 字段 |
+
+S2 gate：只有 `RtspConnection` 直接拥有并读写客户端 TCP socket；`ClientSession` 无法绕过 connection 发起 `async_write`。
+
+###### 12.9.7.5 S3：提取 `RtspClientSession` 与 `RtspSessionManager`
+
+目标：把嵌套 session 变成可测试的独立状态机，并去除其对 façade 的原始反向引用。
+
+| 编号 | 任务 | 接口与迁移内容 | 验证重点 |
+|---|---|---|---|
+| S3-1 | 定义只读 `RtspSessionContext` | 只暴露 tracks/config snapshot、SDP builder、multicast setup 查询和统计回调等窄依赖；禁止传入 `RtspServerProtocol&` | context 生命周期覆盖全部 session，子组件不能修改 server 配置 |
+| S3-2 | 独立 RTSP 状态机 | 迁移 `HandleRequest()`、session id、requested URL、track URL/RTP-Info 和 SETUP/PLAY/PAUSE/TEARDOWN 决策；用明确的 Init/Ready/Playing/Closed 状态表达当前语义 | method/state 矩阵、Session header 校验、aggregate URL 与 track URL、重复 PLAY/PAUSE |
+| S3-3 | 整理 `TrackSession` | 暂时聚合 track config、`RtspTransportSpec`、ready 状态和待迁移 sender/transport 数据；不在本阶段改变 RTP 字节 | 多 track 独立 SETUP，未 SETUP track 不发送，track id 解析保持不变 |
+| S3-4 | 新增 manager | 集中分配内部 id/session id、保存活动 `shared_ptr<RtspClientSession>`、删除和生成快照；registry 锁只保护容器 | 两客户端增删、重复关闭、遍历期间关闭、id 不重复、锁内无 I/O |
+| S3-5 | 调整 accept 路径 | `RtspServerProtocol::OnAccepted()` 只创建 connection/session 并注册 manager；closed callback 请求 manager 删除 | façade 不再调用 `RemoveSession()`/`SnapshotSessions()` 维护 weak vector |
+
+S3 gate：`ClientSession` 嵌套类、`owner_` 原始引用、`sessions_`、`next_session_id_`、`RemoveSession()` 和 `SnapshotSessions()` 从 façade 删除；所有 RTSP method 行为与 S0 基线一致。
+
+###### 12.9.7.6 S4：引入媒体 transport 边界
+
+目标：把“发送什么”和“通过哪种 socket 发送”分开，session 不再直接管理 UDP socket。
+
+| 编号 | 任务 | 接口与迁移内容 | 验证重点 |
+|---|---|---|---|
+| S4-1 | 定义 `IRtspMediaTransport` | 最小接口包含 RTP/RTCP send、RTCP receive callback、transport response snapshot 和幂等 close；所有方法注明 strand 前置条件 | 接口不出现 RTSP method、codec packetizer 或 server façade 类型 |
+| S4-2 | 实现 `TcpInterleavedTransport` | 只保存 RTP/RTCP channel 和 connection writer 弱引用；构建 `$ + channel + length` frame 后进入 connection 队列 | channel 映射、16-bit length、connection 已关闭、RTP/RTCP 排队顺序 |
+| S4-3 | 实现 `UdpUnicastTransport` | 迁移 RTP/RTCP socket 创建、bind、server/client endpoint、RTCP receive 和来源校验 | IPv4 endpoint、端口分配失败、意外 RTCP 来源、接收循环、重复 close |
+| S4-4 | 建立 transport factory | 根据已经解析并校验的 `RtspTransportSpec` 创建 transport；失败返回结构化错误供 session 映射为 461 | TCP 禁用、UDP 禁用、缺少 client_port、socket bind 失败时无半初始化 track |
+| S4-5 | 明确 multicast 订阅 | multicast SETUP 在 session 中只保存 `RtspMulticastSubscription` 值对象和共享 Transport response，不创建每客户端发送 socket，也不在每个 session 的媒体循环中重复发送 | 两个 multicast client 只产生一份共享 RTP packet |
+
+S4 gate：session 和 `TrackSession` 中不再出现 `udp::socket`、UDP endpoint/read buffer 或 `async_send_to`；TCP/UDP transport 测试和 S0 协议测试全部通过。
+
+###### 12.9.7.7 S5：提取 per-track `RtpSender`
+
+目标：集中 RTP header、sequence、timestamp 和 sender counters，消除 TCP/UDP 两条发送路径中的重复状态。
+
+| 编号 | 任务 | 接口与迁移内容 | 验证重点 |
+|---|---|---|---|
+| S5-1 | 定义 sender config/state | config 包含 payload type、SSRC、初始 sequence 和 clock rate；state 包含最近 timestamp、packet/octet count、下次 SR 时间 | 初始值可注入以保证测试确定性，生产默认生成规则保持不变 |
+| S5-2 | 迁移 RTP header 构建 | 输入 `RtpPayload { timestamp, marker, payload }`，输出完整 RTP packet；网络发送仍委托 transport | version/PT/marker、网络字节序、sequence 从 65535 回绕、timestamp 从 0xffffffff 回绕 |
+| S5-3 | 迁移 sender 统计 | 统一 packet/octet count 口径，其中 octet 只计算 RTP payload；明确计数发生在当前行为对应的排队时点 | TCP/UDP 统计一致，发送空 payload 不递增，分片逐 packet 递增 |
+| S5-4 | 迁移 SR 调度状态 | sender 判断 SR 是否到期，使用 `RtcpPacketCodec` 构建 packet，再交给 transport；首轮保持“媒体写入触发 SR”语义 | 首包 SR、5 秒门槛、NTP/RTP timestamp、无 RTP 时不发 SR |
+| S5-5 | 更新 session media path | session 只选择 track、调用 codec packetizer，并把每个 payload 交给相应 sender | H264 FU-A、AAC/G711、多 track、PAUSE 后不发送 |
+
+S5 gate：`TrackSession` 不再直接保存 SSRC、sequence、last timestamp、RTCP sender count 或 next SR time；TCP 和 UDP 共用同一个 `RtpSender` 实现。
+
+###### 12.9.7.8 S6：提取 `RtspMulticastPublisher`
+
+目标：将 server 级共享 multicast 资源从 façade 完整迁出，同时保持当前单 H264 track 限制。
+
+| 编号 | 任务 | 迁移内容 | 验证重点 |
+|---|---|---|---|
+| S6-1 | 定义生命周期接口 | `Configure()` 返回不可变 transport snapshot，`Publish()` 接收 access unit/payload，`Close()` 幂等，`GetStats()` 返回 snapshot | 未配置时不发送，重复 SETUP 复用同一 spec，关闭后不能重新进入 receive loop |
+| S6-2 | 迁移共享 UDP 资源 | 移入三个 multicast socket、RTP/RTCP endpoint、TTL/interface/join group 和 RTCP read buffer | 端口/地址错误不泄漏 socket，RTP 与 SR 发送 endpoint 正确，RR socket 正确 join group |
+| S6-3 | 复用 packetizer/sender/codec | multicast 调用 H264 packetizer、`RtpSender` 和 `RtcpPacketCodec`，不再保留独立 RTP header/RTCP parser 副本 | sequence/SSRC 全客户端共享，两个 client 不导致 packet count 翻倍 |
+| S6-4 | 迁移 receiver feedback | 按 reporter SSRC 聚合 RR snapshot，通过窄统计回调上报 façade | compound RR/SR、多个 reporter、错误 report block、统计累计保持一致 |
+| S6-5 | 切换 session 协调 | SETUP 获取共享 spec；`Write()` 只在至少一个对应 multicast track 处于 PLAY 时向 publisher 投递一次 | session 关闭不关闭共享 socket，最后一个 client 离开后的发送语义与基线一致 |
+
+S6 gate：`RtspServerProtocol` 头文件不再包含 multicast socket、endpoint、SSRC/sequence、RTCP buffer、feedback map 或 multicast helper；multicast S0 回归全部通过。
+
+###### 12.9.7.9 S7：收缩 façade、统一统计与关闭路径
+
+目标：删除迁移残留，使最终类结构和 12.9.2 的职责表一致。
+
+| 编号 | 任务 | 最终改动 | 验证重点 |
+|---|---|---|---|
+| S7-1 | 收缩 `RtspServerProtocol` 头文件 | 只保留 config/track immutable context、Asio runtime/listener、manager、multicast publisher、顶层 stats 和生命周期状态 | header 不暴露 connection/session/transport 的可变实现字段 |
+| S7-2 | 重写 `Write()` 编排 | 校验 track 后更新必要 codec 参数 snapshot，取得 session snapshot，并分别 post session 与 multicast publisher | registry 锁释放后才 packetize/post；buffer 生命周期覆盖异步任务 |
+| S7-3 | 统一 stats snapshot | connection/session/sender/multicast 各自生成只读 snapshot，façade 只聚合；明确 stopped 状态下返回规则 | packets/bytes/errors/clients/RR 计数与 S0 基线一致，无跨线程裸字段读取 |
+| S7-4 | 统一 `Start()`/`Stop()` | Start 失败按资源创建逆序清理；Stop 按 acceptor、投递入口、session、multicast、work guard、io thread 顺序关闭 | 启动失败、重复 Start/Stop 和停止后重启的返回语义与 S0 基线一致；发送中 Stop 无死锁，所有 callback 可安全晚到 |
+| S7-5 | 删除临时适配层 | 删除 owner callback 过渡代码、重复 helper、无用 include/forward declaration 和旧测试开关 | `rg` 确认 façade 内无 framing、RTCP 字段解析、UDP send/receive 或 AAC AU header |
+| S7-6 | 更新设计与文件地图 | 用最终真实类名和文件名回填 6.3、10、12.9 和 15；记录完成日期及与计划偏差 | 文档状态由“待实施”更新为“已完成”，每项验收有测试或代码位置证据 |
+
+S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，专用 RTSP CTest 和完整默认测试通过。
+
+###### 12.9.7.10 建议提交序列
+
+| 提交 | 内容 | 依赖 | 可回滚边界 |
+|---|---|---|---|
+| C0 | 自动化 RTSP server characterization test | 无 | 仅测试，不改生产行为 |
+| C-dir | 新增 `protocol/rtsp` 并迁移 parser/transport spec | C0 | 仅恢复文件路径和 include，不涉及逻辑回滚 |
+| C1 | `RtspResponseBuilder` + `RtspSdpBuilder` | C-dir | 恢复旧 helper 即可回滚 |
+| C2 | `RtcpPacketCodec` + `AudioRtpPacketizer` | C-dir | 恢复旧 helper 即可回滚 |
+| C3 | `RtspConnection` | C1、C2 | session 重新持有 socket/read/write 状态 |
+| C4 | `RtspClientSession` + `RtspSessionManager` | C3 | 恢复嵌套 session 和 weak registry |
+| C5 | TCP/UDP media transport | C4 | 恢复 TrackSession 内 transport 字段 |
+| C6 | `RtpSender` | C5 | 恢复 TrackSession 内 sender 字段和 packet helper |
+| C7 | `RtspMulticastPublisher` | C6 | 恢复 façade 共享 multicast 字段 |
+| C8 | façade/stats/close 清理与文档回填 | C7 | 只清理已迁移代码，不改变协议行为 |
+
+`C-dir` 只允许做路径、include 和必要的构建引用调整，不得夹带逻辑修改。C1 和 C2 可以分别开发，但合并到 C3 前都必须通过 C0 对应的 S0 基线。C3 到 C8 涉及连续所有权迁移，应严格串行，避免两个分支同时修改 `rtsp_server_protocol.cpp` 造成难以审查的冲突。
+
+###### 12.9.7.11 风险与控制措施
+
+| 风险 | 典型后果 | 控制措施 |
+|---|---|---|
+| TCP 写队列被拆成多份 | RTSP response 与 RTP/RTCP 字节交叉，播放器随机断流 | connection 作为唯一 writer；测试记录最大 in-flight write 数必须为 1 |
+| 异步回调形成引用环或悬空引用 | session 永不释放或 Stop 后 use-after-free | owner 使用 `shared_ptr`、反向通知使用 `weak_ptr`；close 测试检查析构和晚到 callback |
+| registry 锁覆盖 I/O | 慢客户端阻塞所有客户端，Stop 发生死锁 | 锁内只增删/复制 `shared_ptr`；代码审查禁止锁内 post 之外的调用 |
+| 媒体 buffer 提前释放 | 异步发送得到损坏 RTP payload | post 前转为共享 immutable buffer，测试在 `Write()` 返回后立即释放输入对象 |
+| RTCP 解析迁移改变 signed/length 语义 | 丢包率和累计丢包统计错误，畸形包越界读取 | codec 使用有界 cursor/structured result；对截断、溢出和 signed 24-bit 建表测试 |
+| multicast 按 session 重复发送 | 客户端数越多，组播包重复越多 | 只允许 server 级 publisher 调用 send；双客户端断言只收到一组 sequence |
+| 状态机重写改变兼容行为 | 常见播放器 SETUP/PLAY 失败 | P0 固化 method/state 矩阵；本轮不顺带强化 RFC 响应 |
+| 统计迁移造成数据竞争或重复计数 | `GetStats()` 不稳定，指标失真 | 子组件在 strand 内更新并输出 snapshot；façade 只合并不可变副本 |
+| 目录迁移残留新旧两份源文件 | 同一个符号重复定义，或不同平台编译到不同实现 | `C-dir` 后重新 configure；用 `rg --files` 和 include 搜索确认旧路径及旧引用均为零 |
+
+###### 12.9.7.12 最终 Definition of Done
+
+- C0、C-dir 及 C1 到 C8 均有独立、可审查的提交，生产行为变化必须另开任务，不能混入类拆分提交。
+- 12.9.2 中列出的目标组件已经落地，所有权与 12.9.3 一致，不存在 façade 原始反向引用和重复可变状态。
+- 新增代码已按 12.9.1 的要求添加详细中文注释，尤其覆盖异步生命周期、线程边界、关闭幂等和 RTP/RTCP 字段。
+- 新增单元测试、`test_rtsp_request_parser`、`test_rtsp_server_protocol` 以及默认 CTest 全部通过；真实摄像头和 VLC/FFmpeg 冒烟测试作为补充证据单独记录。
+- `git diff --check`、项目格式检查和支持平台的 Debug/Release 构建通过；可用环境下完成 AddressSanitizer 或 ThreadSanitizer 检查。
+- 文档中的技术债状态、文件地图、测试入口和完成日期已按最终实现更新。
+
+##### 12.9.8 测试与验收
+
+- `OPTIONS`、`DESCRIBE`、`SETUP`、`PLAY`、`PAUSE`、`TEARDOWN` 和 `GET_PARAMETER` 的状态码、header 与状态转换保持不变。
+- TCP interleaved、UDP unicast、UDP multicast 的 SDP、Transport response、RTP payload 和 RTCP SR/RR 回归通过。
+- malformed、分片、带 body 和 pipelined RTSP request，以及 RTSP/interleaved frame 混合输入测试通过。
+- 覆盖多 track、两个并发客户端、客户端中途断开、重复 `Start()`/`Stop()` 和发送中的 `Stop()`。
+- 验证同一 TCP socket 始终只有一个 write in flight；AddressSanitizer/ThreadSanitizer 可用环境下无 use-after-free、数据竞争或关闭后发送。
+- 为纯组件和状态机新增独立 CTest；自动测试必须使用本地、有限时长的 socket fixture，不依赖当前默认进入无限循环的摄像头测试。
+- 完成后 `RtspServerProtocol` 仅保留 façade、runtime、listener、manager/multicast 编排和统计聚合，不再出现 RTSP 字节 framing、RTCP packet 字段解析、AAC AU header 或 UDP transport 细节。
+
+##### 12.9.9 后续生产化工作
+
+类拆分稳定后再按新边界推进以下能力：
+
+- 在 `RtspClientSession` 前增加 Basic/Digest 鉴权、会话 idle timeout 和访问控制。
+- 在 `RtspSessionManager` 增加最大连接数、按地址限流和连接统计。
+- 在 `RtspConnection` 增加每客户端发送队列上限、慢客户端隔离和 RTSPS 支持。
+- 扩展 transport/地址抽象以支持 IPv6，并评估 RTSP aggregate control 和更完整的 RFC 错误响应。
+- 使用 VLC、FFmpeg、GStreamer 和常见 NVR 建立互操作矩阵测试。
 
 #### 12.10 多目标和主备发布
 
@@ -1064,6 +1395,8 @@ FFmpeg publisher：
 - `src/media/protocol/ffmpeg_mux_protocol.cpp`
 
 RTSP Server publisher：
+
+以下为当前路径；代码迁移尚未开始。目标目录布局和分批迁移范围见 12.9.5。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
