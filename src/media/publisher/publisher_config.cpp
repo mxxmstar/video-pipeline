@@ -190,6 +190,33 @@ PublisherResult PublisherConfig::ValidateProtocol() const {
                 return Invalid("RTSP allowed client address must be an IP address");
             }
         }
+        if (rtsp.auth_mode != RtspAuthMode::None) {
+            if (rtsp.auth_username.empty() || rtsp.auth_password.empty()) {
+                return Invalid("RTSP authentication requires username and password");
+            }
+            if (rtsp.auth_username.find(':') != std::string::npos ||
+                rtsp.auth_username.find('"') != std::string::npos ||
+                rtsp.auth_realm.empty() ||
+                rtsp.auth_realm.find('"') != std::string::npos) {
+                return Invalid("RTSP authentication username or realm is invalid");
+            }
+            const auto has_control = [](const std::string& value) {
+                return std::any_of(value.begin(), value.end(), [](unsigned char ch) {
+                    return ch < 32 || ch == 127;
+                });
+            };
+            if (has_control(rtsp.auth_username) ||
+                has_control(rtsp.auth_password) ||
+                has_control(rtsp.auth_realm)) {
+                return Invalid("RTSP authentication values must not contain control characters");
+            }
+            if (rtsp.auth_mode == RtspAuthMode::Digest &&
+                rtsp.auth_nonce_ttl_ms <= 0) {
+                return Invalid("RTSP Digest nonce TTL must be positive");
+            }
+        } else if (rtsp.auth_nonce_ttl_ms < 0) {
+            return Invalid("RTSP authentication nonce TTL must not be negative");
+        }
         if (rtsp.enable_multicast) {
             if (!rtsp.enable_udp) {
                 return Invalid("RTSP multicast requires UDP to be enabled");

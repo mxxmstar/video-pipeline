@@ -2,6 +2,237 @@
 
 #include "common/log/logger.h"
 
+#include <array>
+#include <cctype>
+#include <iomanip>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string_view>
+
+#include <boost/uuid/detail/md5.hpp>
+
+namespace {
+
+bool AsciiEqualsIgnoreCase(std::string_view lhs, std::string_view rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        const auto lower = [](unsigned char ch) {
+            return ch >= 'A' && ch <= 'Z'
+                ? static_cast<unsigned char>(ch + ('a' - 'A'))
+                : ch;
+        };
+        if (lower(static_cast<unsigned char>(lhs[i])) !=
+            lower(static_cast<unsigned char>(rhs[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string Md5Hex(std::string_view value) {
+    boost::uuids::detail::md5 hash;
+    hash.process_bytes(value.data(), value.size());
+    boost::uuids::detail::md5::digest_type digest{};
+    hash.get_digest(digest);
+
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const auto byte : digest) {
+        output << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    return output.str();
+}
+
+bool ConstantTimeEquals(std::string_view lhs, std::string_view rhs) {
+    const auto size = std::max(lhs.size(), rhs.size());
+    unsigned char difference = static_cast<unsigned char>(lhs.size() ^ rhs.size());
+    for (std::size_t i = 0; i < size; ++i) {
+        const auto left = i < lhs.size()
+            ? static_cast<unsigned char>(lhs[i])
+            : static_cast<unsigned char>(0);
+        const auto right = i < rhs.size()
+            ? static_cast<unsigned char>(rhs[i])
+            : static_cast<unsigned char>(0);
+        difference = static_cast<unsigned char>(difference | (left ^ right));
+    }
+    return difference == 0;
+}
+
+std::optional<std::string> DecodeBase64(std::string_view value) {
+    static constexpr std::string_view alphabet =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (value.empty() || value.size() % 4 != 0) {
+        return std::nullopt;
+    }
+
+    std::string decoded;
+    decoded.reserve(value.size() / 4 * 3);
+    for (std::size_t offset = 0; offset < value.size(); offset += 4) {
+        std::array<int, 4> digits{};
+        int padding = 0;
+        for (std::size_t index = 0; index < 4; ++index) {
+            const auto ch = value[offset + index];
+            if (ch == '=') {
+                ++padding;
+                digits[index] = 0;
+                if (index < 2 || (padding == 1 && index != 3)) {
+                    return std::nullopt;
+                }
+            } else {
+                if (padding != 0) {
+                    return std::nullopt;
+                }
+                const auto position = alphabet.find(ch);
+                if (position == std::string_view::npos) {
+                    return std::nullopt;
+                }
+                digits[index] = static_cast<int>(position);
+            }
+        }
+        const auto combined = (digits[0] << 18) |
+                              (digits[1] << 12) |
+                              (digits[2] << 6) |
+                              digits[3];
+        decoded.push_back(static_cast<char>((combined >> 16) & 0xFF));
+        if (padding < 2) {
+            decoded.push_back(static_cast<char>((combined >> 8) & 0xFF));
+        }
+        if (padding == 0) {
+            decoded.push_back(static_cast<char>(combined & 0xFF));
+        }
+        if (padding > 0 && offset + 4 != value.size()) {
+            return std::nullopt;
+        }
+    }
+    return decoded;
+}
+
+std::optional<std::map<std::string, std::string>> ParseDigestParameters(
+    std::string_view value) {
+    std::map<std::string, std::string> parameters;
+    std::size_t offset = 0;
+    while (offset < value.size()) {
+        while (offset < value.size() &&
+               (value[offset] == ' ' || value[offset] == '\t' || value[offset] == ',')) {
+            ++offset;
+        }
+        if (offset == value.size()) {
+            break;
+        }
+
+        const auto key_begin = offset;
+        while (offset < value.size() && value[offset] != '=' &&
+               value[offset] != ',' && value[offset] != ' ' && value[offset] != '\t') {
+            ++offset;
+        }
+        if (key_begin == offset) {
+            return std::nullopt;
+        }
+        const auto key = value.substr(key_begin, offset - key_begin);
+        while (offset < value.size() && (value[offset] == ' ' || value[offset] == '\t')) {
+            ++offset;
+        }
+        if (offset == value.size() || value[offset] != '=') {
+            return std::nullopt;
+        }
+        ++offset;
+        while (offset < value.size() && (value[offset] == ' ' || value[offset] == '\t')) {
+            ++offset;
+        }
+
+        std::string parsed_value;
+        if (offset < value.size() && value[offset] == '"') {
+            ++offset;
+            while (offset < value.size() && value[offset] != '"') {
+                if (value[offset] == '\\') {
+                    ++offset;
+                    if (offset == value.size()) {
+                        return std::nullopt;
+                    }
+                }
+                parsed_value.push_back(value[offset++]);
+            }
+            if (offset == value.size() || value[offset] != '"') {
+                return std::nullopt;
+            }
+            ++offset;
+        } else {
+            const auto value_begin = offset;
+            while (offset < value.size() && value[offset] != ',') {
+                ++offset;
+            }
+            auto value_end = offset;
+            while (value_end > value_begin &&
+                   (value[value_end - 1] == ' ' || value[value_end - 1] == '\t')) {
+                --value_end;
+            }
+            if (value_begin == value_end) {
+                return std::nullopt;
+            }
+            parsed_value.assign(value.substr(value_begin, value_end - value_begin));
+        }
+
+        const auto lower_key = [&]() {
+            std::string result(key);
+            for (auto& ch : result) {
+                ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            }
+            return result;
+        }();
+        if (!parameters.emplace(lower_key, std::move(parsed_value)).second) {
+            return std::nullopt;
+        }
+        while (offset < value.size() && (value[offset] == ' ' || value[offset] == '\t')) {
+            ++offset;
+        }
+        if (offset < value.size() && value[offset] != ',') {
+            return std::nullopt;
+        }
+    }
+    return parameters;
+}
+
+bool IsHexValue(std::string_view value) {
+    return !value.empty() && std::all_of(value.begin(), value.end(), [](unsigned char ch) {
+        return (ch >= '0' && ch <= '9') ||
+               (ch >= 'a' && ch <= 'f') ||
+               (ch >= 'A' && ch <= 'F');
+    });
+}
+
+std::optional<std::uint32_t> ParseHex32(std::string_view value) {
+    if (value.empty() || value.size() > 8 || !IsHexValue(value)) {
+        return std::nullopt;
+    }
+    std::uint32_t result = 0;
+    for (const auto ch : value) {
+        result <<= 4;
+        if (ch >= '0' && ch <= '9') {
+            result += static_cast<std::uint32_t>(ch - '0');
+        } else if (ch >= 'a' && ch <= 'f') {
+            result += static_cast<std::uint32_t>(ch - 'a' + 10);
+        } else {
+            result += static_cast<std::uint32_t>(ch - 'A' + 10);
+        }
+    }
+    return result;
+}
+
+std::string MakeNonce(std::uint64_t session_id) {
+    std::random_device random;
+    std::ostringstream output;
+    output << std::hex << std::setfill('0')
+           << static_cast<std::uint64_t>(random()) << session_id
+           << static_cast<std::uint64_t>(
+                  std::chrono::steady_clock::now().time_since_epoch().count());
+    return Md5Hex(output.str());
+}
+
+} // namespace
+
     // connection 只捕获 session 的 weak_ptr；manager 是 session 的强所有者，
     // 因而 socket 的晚到回调不会延长已移除 session 的生命周期。
     std::shared_ptr<RtspClientSession> RtspClientSession::Create(
@@ -194,6 +425,10 @@ RtspClientSession::RtspClientSession(
 
         if (request.uri == "*" && request.method != "OPTIONS") {
             SendRtsp(RtspResponseBuilder::Build(400, "Bad Request", cseq));
+            return;
+        }
+
+        if (!AuthenticateRequest(request, cseq)) {
             return;
         }
 
@@ -745,6 +980,150 @@ RtspClientSession::RtspClientSession(
         if (on_closed_) {
             on_closed_(id_);
         }
+}
+
+bool RtspClientSession::AuthenticateRequest(const RtspRequest& request,
+                                            const std::string& cseq) {
+    const auto mode = context_->config.rtsp.auth_mode;
+    if (mode == RtspAuthMode::None) {
+        return true;
+    }
+
+    const auto authorization = request.HeaderValues("Authorization");
+    bool authorized = false;
+    bool stale_nonce = false;
+    if (authorization.size() == 1) {
+        if (mode == RtspAuthMode::Basic) {
+            const auto header = authorization.front();
+            const auto separator = header.find(' ');
+            if (separator != std::string_view::npos &&
+                AsciiEqualsIgnoreCase(header.substr(0, separator), "Basic")) {
+                const auto decoded = DecodeBase64(header.substr(separator + 1));
+                if (decoded) {
+                    const auto colon = decoded->find(':');
+                    authorized = colon != std::string::npos &&
+                                 ConstantTimeEquals(
+                                     decoded->substr(0, colon),
+                                     context_->config.rtsp.auth_username) &&
+                                 ConstantTimeEquals(
+                                     decoded->substr(colon + 1),
+                                     context_->config.rtsp.auth_password);
+                }
+            }
+        } else if (mode == RtspAuthMode::Digest) {
+            authorized = ValidateDigestAuthorization(
+                request,
+                authorization.front(),
+                stale_nonce);
+        }
+    }
+
+    if (!authorized) {
+        SendUnauthorized(cseq, stale_nonce);
+        return false;
+    }
+    return true;
+}
+
+bool RtspClientSession::ValidateDigestAuthorization(
+    const RtspRequest& request,
+    std::string_view authorization,
+    bool& stale_nonce) {
+    const auto separator = authorization.find(' ');
+    if (separator == std::string_view::npos ||
+        !AsciiEqualsIgnoreCase(authorization.substr(0, separator), "Digest")) {
+        return false;
+    }
+
+    const auto parsed = ParseDigestParameters(authorization.substr(separator + 1));
+    if (!parsed) {
+        return false;
+    }
+    const auto& parameters = *parsed;
+    const auto find = [&parameters](std::string_view name) -> const std::string* {
+        const auto it = parameters.find(std::string{name});
+        return it == parameters.end() ? nullptr : &it->second;
+    };
+    const auto* username = find("username");
+    const auto* realm = find("realm");
+    const auto* nonce = find("nonce");
+    const auto* uri = find("uri");
+    const auto* response = find("response");
+    const auto* qop = find("qop");
+    const auto* nc = find("nc");
+    const auto* cnonce = find("cnonce");
+    const auto* algorithm = find("algorithm");
+    if (!username || !realm || !nonce || !uri || !response ||
+        !qop || !nc || !cnonce ||
+        !AsciiEqualsIgnoreCase(algorithm ? *algorithm : "MD5", "MD5") ||
+        *username != context_->config.rtsp.auth_username ||
+        *realm != context_->config.rtsp.auth_realm ||
+        *uri != request.uri ||
+        !AsciiEqualsIgnoreCase(*qop, "auth") ||
+        nc->size() != 8 || !IsHexValue(*nc) ||
+        cnonce->empty() || response->size() != 32 || !IsHexValue(*response)) {
+        return false;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto nonce_age = now - auth_nonce_created_at_;
+    const auto nonce_ttl = std::chrono::milliseconds(
+        context_->config.rtsp.auth_nonce_ttl_ms);
+    const auto nonce_count = ParseHex32(*nc);
+    if (auth_nonce_.empty() || *nonce != auth_nonce_ || nonce_age >= nonce_ttl) {
+        stale_nonce = !auth_nonce_.empty() && *nonce == auth_nonce_;
+        return false;
+    }
+    if (!nonce_count || *nonce_count <= digest_nonce_count_) {
+        return false;
+    }
+
+    const auto& options = context_->config.rtsp;
+    const auto ha1 = Md5Hex(options.auth_username + ":" +
+                            options.auth_realm + ":" +
+                            options.auth_password);
+    const auto ha2 = Md5Hex(request.method + ":" + request.uri);
+    const auto expected = Md5Hex(ha1 + ":" + *nonce + ":" + *nc + ":" +
+                                 *cnonce + ":" + *qop + ":" + ha2);
+    if (!ConstantTimeEquals(expected, *response)) {
+        return false;
+    }
+    digest_nonce_count_ = *nonce_count;
+    return true;
+}
+
+void RtspClientSession::SendUnauthorized(const std::string& cseq,
+                                          bool stale_nonce) {
+    const auto& options = context_->config.rtsp;
+    std::string challenge;
+    if (options.auth_mode == RtspAuthMode::Basic) {
+        challenge = "Basic realm=\"" + options.auth_realm + "\"";
+    } else {
+        challenge = "Digest realm=\"" + options.auth_realm +
+                    "\", nonce=\"" + EnsureDigestNonce() +
+                    "\", algorithm=MD5, qop=\"auth\"";
+        if (stale_nonce) {
+            challenge += ", stale=true";
+        }
+    }
+
+    SendRtsp(RtspResponseBuilder::Build(
+        401,
+        "Unauthorized",
+        cseq,
+        {{"WWW-Authenticate", challenge}}));
+}
+
+std::string RtspClientSession::EnsureDigestNonce() {
+    const auto now = std::chrono::steady_clock::now();
+    const auto ttl = std::chrono::milliseconds(
+        context_->config.rtsp.auth_nonce_ttl_ms);
+    if (auth_nonce_.empty() || now - auth_nonce_created_at_ >= ttl) {
+        auth_nonce_ = MakeNonce(id_);
+        auth_nonce_created_at_ = now;
+        digest_nonce_count_ = 0;
+    }
+    return auth_nonce_;
 }
 
 void RtspClientSession::TouchActivity() {

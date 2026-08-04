@@ -23,6 +23,16 @@ enum class PublishProtocol {
     WebRtc,     ///< WebRTC 推送.
 };
 
+/// @brief RTSP 控制面鉴权方式。
+///
+/// None 保持现有兼容行为；Basic 适合可信 TLS/内网链路；Digest 使用
+/// RFC 2617 风格的 MD5 challenge-response，避免在 RTSP header 中直接发送密码。
+enum class RtspAuthMode {
+    None,
+    Basic,
+    Digest,
+};
+
 struct MediaTrackConfig {
     int track_id{0};
     MediaType media_type{MediaType::VIDEO};
@@ -88,6 +98,14 @@ struct RtspServerOptions {
     // 允许建立 RTSP session 的客户端 IP 精确列表。空列表表示允许所有地址；
     // 当前不解析 CIDR，避免把配置中的网段语义误判成单个客户端地址。
     std::vector<std::string> allowed_client_addresses;
+    RtspAuthMode auth_mode{RtspAuthMode::None};
+    // Basic/Digest 共用的账号、密码和 challenge realm。鉴权关闭时这些字段
+    // 不参与行为；密码仍只保存在配置快照中，不会写入日志或 response。
+    std::string auth_username;
+    std::string auth_password;
+    std::string auth_realm{"video-pipeline"};
+    // Digest nonce 的有效期，单位为毫秒；过期 nonce 只触发新的 401 challenge。
+    int auth_nonce_ttl_ms{300000};
     // 当 SETUP 请求 RTP/AVP;multicast 但没有指定 destination、port 或 ttl 时，
     // 使用这里的默认组播目标。
     std::string multicast_address{"239.255.0.1"};

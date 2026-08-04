@@ -787,7 +787,9 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
   - 状态：已修复。
   - 修复日期：2026-08-03。
   - 修复方法：新增独立、可增量调用的 `RtspRequestParser`，实现 RFC 2326 RTSP/1.0 request-line、header（字段名大小写不敏感、重复字段和折叠行）、`Content-Length` entity body 与 pipelining 消息边界解析；严格拒绝非法 CRLF、token、absolute URI、version、header 控制字符和冲突长度，并增加 request-line/header/body 资源上限。`ClientSession` 改为消费结构化 request，强制唯一数字 `CSeq`，版本不支持时返回 505，语法错误返回 400 后关闭连接。新增 `test_rtsp_request_parser` CTest，覆盖分片、body、流水线和畸形输入。
-- 没有 Basic/Digest 鉴权和 RTSPS；这两项仍属于后续生产化阶段。
+- Basic/Digest 鉴权已实现基础版本；RTSPS、鉴权失败限速和外部凭据存储仍待后续生产化阶段。
+  - 修复日期：2026-08-04。
+  - 修复方法：`RtspClientSession` 支持配置启用 Basic 或 Digest-MD5/qop=auth，未授权请求返回 `401 Unauthorized` 和 `WWW-Authenticate` challenge；Digest nonce 按 session 隔离并受 TTL 限制，错误或过期 nonce 不进入 RTSP method 状态机。
 - 会话 idle timeout 和客户端地址访问控制已实现基础版本：`session_idle_timeout_ms=0` 或空 `allowed_client_addresses` 时保持关闭/放行的兼容默认值；当前 allowlist 只支持精确 IP，不支持 CIDR。
   - 修复日期：2026-08-04。
   - 修复方法：`RtspClientSession` 在其 Asio executor 上维护可取消的 `steady_timer`，由 RTSP request、interleaved/RTCP 和媒体发送刷新；非 PLAY 状态控制面超时后走幂等 `Close()`。`RtspSessionManager` 在进入 registry 前读取 remote endpoint 并执行精确 IP allowlist，拒绝连接不会分配 session ID 或占用媒体资源。
@@ -810,7 +812,7 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
   - S4 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S4 实施记录。
   - S5 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S5 实施记录。
   - S6 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S6 实施记录。
-  - S7 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S7 实施记录。后续鉴权、慢客户端隔离、IPv6 和互操作矩阵属于独立生产化工作，不再扩大 façade 的职责。
+  - S7 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S7 实施记录。鉴权、慢客户端隔离、IPv6 和互操作矩阵均按 12.9.9 独立推进，不扩大 façade 的职责。
 - 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
 - TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
 - 慢客户端隔离、长时间运行、时间戳回绕和真实接收端互操作测试仍不充分；启动失败回滚、重复 Stop、停止后重启及并发 Write/Stop 已由 S7 生命周期测试覆盖。
@@ -1398,7 +1400,7 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 类拆分稳定后再按新边界推进以下能力：
 
 - **P1：会话资源保护（已完成，2026-08-04）**：在 `RtspClientSession`/`RtspSessionManager` 边界增加控制面 idle timeout 和精确 IP allowlist；默认关闭，先不改变现有客户端行为。
-- **P2：RTSP 鉴权**：增加 Basic/Digest challenge、凭据校验、nonce 生命周期和鉴权失败限速；鉴权配置启用后再改变未授权请求的响应。
+- **P2：RTSP 鉴权（基础版本已完成，2026-08-04）**：Basic/Digest challenge、凭据校验和 nonce 生命周期已接入；鉴权失败限速、外部凭据存储和 RTSPS 另行推进。
 - 在 `RtspSessionManager` 增加最大连接数、按地址限流和连接统计。
 - 在 `RtspConnection` 增加每客户端发送队列上限、慢客户端隔离和 RTSPS 支持。
 - 扩展 transport/地址抽象以支持 IPv6，并评估 RTSP aggregate control 和更完整的 RFC 错误响应。
@@ -1413,6 +1415,16 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 - **测试补充**：扩展 `test_rtsp_server_lifecycle`，覆盖 50 ms 空 session 自动关闭、`127.0.0.2` allowlist 拒绝 `127.0.0.1` 客户端、失败后客户端计数保持为 0；原有 Stop/Start、并发 Write/Stop 和协议回归继续执行。
 - **验证结果**：通过项目 VS/NMake 环境编译 `video_pipeline_lib`、`test_rtsp_server_lifecycle` 和 `test_rtsp_server_protocol`；10 项 RTSP 定向 CTest 全部通过，结果为 10/10，总耗时约 1.88 秒。完整默认构建曾在无关测试目标阶段超时，但受影响目标均已成功编译。
 - **阶段结论**：P1 gate 已满足。下一步进入 P2 Basic/Digest 鉴权设计与实现，需先固定 `401` challenge、Session/CSeq 组合请求和 nonce 失效语义，再接入 session 状态机。
+
+###### 12.9.9.2 P2 实施记录（2026-08-04）
+
+- **配置与默认行为**：`RtspServerOptions` 新增 `auth_mode`、`auth_username`、`auth_password`、`auth_realm` 和 `auth_nonce_ttl_ms`。`auth_mode=None` 时不读取凭据、不增加 response header；Basic/Digest 启用时配置校验要求非空账号密码、合法 realm 和正 nonce TTL。
+- **Basic challenge**：未携带或携带错误 `Authorization` 时返回 `401 Unauthorized` 与 `WWW-Authenticate: Basic realm=...`；凭据使用严格 Base64 解码，用户名和密码采用常量时间比较，不把密码写入日志。
+- **Digest challenge**：返回 `algorithm=MD5, qop=\"auth\"` challenge；按 session 生成随机 nonce 并记录创建时间，校验 username/realm/uri/method、nonce TTL、单调递增的 nc/cnonce/qop 和 RFC 2617 HA1/HA2 response。过期 nonce 返回新的 challenge 并标记 `stale=true`，重复 nc 不会继续执行 OPTIONS/DESCRIBE/SETUP 等 method。
+- **请求状态边界**：鉴权位于 CSeq/version/URI 语法检查之后、RTSP method 状态机之前；401 response 保留原 CSeq，授权成功后沿用原有 Session、Transport 和媒体路径。Authorization 重复、scheme 不匹配、Digest 参数重复或缺失均按未授权处理。
+- **中文注释与测试**：新增代码注释覆盖 Base64/MD5 字节序、常量时间比较、Digest 参数解析、nonce 生命周期、nc 重放保护和 401 语义；扩展 `test_rtsp_server_lifecycle` 验证 Basic 401/200、Digest challenge/正确 response/重复 nc 拒绝，扩展 `test_publisher_protocol` 验证鉴权配置校验。
+- **验证结果**：`video_pipeline_lib`、`test_publisher_protocol`、`test_rtsp_server_lifecycle` 和 `test_rtsp_server_protocol` 在 VS/NMake Debug 环境编译通过；相关 3 项 CTest 全部通过，随后完整 10 项 RTSP 定向 CTest 继续回归。
+- **阶段结论**：P2 基础鉴权 gate 已满足。下一步为 `RtspSessionManager` 最大连接数、按地址限流和连接统计；鉴权失败限速应与该阶段的地址限流策略一起设计。
 
 #### 12.10 多目标和主备发布
 
@@ -1465,7 +1477,7 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | `test_rtsp_media_transport` | transport factory 边界、UDP RTP/RTCP 发送、RTCP 来源校验和幂等关闭 |
 | `test_rtp_sender` | RTP header、sequence/timestamp 回绕、sender counters、SR 首包和 5 秒调度 |
 | `test_rtsp_multicast_publisher` | multicast 地址/端口校验、共享 RTP/SR 发送、RR reporter 聚合、幂等关闭和关闭后禁止重启 |
-| `test_rtsp_server_lifecycle` | Start 失败回滚、停止后 Write、重复 Stop、停止后重启、并发 Write/Stop、idle timeout 和 IP allowlist |
+| `test_rtsp_server_lifecycle` | Start 失败回滚、停止后 Write、重复 Stop、停止后重启、并发 Write/Stop、idle timeout、IP allowlist 和 Basic/Digest 鉴权 |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1557,7 +1569,7 @@ RTP/bitstream 工具：
 - `test/media/test_rtsp_media_transport.cpp`（TCP/UDP transport factory 和 UDP socket 边界测试）
 - `test/media/test_rtp_sender.cpp`（RTP sender header、回绕、统计和 SR 调度测试）
 - `test/media/test_rtsp_multicast_publisher.cpp`（共享 multicast publisher 的 socket、sender、RR 聚合和生命周期测试）
-- `test/media/test_rtsp_server_lifecycle.cpp`（`RtspServerProtocol` 启动失败回滚、Stop/Start 幂等、并发媒体关闭、idle timeout 和 IP allowlist 测试）
+- `test/media/test_rtsp_server_lifecycle.cpp`（`RtspServerProtocol` 启动失败回滚、Stop/Start 幂等、并发媒体关闭、idle timeout、IP allowlist 和 Basic/Digest 鉴权测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`

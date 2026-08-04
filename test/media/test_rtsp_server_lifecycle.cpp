@@ -5,9 +5,14 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <iomanip>
+#include <sstream>
+#include <string>
 #include <thread>
 
+#include <boost/uuid/detail/md5.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/write.hpp>
 
 namespace {
 
@@ -76,6 +81,139 @@ bool WaitForPeerClose(boost::asio::ip::tcp::socket& socket) {
         return false;
     }
     return false;
+}
+
+bool ReadRtspResponse(boost::asio::ip::tcp::socket& socket,
+                      std::string& response) {
+    socket.non_blocking(true);
+    std::array<char, 1024> buffer{};
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        boost::system::error_code ec;
+        const auto count = socket.read_some(boost::asio::buffer(buffer), ec);
+        if (!ec && count != 0) {
+            response.append(buffer.data(), count);
+            if (response.find("\r\n\r\n") != std::string::npos) {
+                return true;
+            }
+            continue;
+        }
+        if (ec == boost::asio::error::would_block ||
+            ec == boost::asio::error::try_again) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+std::string Md5HexForTest(const std::string& value) {
+    boost::uuids::detail::md5 hash;
+    hash.process_bytes(value.data(), value.size());
+    boost::uuids::detail::md5::digest_type digest{};
+    hash.get_digest(digest);
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const auto byte : digest) {
+        output << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    return output.str();
+}
+
+std::string ExtractDigestNonce(const std::string& response) {
+    const auto marker = response.find("nonce=\"");
+    assert(marker != std::string::npos);
+    const auto begin = marker + std::string{"nonce=\""}.size();
+    const auto end = response.find('"', begin);
+    assert(end != std::string::npos);
+    return response.substr(begin, end - begin);
+}
+
+void SendOptions(boost::asio::ip::tcp::socket& socket,
+                 const std::string& authorization = {}) {
+    std::string request =
+        "OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n";
+    if (!authorization.empty()) {
+        request += "Authorization: " + authorization + "\r\n";
+    }
+    request += "\r\n";
+    boost::asio::write(socket, boost::asio::buffer(request));
+}
+
+void TestBasicAndDigestAuthentication() {
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.auth_mode = RtspAuthMode::Basic;
+        config.rtsp.auth_username = "admin";
+        config.rtsp.auth_password = "secret";
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket client(client_io);
+        client.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        SendOptions(client);
+        std::string response;
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 401 Unauthorized") != std::string::npos);
+        assert(response.find("WWW-Authenticate: Basic realm=\"video-pipeline\"") !=
+               std::string::npos);
+
+        response.clear();
+        SendOptions(client, "Basic YWRtaW46c2VjcmV0");
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+        protocol.Stop();
+    }
+
+    {
+        RtspServerProtocol protocol;
+        auto config = MakeConfig(FindFreeTcpPort());
+        config.rtsp.auth_mode = RtspAuthMode::Digest;
+        config.rtsp.auth_username = "admin";
+        config.rtsp.auth_password = "secret";
+        config.rtsp.auth_realm = "test-realm";
+        assert(protocol.Start(config, MakeTracks()));
+
+        boost::asio::io_context client_io;
+        boost::asio::ip::tcp::socket client(client_io);
+        client.connect({boost::asio::ip::address_v4::loopback(),
+                        config.listen_port});
+        SendOptions(client);
+        std::string response;
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 401 Unauthorized") != std::string::npos);
+        const auto nonce = ExtractDigestNonce(response);
+
+        const std::string uri = "*";
+        const std::string nc = "00000001";
+        const std::string cnonce = "abcdef0123456789";
+        const std::string qop = "auth";
+        const auto ha1 = Md5HexForTest("admin:test-realm:secret");
+        const auto ha2 = Md5HexForTest("OPTIONS:" + uri);
+        const auto digest = Md5HexForTest(
+            ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":" + qop + ":" + ha2);
+        const auto authorization =
+            "Digest username=\"admin\", realm=\"test-realm\", nonce=\"" +
+            nonce + "\", uri=\"*\", algorithm=MD5, qop=auth, nc=" + nc +
+            ", cnonce=\"" + cnonce + "\", response=\"" + digest + "\"";
+
+        response.clear();
+        SendOptions(client, authorization);
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 200 OK") != std::string::npos);
+
+        // 同一 nonce 下重复使用相同 nc 必须被拒绝，避免抓到一条合法
+        // Authorization 后无限重放 RTSP method。
+        response.clear();
+        SendOptions(client, authorization);
+        assert(ReadRtspResponse(client, response));
+        assert(response.find("RTSP/1.0 401 Unauthorized") != std::string::npos);
+        protocol.Stop();
+    }
 }
 
 void TestIdleTimeoutAndAddressAllowlist() {
@@ -168,6 +306,7 @@ void TestConcurrentWriteAndStop() {
 } // namespace
 
 int main() {
+    TestBasicAndDigestAuthentication();
     TestIdleTimeoutAndAddressAllowlist();
     TestFailureRollbackAndRestart();
     TestConcurrentWriteAndStop();

@@ -153,6 +153,16 @@ static void TestPublisherConfigValidation() {
     config.rtsp.allowed_client_addresses = {"127.0.0.1"};
     assert(config.Validate().code == PublisherErrorCode::None);
 
+    config.rtsp.auth_mode = RtspAuthMode::Basic;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+    config.rtsp.auth_username = "admin";
+    config.rtsp.auth_password = "secret";
+    assert(config.Validate().code == PublisherErrorCode::None);
+
+    config.rtsp.auth_mode = RtspAuthMode::Digest;
+    config.rtsp.auth_nonce_ttl_ms = 0;
+    assert(config.Validate().code == PublisherErrorCode::InvalidConfiguration);
+
     config = MakeRtspConfig();
     config.tracks.front().codec_type = CodecType::H265;
     assert(config.Validate().code == PublisherErrorCode::UnsupportedCodec);

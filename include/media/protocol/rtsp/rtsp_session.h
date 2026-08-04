@@ -287,6 +287,21 @@ private:
     void OnIdleTimeout();
 
 
+    bool AuthenticateRequest(const RtspRequest& request,
+                             const std::string& cseq);
+
+
+    bool ValidateDigestAuthorization(const RtspRequest& request,
+                                     std::string_view authorization,
+                                     bool& stale_nonce);
+
+
+    void SendUnauthorized(const std::string& cseq, bool stale_nonce);
+
+
+    std::string EnsureDigestNonce();
+
+
     void Close();
 
 
@@ -297,6 +312,11 @@ private:
     std::uint64_t id_{0};
     std::string session_id_;
     std::string requested_url_;
+    // nonce 只在当前 session 内复用，且由创建时间控制有效期；这样过期后
+    // 不接受旧 Digest response，也不会把 nonce 状态放到 façade 全局共享。
+    std::string auth_nonce_;
+    std::chrono::steady_clock::time_point auth_nonce_created_at_{};
+    std::uint32_t digest_nonce_count_{0};
     // key 对应 MediaTrackConfig::track_id，也就是 SDP/SETUP 中的 trackN。
     std::map<int, TrackSessionState> track_states_;
     bool ready_{false};
