@@ -2,7 +2,7 @@
 
 本文档说明当前 Publisher 模块的架构、接口契约、协议实现、测试现状和后续改进计划。文档以当前代码为准，覆盖 FFmpeg 复用推流和本机 RTSP Server 两条发布链路。
 
-最后更新：2026-08-03。
+最后更新：2026-08-04。
 
 ## 1. 模块定位
 
@@ -796,10 +796,11 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 ### 可维护性与测试
 
 - `RtspServerProtocol` 同时承担 RTSP 解析、会话、RTP header、音频 packetizer、RTCP 和 multicast，类体积较大。
-  - 状态：S0 基线与目录分层已完成，S1 及后续类拆分尚未开始。
+  - 状态：S0 基线、目录分层和 S1 纯组件拆分已完成，S2 及后续类拆分尚未开始。
   - 规划日期：2026-08-03。
   - 实施方案：见 12.9，按纯函数组件、TCP 连接、会话状态机、媒体 transport、RTP sender、multicast 的顺序渐进拆分，每阶段保持现有协议行为不变。
   - S0 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S0 实施记录。
+  - S1 实施日期：2026-08-04；完成内容和验证结果见 12.9.7 的 S1 实施记录。
 - 手动摄像头链路和协议自动测试已通过两个 CMake target 分离；两者暂时复用 `test_rtsp_server_publisher.cpp`，协议 target 不进入摄像头循环。
 - TCP interleaved、音视频、UDP unicast、UDP audio 和 multicast 协议用例已启用并注册为 `test_rtsp_server_protocol` CTest。
 - 缺少断网、慢客户端、并发客户端、长时间运行和错误配置测试。
@@ -1066,8 +1067,7 @@ include/media/protocol/
     rtsp_session_manager.h
     rtsp_media_transport.h
     rtsp_multicast_publisher.h
-    rtsp_sdp_builder.h
-    rtsp_response_builder.h
+    rtsp_builders.h                       # response/SDP 两个 builder 的统一声明
 
 src/media/protocol/
   protocol_adapter_factory.cpp
@@ -1086,8 +1086,7 @@ src/media/protocol/
     rtsp_session_manager.cpp
     rtsp_media_transport.cpp
     rtsp_multicast_publisher.cpp
-    rtsp_sdp_builder.cpp
-    rtsp_response_builder.cpp
+    rtsp_builders.cpp                     # response/SDP 两个 builder 的统一实现
 ```
 
 路径和 include 规则：
@@ -1116,7 +1115,7 @@ src/media/protocol/
 
 ##### 12.9.7 详细执行计划
 
-计划状态：S0 已完成，S1 到 S7 待实施。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过未完成步骤直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
+计划状态：S0、S1 已完成，S2 到 S7 待实施。下面的 `S0` 到 `S7` 是迁移步骤，不允许跳过未完成步骤直接搬迁生产代码；只有当前步骤的 gate 全部通过，才能开始下一步骤。这里的 `S` 表示 step，避免与第 12 章的 `P0/P1/P2` 优先级混淆。
 
 ###### 12.9.7.1 每个阶段的固定工作流
 
@@ -1170,6 +1169,17 @@ S0 gate：自动测试能够覆盖当前 TCP、UDP unicast、multicast、RTCP �
 | S1-5 | 切换 façade 和 session 调用点 | `RtspServerProtocol`/旧 `ClientSession` 调用新组件，删除匿名 namespace 中对应旧函数 | S0 全量回归输出不变，新旧实现不并存 |
 
 S1 gate：四个组件不依赖 `RtspServerProtocol`、Boost.Asio socket 或全局可变状态；每个组件有独立单元测试，`rtsp_server_protocol.cpp` 中对应旧 helper 已删除。
+
+###### S1 实施记录（2026-08-04）
+
+- **纯组件拆分**：新增 `RtspResponseBuilder`，集中序列化 RTSP status line、`CSeq`、公共 `Server`、自定义 header、`Content-Type` 和 `Content-Length`；新增 `RtspSdpBuilder`，迁移 H264/AAC/G711 的 SDP 生成、AAC AudioSpecificConfig 和 multicast connection line 逻辑。两个 builder 均为无状态静态函数，不持有 socket、session 或可变 server 状态。
+- **文件整理**：将两个 builder 的声明和实现分别合并到 `include/media/protocol/rtsp/rtsp_builders.h`、`src/media/protocol/rtsp/rtsp_builders.cpp`，仍保留两个独立类；这样减少小型文件数量，不改变职责、调用方式或实现依赖。
+- **RTP/RTCP 工具拆分**：新增 `AudioRtpPacketizer`，迁移 AAC RFC 3640 AU header、7/9 字节 ADTS header 识别和 G711 raw payload 生成；新增 `RtcpPacketCodec`，迁移 RTCP Sender Report 序列化、网络字节序读写、compound packet 边界解析、packet type 名称和 signed 24-bit cumulative lost 解码。sender 统计、timer、socket 和日志仍由原 session/multicast 编排负责。
+- **调用点切换**：`RtspServerProtocol`/嵌套 `ClientSession` 的 response、SDP、AAC/G711、RTCP SR 和 compound RTCP 处理已切换到新组件；匿名 namespace 中对应旧 helper、常量和重复 report block 结构已删除，保留 RTP header 和 session 状态等未到 S2/S5 的职责。
+- **测试补充**：新增 `test/media/test_rtsp_pure_components.cpp` 和 `test_rtsp_pure_components` CTest，覆盖 response 状态码和 CRLF、H264/AAC/G711 SDP、多 track 与缺失 SPS/PPS、AAC raw/7-byte ADTS/9-byte ADTS/截断 ADTS、G711A/G711U、空 payload、RTCP SR、compound packet、trailing bytes、错误 version、截断 packet 和 signed 24-bit report block。
+- **中文注释**：新头文件说明组件所有权边界；非平凡的 RFC 字段、网络字节序、ADTS 判断、异步调用方保留的状态语义均添加中文注释，便于后续 S2 连接和 S5 sender 拆分时复用。
+- **验证结果**：使用 `cmake --build build --config Debug --target test_rtsp_pure_components test_rtsp_server_protocol --parallel 1` 串行构建通过；`ctest --test-dir build -C Debug -R "test_(rtsp_pure_components|rtsp_request_parser|rtsp_server_protocol|publisher_protocol)" --output-on-failure --timeout 30` 四项测试全部通过。`test_rtsp_server_publisher` 仍只做手动摄像头 target 的构建验证，不启动无限时长链路。
+- **阶段结论**：S1 gate 已满足，生产协议行为保持不变；下一阶段入口为 S2 `RtspConnection`，先迁移 TCP read/framing/write queue/close，再接回现有 `ClientSession` 状态机。
 
 ###### 12.9.7.4 S2：提取 `RtspConnection`
 
@@ -1360,6 +1370,8 @@ WebRTC 按 [WebRTC RTC 模块计划](webrtc-rtc-module-plan.md) 单独推进，�
 | 测试 | 覆盖内容 |
 |---|---|
 | `test_publisher_protocol` | 配置基础校验、Annex-B/AVCC、H264 FU-A、RTSP Transport 解析 |
+| `test_rtsp_request_parser` | RTSP request 分片、body、pipelining、header 规范和畸形输入 |
+| `test_rtsp_pure_components` | RTSP response/SDP、AAC/G711 payload、RTCP SR/compound/report block 纯组件边界 |
 | `test_rtsp_server_protocol` | 有限时长的 TCP interleaved、音视频、UDP unicast、UDP audio、multicast、RTP 和 RTCP 协议回归 |
 | `test_rtsp_server_publisher` | 手动摄像头双路发布；协议用例与该 target 共用测试源，但不进入默认 CTest |
 | `test_local_mp4_decode_rtsp_publisher` | 根目录 `test.mp4` 解码、编码并通过本机 RTSP 发布 |
@@ -1408,16 +1420,22 @@ FFmpeg publisher：
 
 RTSP Server publisher：
 
-S0 已完成目录迁移；以下为当前路径。后续 S1-S7 的目标布局和分批迁移范围见 12.9.5。
+S0 已完成目录迁移，S1 已落地纯组件；以下为当前路径。后续 S2-S7 的目标布局和分批迁移范围见 12.9.5。
 
 - `include/media/protocol/rtsp_server_protocol_adapter.h`
 - `include/media/protocol/rtsp_server_protocol.h`
+- `include/media/protocol/audio_rtp_packetizer.h`
+- `include/media/protocol/rtcp_packet_codec.h`
 - `include/media/protocol/rtsp/rtsp_request_parser.h`
+- `include/media/protocol/rtsp/rtsp_builders.h`（统一声明 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
 - `include/media/protocol/rtsp/rtsp_transport_spec.h`
+- `src/media/protocol/audio_rtp_packetizer.cpp`
+- `src/media/protocol/rtcp_packet_codec.cpp`
 - `src/media/protocol/rtsp_server_protocol_adapter.cpp`
 - `src/media/protocol/rtsp_server_protocol.cpp`
 - `src/media/protocol/rtsp/rtsp_request_parser.cpp`
 - `src/media/protocol/rtsp/rtsp_transport_spec.cpp`
+- `src/media/protocol/rtsp/rtsp_builders.cpp`（统一实现 `RtspResponseBuilder` 和 `RtspSdpBuilder`）
 
 RTP/bitstream 工具：
 
@@ -1429,6 +1447,7 @@ RTP/bitstream 工具：
 测试：
 
 - `test/media/test_publisher_protocol.cpp`
+- `test/media/test_rtsp_pure_components.cpp`（`RtspResponseBuilder`、`RtspSdpBuilder`、`AudioRtpPacketizer`、`RtcpPacketCodec` 单元测试）
 - `test/media/test_rtsp_server_publisher.cpp`（手动 target 与 CTest target：`test_rtsp_server_protocol`）
 - `test/media/test_local_mp4_decode_rtsp_publisher.cpp`
 - `test/media/test_rtsp_decode_encode_push_zlm.cpp`
