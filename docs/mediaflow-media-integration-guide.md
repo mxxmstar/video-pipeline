@@ -792,7 +792,7 @@ ctest --test-dir build -C Debug --output-on-failure
 | RTSP 多轨唯一匹配 | 同 codec 多候选的显式 track 拒绝策略尚未完成 | A2/A3 |
 | FFmpeg 多轨交织 | mux 的 interleaved write 和有界 DTS 重排尚未实施 | A3 |
 | Graph Graceful Stop | MediaFlow 仍需 pending-task barrier、拓扑逆序停止和逐级 Flush 屏障 | A3 |
-| SourceNode、DecoderNode、EncoderNode、PublisherSinkNode | A0 只修复底层契约，媒体适配节点尚未接入主链路 | A1/A2 |
+| SourceNode、DecoderNode、EncoderNode、PublisherSinkNode | A1 已完成 Source/Router/Decoder 节点和本地单视频图；Encoder/Publisher 尚未接入 | A2 |
 
 ### 17.4 A0 后的接入约束
 
@@ -800,3 +800,65 @@ ctest --test-dir build -C Debug --output-on-failure
 节点代次由消息上下文携带，Decoder/Encoder 在停止屏障中显式 Flush，Publisher 使用
 `EncodedTrackInfo` 和 packet 自带 `time_base`。测试中不得再通过手工覆盖 packet 的
 `stream_index` 或 `time_base` 来掩盖适配层缺失。
+
+## 18. A1 实施记录：Source + Decoder 单视频链路
+
+### 18.1 已完成修改
+
+本阶段完成 MediaFlow 到现有 `media` 拉流器和解码器的第一条可测试适配链路。
+本阶段的目标是先固定节点边界、启动顺序和连接代次语义，不把 Encoder、Publisher
+以及音视频汇合的停止屏障提前混入。
+
+| 领域 | 实际修改 | 主要文件 |
+|---|---|---|
+| 媒体消息 | 增加 `MediaPacketMessage` 和 `MediaFrameMessage`，包/帧都携带 `generation`；包消息同时携带所属 `MediaStreamInfo` | `include/mediaflow/media_nodes.h` |
+| 源节点 | 增加 `StreamSourceNode`，在独立读取线程中调用 `IPuller::ReadPacketResult()`，区分 Packet、NoData、EOS、RetryableError、FatalError 和 Stopped | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| 源节点重连 | 仅对 `RetryableError` 执行有限或无限重连；每次成功重连递增 generation，旧连接消息不会冒充新连接 | `src/mediaflow/media_nodes.cpp` |
+| 轨道路由 | 增加 `TrackRouterNode`，按显式 `stream_index` 和可选 `CodecType` 选择单路视频，音频及其他视频轨不进入视频 Decoder | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| 解码节点 | 增加 `DecoderNode`，Init 阶段先安装帧回调；已有 StreamInfo 时提前 Open，只有连接后才能获知 StreamInfo 时在首个包到达前完成延迟 Open | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| 旧代次隔离 | Decoder 记录当前 generation；晚到的旧代次包直接丢弃；新代次到达时先关闭旧 decoder，再使用新轨道信息打开上下文 | `src/mediaflow/media_nodes.cpp` |
+| Graph 启停顺序 | 增加 `StartPriority()`；普通节点先启动，Source 最后启动；停止时按相反优先级先停止 Source，减少首包竞争和停止期间继续生产 | `include/mediaflow/core/node.h`、`include/mediaflow/core/graph.h` |
+| 构建与测试 | 新增本地脚本 Puller/Decoder 测试，覆盖音频旁路、重连、EOS、代次输出和旧包丢弃 | `test/mediaflow/test_mediaflow_media_nodes.cpp`、`test/CMakeLists.txt` |
+
+### 18.2 当前推荐组图方式
+
+```text
+StreamSourceNode<MediaPacketMessage>
+        -> TrackRouterNode(video)
+        -> DecoderNode
+        -> 下游 Frame 节点
+```
+
+`StreamSourceNode` 构造时接收现有工程的 `IPuller` 和 URL，因此可以使用
+`FFmpegPuller` 处理本地文件、RTSP 等输入，也可以使用 AVTP Puller。节点不再要求
+业务侧先 `Start()` 再添加 subscriber；Graph 会先启动 Router/Decoder/下游节点，
+最后才打开 Puller 并读取第一条包。
+
+当前 A1 采用独立读取线程直接调用 `IPuller`，没有复制或改写旧的
+`MediaStreamSession` / `MediaStreamSource`。旧回调链仍可继续使用，后续迁移时应以
+本节点链路作为新入口，并逐步移除手工 subscriber 编排。
+
+### 18.3 验证结果
+
+- 使用 `C:\Program Files\Microsoft Visual Studio\18\Community` 的 VS 2026 x64 工具链，重新配置并编译 `video_pipeline_lib` 和 `test_mediaflow_media_nodes`。
+- `test_mediaflow_media_nodes` 通过：输出 generation 为 `1, 2`，首个连接和重连各打开一次 Decoder，音频包未进入视频 Decoder，EOS 后读取线程结束。
+- 测试手工注入 generation=1 的晚到视频包，在 Decoder 已处理 generation=2 后未产生第三帧。
+- 本阶段未执行真实 RTSP、摄像头或 AVTP 网卡测试；这些测试依赖外部服务/设备，不能由本地脚本测试替代。
+
+### 18.4 尚未完成项与下一阶段入口
+
+| 项目 | 当前状态 | 后续阶段 |
+|---|---|---|
+| Source 与现有 MediaStreamSession 统一 | A1 节点直接使用 IPuller，旧 Session 仍保留；Session 的 watchdog/jitter 配置尚未完整映射到节点 | A1 后续/A3 |
+| 多轨 selected track 契约 | Router 支持显式 stream index，但 Source 尚未发布完整的选轨控制对象，多个同 codec 轨道仍需上层明确选择 | A3 |
+| Graph EOS 传播 | Source 内部可识别 EOS，但当前 Graph 没有通用 EOS 控制消息，Decoder 不会因 EOS 自动 Flush | A3 |
+| Decoder Flush 屏障 | `DecoderNode::Flush()` 已提供，但 Immediate Stop 不调用它，避免与未完成 Decode 并发；需等 Graph Graceful Stop barrier | A3 |
+| Encoder/Publisher | 尚未实现 `EncoderNode` 和 `PublisherSinkNode` | A2 |
+| 现有媒体测试迁移 | `test_stream_decode`、AVTP 和 RTSP 发布测试仍是旧手工回调链 | A1 后续/A2 |
+
+### 18.5 阶段结论
+
+A1 的本地单视频 Source -> Router -> Decoder 图已经具备可编译、可运行和可重连的
+最小实现，首包窗口和旧代次穿透问题已由节点边界处理。下一阶段入口为 A2：接入
+`EncoderNode` 和 `PublisherSinkNode`，同时完善 Publisher 重连后的等待关键帧语义；
+Graph 的完整 EOS/Flush/Graceful Stop 屏障继续留在 A3。

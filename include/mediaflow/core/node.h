@@ -26,6 +26,12 @@ public:
     virtual bool Init() { return true; }
     /// 开始工作；Source 通常在此阶段开始 Emit。
     virtual bool Start() { return true; }
+    /// 返回启动优先级；数值越小越早启动。
+    ///
+    /// Graph 会先启动下游节点，再启动 Source，确保源节点发出第一条消息时，
+    /// 下游端口、队列和业务状态都已经就绪。普通节点默认使用 0，业务节点
+    /// 只有在确实需要特殊启动顺序时才覆盖这个方法。
+    virtual int StartPriority() const { return 0; }
     /// 停止生产和接收新的业务工作。
     virtual void Stop() {}
     /// 释放 Init 阶段分配的资源。
@@ -38,6 +44,9 @@ public:
 template <typename T>
 class SourceNode : public INode {
 public:
+    /// 源节点最后启动，避免 Start 阶段产生的首包落在尚未就绪的下游之外。
+    int StartPriority() const override { return 100; }
+
     /// 获取默认输出端口，Graph 会通过端口注册表连接它。
     OutputPort<T>& Output() {
         return output_;

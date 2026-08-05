@@ -282,6 +282,7 @@ target_include_directories(video_pipeline_mediaflow
 target_link_libraries(video_pipeline_mediaflow
     INTERFACE
         video-pipeline::boost
+        video-pipeline::spdlog
         Threads::Threads
 )
 

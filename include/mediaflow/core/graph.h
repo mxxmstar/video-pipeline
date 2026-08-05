@@ -666,12 +666,24 @@ public:
             }
         }
 
-        std::vector<std::shared_ptr<NodeContext>> started_nodes;
+        // 启动顺序按节点优先级稳定排序。默认节点先启动，SourceNode 最后
+        // 启动，这样 Source 的第一条消息不会早于 Decoder/Sink 的准备完成。
+        std::vector<std::shared_ptr<NodeContext>> start_order;
+        start_order.reserve(node_order_.size());
         for (const auto& id : node_order_) {
-            auto context = nodes_.at(id);
+            start_order.push_back(nodes_.at(id));
+        }
+        std::stable_sort(start_order.begin(), start_order.end(),
+                         [](const auto& left, const auto& right) {
+                             return left->node->StartPriority() <
+                                    right->node->StartPriority();
+                         });
+
+        std::vector<std::shared_ptr<NodeContext>> started_nodes;
+        for (const auto& context : start_order) {
             if (!context->node->Start()) {
                 SetError(FlowErrorCode::NodeStartFailed,
-                         "Node Start failed: " + id);
+                         "Node Start failed: " + context->id);
                 Rollback(initialized, started_executors, started_nodes);
                 return false;
             }
@@ -701,8 +713,21 @@ public:
             state_ = State::Stopping;
         }
 
+        // 停止顺序与启动顺序相反：Source 先停止生产，随后才让路由和解码
+        // 节点拒绝新消息。这样 Immediate Stop 不会因为下游先停而把源线程
+        // 留在持续发送的状态里。
+        std::vector<std::shared_ptr<NodeContext>> stop_order;
+        stop_order.reserve(node_order_.size());
         for (const auto& id : node_order_) {
-            nodes_.at(id)->node->Stop();
+            stop_order.push_back(nodes_.at(id));
+        }
+        std::stable_sort(stop_order.begin(), stop_order.end(),
+                         [](const auto& left, const auto& right) {
+                             return left->node->StartPriority() >
+                                    right->node->StartPriority();
+                         });
+        for (const auto& context : stop_order) {
+            context->node->Stop();
         }
         for (auto& edge : edges_) {
             edge->Close();
