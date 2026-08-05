@@ -293,6 +293,26 @@ void TestConnectionLimitsAndStatistics() {
     }
 }
 
+void TestSlowClientIsolation() {
+    RtspServerProtocol protocol;
+    auto config = MakeConfig(FindFreeTcpPort());
+    // OPTIONS response 本身大于该上限，服务端应立即隔离这个不具备消费能力的
+    // 客户端，并把原因计入 slow_clients_closed，而不是让队列无限增长。
+    config.rtsp.max_write_queue_bytes = 8;
+    assert(protocol.Start(config, MakeTracks()));
+
+    boost::asio::io_context client_io;
+    boost::asio::ip::tcp::socket client(client_io);
+    client.connect({boost::asio::ip::address_v4::loopback(),
+                    config.listen_port});
+    SendOptions(client);
+    assert(WaitForPeerClose(client));
+    const auto stats = protocol.GetStats();
+    assert(stats.slow_clients_closed == 1);
+    assert(stats.clients_connected == 0);
+    protocol.Stop();
+}
+
 void TestIdleTimeoutAndAddressAllowlist() {
     {
         RtspServerProtocol protocol;
@@ -385,6 +405,7 @@ void TestConcurrentWriteAndStop() {
 int main() {
     TestBasicAndDigestAuthentication();
     TestConnectionLimitsAndStatistics();
+    TestSlowClientIsolation();
     TestIdleTimeoutAndAddressAllowlist();
     TestFailureRollbackAndRestart();
     TestConcurrentWriteAndStop();

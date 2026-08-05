@@ -193,6 +193,11 @@ PublisherResult RtspServerProtocol::Start(
             }
             return true;
         };
+    session_context->record_slow_client = [weak_session_manager]() {
+        if (const auto manager = weak_session_manager.lock()) {
+            manager->RecordSlowClientClosed();
+        }
+    };
 
     // acceptor 也先在局部完成 open/bind/listen。只有监听资源完整可用时，
     // 才把 config/context/manager/publisher 一起提交给 façade。
@@ -460,6 +465,7 @@ void RtspServerProtocol::Stop() {
                 manager_stats.connections_rejected_by_rate_limit;
             stats_.auth_failures = manager_stats.auth_failures;
             stats_.auth_failures_rejected = manager_stats.auth_failures_rejected;
+            stats_.slow_clients_closed = manager_stats.slow_clients_closed;
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -516,6 +522,7 @@ PublisherStats RtspServerProtocol::GetStats() const {
             manager_stats.connections_rejected_by_rate_limit;
         stats.auth_failures = manager_stats.auth_failures;
         stats.auth_failures_rejected = manager_stats.auth_failures_rejected;
+        stats.slow_clients_closed = manager_stats.slow_clients_closed;
     } else {
         stats.clients_connected = 0;
     }

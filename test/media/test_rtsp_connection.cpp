@@ -22,6 +22,8 @@ struct ConnectionEvents {
     std::condition_variable condition;
     int request_count{0};
     int frame_count{0};
+    int closed_count{0};
+    boost::system::error_code close_reason;
     std::uint8_t last_channel{0};
     std::vector<std::uint8_t> last_payload;
 };
@@ -40,6 +42,14 @@ bool WaitForFrame(ConnectionEvents& events) {
         lock,
         std::chrono::seconds(2),
         [&events]() { return events.frame_count == 1; });
+}
+
+bool WaitForClosed(ConnectionEvents& events) {
+    std::unique_lock<std::mutex> lock(events.mutex);
+    return events.condition.wait_for(
+        lock,
+        std::chrono::seconds(2),
+        [&events]() { return events.closed_count == 1; });
 }
 
 bool ReadExactWithTimeout(boost::asio::ip::tcp::socket& socket,
@@ -113,7 +123,13 @@ void TestFragmentedRequestAndSerializedWrites() {
                     events.condition.notify_all();
                 },
                 RtspConnection::ParseErrorHandler{},
-                [](const boost::system::error_code&) {});
+                [&events](const boost::system::error_code& reason) {
+                    std::lock_guard<std::mutex> lock(events.mutex);
+                    ++events.closed_count;
+                    events.close_reason = reason;
+                    events.condition.notify_all();
+                },
+                RtspConnection::Options{128});
             {
                 std::lock_guard<std::mutex> lock(connection_mutex);
                 connection = std::move(accepted_connection);
@@ -179,6 +195,15 @@ void TestFragmentedRequestAndSerializedWrites() {
         std::lock_guard<std::mutex> lock(events.mutex);
         assert(events.last_channel == 3);
         assert(events.last_payload == incoming_payload);
+    }
+
+    // 队列上限只针对当前连接生效。发送一个明显超过 128 字节的 buffer 时，
+    // connection 必须以 no_buffer_space 关闭，而不是继续积压内存。
+    connection->SendRtsp(std::string(256, 'x'));
+    assert(WaitForClosed(events));
+    {
+        std::lock_guard<std::mutex> lock(events.mutex);
+        assert(events.close_reason == boost::asio::error::no_buffer_space);
     }
 
     // 关闭请求必须在现有写队列排空后执行，避免截断 response 或 frame。

@@ -115,6 +115,9 @@ struct RtspServerOptions {
     std::size_t connection_attempts_per_address{0};
     std::size_t auth_failures_per_address{0};
     int rate_limit_window_ms{60000};
+    // 单个 RTSP 客户端待发送的 response/RTP/RTCP 总字节上限。默认 0 表示
+    // 关闭限制；启用后，队列超限的慢客户端会被立即隔离关闭。
+    std::size_t max_write_queue_bytes{0};
     // 当 SETUP 请求 RTP/AVP;multicast 但没有指定 destination、port 或 ttl 时，
     // 使用这里的默认组播目标。
     std::string multicast_address{"239.255.0.1"};

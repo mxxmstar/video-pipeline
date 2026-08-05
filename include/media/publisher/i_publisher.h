@@ -22,6 +22,8 @@ struct PublisherStats {
     std::uint64_t connections_rejected_by_rate_limit{0};
     std::uint64_t auth_failures{0};
     std::uint64_t auth_failures_rejected{0};
+    // 因单客户端发送队列超过上限而主动隔离关闭的连接数量。
+    std::uint64_t slow_clients_closed{0};
 };
 
 class IPublisher {

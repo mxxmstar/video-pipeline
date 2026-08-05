@@ -125,6 +125,9 @@ struct RtspSessionContext {
     // manager 提供的窄化回调只记录鉴权失败和是否触发地址限流；session 不
     // 直接持有 manager，避免形成 owner/session/manager 循环引用。
     std::function<bool(const std::string&)> record_auth_failure;
+    // 发送队列溢出由 connection 在 socket executor 上检测；session 只通过
+    // 这个弱耦合回调把慢客户端事件交给 manager 计数，不直接持有 manager。
+    std::function<void()> record_slow_client;
 };
 
 /// @brief `RtspSessionManager` 的只读连接统计快照。
@@ -141,6 +144,7 @@ struct RtspSessionManagerStats {
     std::uint64_t connections_rejected_by_rate_limit{0};
     std::uint64_t auth_failures{0};
     std::uint64_t auth_failures_rejected{0};
+    std::uint64_t slow_clients_closed{0};
 };
 
 /// @brief RTSP 会话
@@ -220,7 +224,7 @@ private:
         const RtspRequestParseResult& parse_result);
 
 
-    void OnConnectionClosed(const boost::system::error_code&);
+    void OnConnectionClosed(const boost::system::error_code& reason);
 
 
     void HandleRequest(const RtspRequest& request);
@@ -376,6 +380,9 @@ public:
     /// 记录一次鉴权失败；返回 false 表示该地址达到失败阈值，session 应
     /// 在写完当前 401 challenge 后关闭，避免继续占用连接资源。
     bool RecordAuthFailure(const std::string& client_address);
+
+    /// @brief 记录一个因发送队列超过上限而被隔离关闭的客户端。
+    void RecordSlowClientClosed();
 
     void Clear();
 

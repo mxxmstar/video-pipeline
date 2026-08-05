@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -11,6 +12,15 @@
 #include <boost/asio/ip/tcp.hpp>
 
 #include "media/protocol/rtsp/rtsp_request_parser.h"
+
+/// @brief 单个 RTSP TCP 客户端连接的发送队列策略。
+///
+/// `max_write_queue_bytes == 0` 表示不限制队列大小，保持历史行为；配置为
+/// 正数后，待发送的 RTSP response、RTP 和 RTCP 字节总量超过上限时，连接
+/// 会立即以 `no_buffer_space` 关闭，从而把慢客户端隔离在自己的连接内。
+struct RtspConnectionOptions {
+    std::size_t max_write_queue_bytes{0};
+};
 
 /// @brief 单个 RTSP TCP 客户端连接的字节流和写入边界。
 ///
@@ -28,13 +38,17 @@ public:
     using ClosedHandler =
         std::function<void(const boost::system::error_code&)>;
 
+    // 保留短名称，方便连接内部和既有测试代码表达“本连接的选项”。
+    using Options = RtspConnectionOptions;
+
     /// socket 必须已经由 accept 完成；connection 接管它的唯一生命周期。
     /// handler 不应直接捕获拥有 connection 的 shared_ptr，避免形成引用环。
     RtspConnection(boost::asio::ip::tcp::socket socket,
                    RequestHandler on_request,
                    InterleavedFrameHandler on_interleaved_frame,
                    ParseErrorHandler on_parse_error,
-                   ClosedHandler on_closed);
+                   ClosedHandler on_closed,
+                   RtspConnectionOptions options = {});
 
     RtspConnection(const RtspConnection&) = delete;
     RtspConnection& operator=(const RtspConnection&) = delete;
@@ -85,6 +99,10 @@ private:
     std::array<std::uint8_t, 8192> read_chunk_{};
     std::vector<std::uint8_t> read_buffer_;
     std::deque<std::vector<std::uint8_t>> write_queue_;
+    // 该计数包含正在执行 async_write 的首个 buffer，便于在任意一次入队前
+    // 判断整个客户端的待发送内存，而不是只限制尚未开始写出的部分。
+    std::size_t queued_write_bytes_{0};
+    RtspConnectionOptions options_;
     bool started_{false};
     bool writing_{false};
     bool closed_{false};

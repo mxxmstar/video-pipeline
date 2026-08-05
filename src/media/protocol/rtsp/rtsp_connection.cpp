@@ -34,12 +34,14 @@ RtspConnection::RtspConnection(
     RequestHandler on_request,
     InterleavedFrameHandler on_interleaved_frame,
     ParseErrorHandler on_parse_error,
-    ClosedHandler on_closed)
+    ClosedHandler on_closed,
+    RtspConnectionOptions options)
     : socket_(std::move(socket)),
       on_request_(std::move(on_request)),
       on_interleaved_frame_(std::move(on_interleaved_frame)),
       on_parse_error_(std::move(on_parse_error)),
-      on_closed_(std::move(on_closed)) {
+      on_closed_(std::move(on_closed)),
+      options_(options) {
 }
 
 void RtspConnection::Start() {
@@ -192,6 +194,19 @@ void RtspConnection::EnqueueWrite(std::vector<std::uint8_t> data) {
         return;
     }
 
+    // 所有发送数据都在 socket executor 上串行进入这里，因此无需额外加锁即可
+    // 保证 queued_write_bytes_ 与 write_queue_ 一致。超限时不再追加新 buffer，
+    // 而是立即关闭当前连接；这样一个不读数据的客户端不会持续占用服务端内存，
+    // 也不会阻塞同一进程中的其他 RTSP 客户端。
+    if (options_.max_write_queue_bytes != 0 &&
+        (queued_write_bytes_ > options_.max_write_queue_bytes ||
+         data.size() > options_.max_write_queue_bytes - queued_write_bytes_)) {
+        CloseOnExecutor(boost::asio::error::make_error_code(
+            boost::asio::error::no_buffer_space));
+        return;
+    }
+
+    queued_write_bytes_ += data.size();
     write_queue_.push_back(std::move(data));
     if (!writing_) {
         DoWrite();
@@ -218,6 +233,10 @@ void RtspConnection::DoWrite() {
                 return;
             }
 
+            // async_write 成功后首个 buffer 已经完全离开队列，先扣减其字节数
+            // 再弹出容器，避免后续入队看到虚高的内存占用。
+            const auto completed_size = self->write_queue_.front().size();
+            self->queued_write_bytes_ -= completed_size;
             self->write_queue_.pop_front();
             if (self->write_queue_.empty() && self->close_after_write_) {
                 self->CloseOnExecutor();
@@ -251,6 +270,7 @@ void RtspConnection::CloseOnExecutor(
     // buffer，直到完成回调返回，避免清空 deque 造成悬空 asio buffer。
     if (!writing_) {
         write_queue_.clear();
+        queued_write_bytes_ = 0;
     }
     read_buffer_.clear();
 

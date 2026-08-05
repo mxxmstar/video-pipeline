@@ -241,6 +241,8 @@ std::string MakeNonce(std::uint64_t session_id) {
         std::uint64_t id,
         std::string client_address,
         ClosedHandler on_closed) {
+        const auto max_write_queue_bytes =
+            context->config.rtsp.max_write_queue_bytes;
         auto session = std::shared_ptr<RtspClientSession>(
             new RtspClientSession(std::move(context),
                                   id,
@@ -269,7 +271,9 @@ std::string MakeNonce(std::uint64_t session_id) {
                 if (const auto self = weak.lock()) {
                     self->OnConnectionClosed(ec);
                 }
-            });
+            },
+            RtspConnectionOptions{
+                max_write_queue_bytes});
         return session;
     }
 
@@ -406,9 +410,16 @@ RtspClientSession::RtspClientSession(
 
 
 
-    void RtspClientSession::OnConnectionClosed(const boost::system::error_code&) {
+    void RtspClientSession::OnConnectionClosed(
+        const boost::system::error_code& reason) {
         // connection 已经完成 TCP cancel/close；session 只清理 media transport
         // 状态和 registry，不再次直接触碰 TCP socket。
+        if (reason == boost::asio::error::no_buffer_space &&
+            context_->record_slow_client) {
+            // no_buffer_space 是 connection 队列上限的专用关闭原因。其他网络
+            // 错误不能简单归类为慢客户端，否则统计会掩盖真实链路故障。
+            context_->record_slow_client();
+        }
         Close();
     }
 
@@ -1334,6 +1345,11 @@ bool RtspSessionManager::RecordAuthFailure(
         return false;
     }
     return true;
+}
+
+void RtspSessionManager::RecordSlowClientClosed() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++stats_.slow_clients_closed;
 }
 
 void RtspSessionManager::ResetAddressWindow(

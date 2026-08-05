@@ -793,7 +793,7 @@ multicast 默认关闭。只有确实需要组播且客户端只订阅当前支�
 - 会话 idle timeout 和客户端地址访问控制已实现基础版本：`session_idle_timeout_ms=0` 或空 `allowed_client_addresses` 时保持关闭/放行的兼容默认值；当前 allowlist 只支持精确 IP，不支持 CIDR。
   - 修复日期：2026-08-04。
   - 修复方法：`RtspClientSession` 在其 Asio executor 上维护可取消的 `steady_timer`，由 RTSP request、interleaved/RTCP 和媒体发送刷新；非 PLAY 状态控制面超时后走幂等 `Close()`。`RtspSessionManager` 在进入 registry 前读取 remote endpoint 并执行精确 IP allowlist，拒绝连接不会分配 session ID 或占用媒体资源。
-- `RtspSessionManager` 已实现基础连接数限制、按地址连接尝试/鉴权失败窗口和连接生命周期统计；慢客户端隔离、持久化 metrics 和分布式限流仍待后续阶段。
+- `RtspSessionManager` 已实现基础连接数限制、按地址连接尝试/鉴权失败窗口、连接生命周期统计和慢客户端隔离；持久化 metrics、分布式限流与 RTSPS 仍待后续阶段。
 - 只支持 H264 视频，尚未支持 H265。
 - multicast 只有单 H264 track，共享一组 RTP/RTCP 端口、SSRC 和 sequence。
 - 没有 RTCP SDES/BYE，也没有基于 RR 的质量告警或码率反馈。
@@ -1402,7 +1402,7 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 - **P1：会话资源保护（已完成，2026-08-04）**：在 `RtspClientSession`/`RtspSessionManager` 边界增加控制面 idle timeout 和精确 IP allowlist；默认关闭，先不改变现有客户端行为。
 - **P2：RTSP 鉴权（基础版本已完成，2026-08-04）**：Basic/Digest challenge、凭据校验和 nonce 生命周期已接入；鉴权失败限速已在 P3 接入，外部凭据存储和 RTSPS 另行推进。
 - **P3：连接资源保护（基础版本已完成，2026-08-04）**：`RtspSessionManager` 已接入最大连接数、按地址连接尝试/鉴权失败限流和连接统计；更复杂的封禁策略另行推进。
-- 在 `RtspConnection` 增加每客户端发送队列上限、慢客户端隔离和 RTSPS 支持。
+- 已在 `RtspConnection` 增加每客户端发送队列上限和慢客户端隔离；RTSPS 支持作为独立后续阶段推进。
 - 扩展 transport/地址抽象以支持 IPv6，并评估 RTSP aggregate control 和更完整的 RFC 错误响应。
 - 使用 VLC、FFmpeg、GStreamer 和常见 NVR 建立互操作矩阵测试。
 
@@ -1435,6 +1435,16 @@ S7 gate：达到 12.9.8 的全部验收标准，删除迁移期兼容实现，�
 - **测试与中文注释**：扩展 `test_rtsp_server_lifecycle` 覆盖全局连接上限、按地址连接尝试限流、鉴权失败达到阈值后的 401/关闭和统计断言；配置测试覆盖窗口与限制字段。新增代码注释说明 pending slot、registry 锁范围、地址窗口重置、401 flush 后关闭和统计快照线程边界。
 - **验证结果**：`video_pipeline_lib`、`test_publisher_protocol`、`test_rtsp_server_lifecycle` 和 `test_rtsp_server_protocol` 在 VS/NMake Debug 环境编译通过；3 项定向测试及完整 10 项 RTSP CTest 全部通过。
 - **阶段结论**：P3 基础连接资源保护 gate 已满足。下一步进入 `RtspConnection` 的发送队列上限、慢客户端隔离和 RTSPS 设计，连接统计字段可作为后续 metrics 接入基础。
+
+###### 12.9.9.4 P3 发送队列与慢客户端隔离实施记录（2026-08-04）
+
+- **配置边界**：`RtspServerOptions` 新增 `max_write_queue_bytes`，默认值 `0` 表示关闭限制，保留现有客户端行为；正数表示单个客户端连接中待发送 RTSP response、RTP 和 RTCP buffer 的总字节上限。
+- **连接层实现**：`RtspConnection` 增加连接级 `RtspConnectionOptions` 和 `queued_write_bytes_`，在 socket executor 内入队前检查总字节数，写成功后扣减已完成 buffer；超限不再追加数据，而是使用 `boost::asio::error::no_buffer_space` 立即关闭当前连接。
+- **慢客户端隔离**：`RtspClientSession` 只识别 `no_buffer_space` 这一专用关闭原因，并通过 `RtspSessionContext` 的窄化回调通知 `RtspSessionManager`；manager 累计 `slow_clients_closed`，不会让 session 直接持有 manager，也不会影响其他客户端的发送队列。
+- **统计聚合**：`PublisherStats` 新增 `slow_clients_closed`，`RtspServerProtocol::GetStats()` 和 `Stop()` 快照路径均合并 manager 统计，便于上层监控慢客户端被隔离的次数。
+- **测试与兼容性**：`test_rtsp_connection` 验证队列超限返回 `no_buffer_space`；`test_rtsp_server_lifecycle` 验证服务端统计和活动连接数；默认上限为 0 时不改变已有序列化写入和关闭语义。新增代码补充中文注释，说明 executor 串行边界、字节计数和关闭原因。
+- **验证结果**：2026-08-04 使用 VS Debug 编译 `test_rtsp_connection`、`test_rtsp_server_lifecycle`、`test_rtsp_server_protocol` 和 `test_publisher_protocol` 通过；随后运行 10 项 RTSP 定向 CTest，结果为 10/10 通过，总耗时约 2.11 秒。
+- **阶段结论**：发送队列保护 gate 已落地；RTSPS（TLS listener、证书配置和握手失败策略）作为后续独立阶段，不与本次明文 RTSP 队列改动混合推进。
 
 #### 12.10 多目标和主备发布
 
