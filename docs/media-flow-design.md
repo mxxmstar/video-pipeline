@@ -555,6 +555,28 @@ target_link_libraries(video_pipeline_mediaflow INTERFACE
 
 仍未在本阶段实现的内容：DropFrameScheduler 的延迟/关键帧感知策略、真正的轮转公平调度、多下游消息可变性约束、PipelineManager 和媒体业务适配节点。这些项目继续按 M1 至 M3 计划推进，不能以当前核心测试结果代替媒体链路集成验收。
 
+### 10.2 源框架内容迁移对照表
+
+下表说明源框架目录中的主要内容在当前工程中的处理方式。当前完成的是 M0
+编排内核，不等同于源目录逐文件复制，也不等同于完整媒体业务链路已经接入。
+
+| 源框架内容 | 当前 MediaFlow 对应 | 状态 | 处理原因与后续计划 |
+|---|---|---|---|
+| `graph.h`、`node_context.h`、`edge_context.h` | 合并到 `include/mediaflow/core/graph.h` | 已完成并重构 | Graph、NodeContext、Edge 和生命周期统一实现，并增加错误回滚、拓扑冻结和 EdgeMetrics。 |
+| `i_executor.h`、`asio_executor.h` | 合并到 `include/mediaflow/core/executor.h` | 已完成并重构 | 保留显式 `IExecutor` 注入；AsioExecutor 支持 Start/Stop/Start，避免把线程池生命周期隐藏在全局对象中。 |
+| `i_node.h`、`node.h`、`source_node.h`、`sink_node.h`、`transform_node.h` | 合并到 `include/mediaflow/core/node.h` | 已完成并重构 | 保留节点生命周期和三种常用节点基类，并统一使用 `mediaflow` 命名空间。 |
+| `input_port.h`、`output_port.h` | 合并到 `include/mediaflow/core/port.h` | 已完成并重构 | 保留强类型端口、Fan-out 和端口注册表；Graph::Connect 会校验方向和消息类型。 |
+| `i_transport.h`、`queue_transport.h`、`direct_transport.h`、`transport.h` | 合并到 `include/mediaflow/core/transport.h` | 已完成并改名 | QueueTransport 提供有界队列；无中间队列的传输改名为 `ExecutorDispatchTransport`，避免误解为发送线程内联执行。 |
+| `i_mailbox.h`、`mailbox.h`、`spsc_mailbox.h`、`mpmc_mailbox.h` | 未逐文件复制；由 MediaFlow 内部 QueueTransport 承载 | 当前不原样迁移 | 源 SPSC 的生产侧 `DropOldest` 会形成并发消费问题，且旧队列接口与当前工程不兼容。当前优先使用 mutex 保护的正确有界队列，后续根据性能数据再增加经过验证的专用队列。 |
+| `i_scheduler.h`、`fifo_scheduler.h` | 调度逻辑内置于 Edge | 部分完成 | 当前通过 CAS 调度门闩、批量 Drain 和时间预算实现 FIFO 等基本行为，减少 M0 的抽象层数量；后续需要可插拔优先级或轮转调度时再抽出 Scheduler 接口。 |
+| `dropframe_scheduler.h` | 尚未接入 | 延后 | 源实现实际等同 FIFO，尚未具备延迟、队列深度、关键帧感知能力；将在 M2 实现 Latest-only 和关键帧策略后再提供正式接口。 |
+| `asio_io_context_pool.h` | 当前不提供全局池管理器 | 延后 | 全局命名线程池会扩大多个 Pipeline 的故障影响范围。M3 由 PipelineManager 显式管理共享 Executor Pool。 |
+| 顶层生命周期 Facade | `include/mediaflow/mediaflow.h` + Graph 低层 API | 当前不原样迁移 | M0 需要明确的核心 API，不需要额外的全局 Facade；M3 再根据 PipelineBuilder、PipelineHandle 和 PipelineManager 的边界补充上层入口。 |
+| `any_message.h`、`std::any` 消息包装 | `Graph::Connect<T>()`、`InputPort<T>`、`OutputPort<T>` | 当前不原样迁移 | 当前媒体链路优先使用 `MediaPacket`/`MediaFrame` 的共享指针强类型消息，避免 `std::any` 失去编译期校验；动态控制消息有需求时再单独设计。 |
+| 源模块 `CMakeLists.txt`、构建脚本和独立说明 | 顶层 `CMakeLists.txt`、`video-pipeline::mediaflow`、本文档 | 已完成并整合 | 不复制源模块对无关依赖的要求，按当前工程实际 include 和链接关系接入。 |
+| StreamSource、Decoder、Encoder、Publisher 等媒体适配节点 | 当前尚未加入 MediaFlow 核心 | M1 后续实现 | 这些不是通用编排内核文件，需要针对当前工程的 `MediaStreamSession`、`IDecoder`、`IEncoder` 和 `IPublisher` 编写适配节点。 |
+| Inference、Render、Recorder、WebRTC、OSD 等扩展节点 | 当前尚未加入 MediaFlow 核心 | M2/M4 后续实现 | 这些节点依赖具体媒体和业务模块，先完成主链路和背压策略，再按独立职责接入，避免污染 Graph/Node 基类。 |
+
 ## 11. 可观测性
 
 ### 11.1 Node 指标
