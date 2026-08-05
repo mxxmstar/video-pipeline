@@ -1,146 +1,270 @@
 /// @file test_stream_decode.cpp
-/// 测试 RTSP 拉流 + 音视频解码完整流程
+/// @brief 使用 MediaFlow 运行 RTSP 音视频解码链路的交互式验证程序。
 
-#include <iostream>
+#include "mediaflow/mediaflow.h"
+
 #include <atomic>
-#include <thread>
+#include <chrono>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
 
-#include "media/stream/stream_session.h"
-#include "media/stream/stream_source.h"
-#include "media/puller/ffmpeg_puller.h"
 #include "media/decoder/ffmpeg_decoder.h"
-#include <boost/asio.hpp>
+#include "media/puller/ffmpeg_puller.h"
 
-struct IOTestContext {
-    boost::asio::io_context io;
-    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work;
-    std::thread thread;
+namespace {
 
-    IOTestContext()
-        : work(boost::asio::make_work_guard(io))
-        , thread([this]() { io.run(); }) {}
+using namespace mediaflow;
 
-    ~IOTestContext() {
-        work.reset();
-        if (thread.joinable())
-            thread.join();
+/**
+ * @brief 统计一路解码帧的终端节点。
+ *
+ * 这个节点只做验证和日志输出，不把帧复制到其他缓存。帧的线程归属由
+ * MediaFlow Graph 管理，因此测试主线程只读取原子计数，不直接碰 Decoder。
+ */
+class FrameCounterSink final : public SinkNode<MediaFrameMessage> {
+public:
+    FrameCounterSink(MediaType media_type, std::string name)
+        : media_type_(media_type), name_(std::move(name)) {}
+
+    std::string Name() const override {
+        return name_;
     }
+
+    int Count() const {
+        return frame_count_.load();
+    }
+
+protected:
+    void Process(MediaFrameMessage message) override {
+        // EOS 是控制消息，不属于实际解码帧；正常停止时它仍会经过该节点，
+        // 但不能把它计入媒体帧数量。
+        if (!message.Valid() || message.eos || !message.frame ||
+            message.frame->type != media_type_) {
+            return;
+        }
+
+        const int count = frame_count_.fetch_add(1) + 1;
+        if (count % LogInterval() != 1) {
+            return;
+        }
+
+        if (media_type_ == MediaType::VIDEO) {
+            const auto* meta = message.frame->VideoMeta();
+            if (meta) {
+                LOG_INFO("[MediaFlow][Video] frame #{}: {}x{}, format={}, pts_us={}",
+                         count,
+                         meta->width,
+                         meta->height,
+                         static_cast<int>(meta->pixel_format),
+                         message.frame->time.pts_us);
+            }
+            return;
+        }
+
+        const auto* meta = message.frame->AudioMeta();
+        if (meta) {
+            LOG_INFO("[MediaFlow][Audio] frame #{}: sample_rate={}, channels={}, "
+                     "samples={}, pts_us={}",
+                     count,
+                     meta->sample_rate,
+                     meta->channels,
+                     meta->nb_samples,
+                     message.frame->time.pts_us);
+        }
+    }
+
+private:
+    int LogInterval() const {
+        return media_type_ == MediaType::VIDEO ? 30 : 100;
+    }
+
+    MediaType media_type_;
+    std::string name_;
+    std::atomic<int> frame_count_{0};
 };
 
-int main()
-{
-    std::cout << "=== Test Stream Decode ===" << std::endl;
-    std::string url = "rtsp://192.168.24.169/live/mainstream";
+void PrintGraphError(const Graph& graph, const std::string& operation) {
+    const auto error = graph.LastError();
+    std::cerr << operation << " failed: " << error.message << "\n";
+}
 
-    // 1. 创建拉流器
+} // namespace
+
+int main() {
+    std::cout << "=== MediaFlow RTSP Stream Decode ===\n";
+
+    // 连接参数仍由测试程序集中设置，SourceNode 只负责把 Puller 的读取结果
+    // 转换成 MediaPacketMessage，不在业务节点中重新实现 FFmpeg I/O。
+    constexpr const char* kUrl = "rtsp://192.168.66.83/live/mainstream";
     auto puller = std::make_unique<FFmpegPuller>();
-    puller->SetConnectTimeoutMs(3000);
-    puller->SetReadTimeoutMs(3000);
+    // 当前 URL 按已有摄像头发布和渲染测试的成功配置运行：RTSP 控制与媒体
+    // 使用 TCP，开启低延迟模式，避免 MediaFlow 测试与已验证链路使用不同
+    // 的 FFmpeg 会话参数。
+    puller->SetConnectTimeoutMs(5000);
+    puller->SetReadTimeoutMs(5000);
+    puller->SetRtspTransport("tcp");
+    puller->SetRtspAutoSwitchToTcp(false);
     puller->SetLowLatency(true);
 
-    // 2. 创建会话和源
-    IOTestContext io_ctx;
-    auto session = std::make_shared<MediaStreamSession>(io_ctx.io);
-    session->SetPuller(std::move(puller));
-    session->SetUrl(url);
+    auto executor = std::make_shared<AsioExecutor>("stream-decode", 2);
 
-    auto source = std::make_shared<MediaStreamSource>("test_stream");
-    source->SetSession(session);
+    // 真实 RTSP 拉流器可能一次性读出网络接收缓冲区中的一段历史数据，
+    // 因此 Source 在启动初期会短暂快于 Decoder。默认的 64 条队列会让
+    // 音频包先占满队列，随后视频包被 DropNewest 丢弃，无法反映旧手工
+    // 测试的实际解码能力。这里为验证图保留更大的有界队列，同时仍使用
+    // DropNewest 保持包的时间顺序，避免无界缓存掩盖下游处理能力问题。
+    const NodeOptions decode_node_options{
+        NodeExecutionMode::Serialized,
+        4096};
+    const EdgeOptions packet_edge_options{
+        TransportKind::Queue,
+        4096,
+        BackpressurePolicy::DropNewest,
+        64,
+        0};
+    const EdgeOptions frame_edge_options{
+        TransportKind::Queue,
+        1024,
+        BackpressurePolicy::DropNewest,
+        64,
+        0};
+    Graph graph;
 
-    // 3. 创建解码器（支持音视频多路）
-    std::shared_ptr<FFmpegDecoder> video_decoder;
-    std::shared_ptr<FFmpegDecoder> audio_decoder;
-
-    std::atomic<int> video_frame_count{0};
-    std::atomic<int> audio_frame_count{0};
-
-    // 4. 启动拉流
-    bool ret = source->Start();
-    if (!ret) {
-        std::cerr << "Stream start failed" << std::endl;
-        return -1;
+    // Graph 会先启动 Router、Decoder 和统计 Sink，最后才启动 Source 并打开
+    // RTSP。这样第一条音频或视频包到来时，下游端口已经全部注册完成。
+    if (!graph.AddNode<StreamSourceNode>(
+            "source", executor, decode_node_options, "test-stream",
+            std::move(puller), kUrl, StreamSourceNodeOptions{100, -1})) {
+        PrintGraphError(graph, "add source");
+        return 1;
     }
-    std::cout << "Stream started" << std::endl;
-
-    // 5. 等待 StreamInfo 回调，创建解码器
-    MultiStreamInfo multi_info = source->GetStreamInfo();
-    int wait_count = 0;
-    while (!multi_info.HasVideoStream() && !multi_info.HasAudioStream() && wait_count < 50) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        multi_info = source->GetStreamInfo();
-        wait_count++;
+    if (!graph.AddNode<TrackRouterNode>(
+            "router", executor, decode_node_options, TrackSelection{},
+            TrackSelection{})) {
+        PrintGraphError(graph, "add router");
+        return 1;
     }
-
-    if (!multi_info.HasVideoStream() && !multi_info.HasAudioStream()) {
-        std::cerr << "No video or audio stream found" << std::endl;
-        return -1;
+    if (!graph.AddNode<DecoderNode>(
+            "video-decoder", executor, decode_node_options,
+            std::make_unique<FFmpegDecoder>())) {
+        PrintGraphError(graph, "add video decoder");
+        return 1;
     }
-
-    // 6. 打开视频解码器
-    if (multi_info.HasVideoStream()) {
-        video_decoder = std::make_shared<FFmpegDecoder>();
-        video_decoder->SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
-            if (frame) {
-                video_frame_count++;
-                const auto& meta = std::get<VideoFrameMeta>(frame->meta);
-                if (video_frame_count % 30 == 1) {
-                    LOG_INFO("[Video] frame #{}: {}x{}, format={}, pts={}",
-                             video_frame_count.load(),
-                             meta.width, meta.height,
-                             static_cast<int>(meta.pixel_format),
-                             frame->time.pts_us);
-                }
-            }
-        });
-        video_decoder->Open(multi_info.stream_infos[multi_info.video_stream_idx_]);
-        LOG_INFO("Video decoder opened: codec={}",
-                 static_cast<int>(multi_info.stream_infos[multi_info.video_stream_idx_].codec_type));
+    if (!graph.AddNode<DecoderNode>(
+            "audio-decoder", executor, decode_node_options,
+            std::make_unique<FFmpegDecoder>())) {
+        PrintGraphError(graph, "add audio decoder");
+        return 1;
     }
-
-    // 7. 打开音频解码器
-    if (multi_info.HasAudioStream()) {
-        audio_decoder = std::make_shared<FFmpegDecoder>();
-        audio_decoder->SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
-            if (frame) {
-                audio_frame_count++;
-                const auto& meta = std::get<AudioFrameMeta>(frame->meta);
-                if (audio_frame_count % 100 == 1) {
-                    LOG_INFO("[Audio] frame #{}: sample_rate={}, channels={}, samples={}",
-                             audio_frame_count.load(),
-                             meta.sample_rate, meta.channels,
-                             meta.nb_samples);
-                }
-            }
-        });
-        audio_decoder->Open(multi_info.stream_infos[multi_info.audio_stream_idx_]);
-        LOG_INFO("Audio decoder opened: codec={}",
-                 static_cast<int>(multi_info.stream_infos[multi_info.audio_stream_idx_].codec_type));
+    if (!graph.AddNode<FrameCounterSink>(
+            "video-counter", executor, decode_node_options, MediaType::VIDEO,
+            "video-frame-counter")) {
+        PrintGraphError(graph, "add video counter");
+        return 1;
+    }
+    if (!graph.AddNode<FrameCounterSink>(
+            "audio-counter", executor, decode_node_options, MediaType::AUDIO,
+            "audio-frame-counter")) {
+        PrintGraphError(graph, "add audio counter");
+        return 1;
     }
 
-    // 8. 订阅包 -> 送入对应解码器
-    source->AddPacketSubscriber(
-        [&](std::shared_ptr<MediaPacket> pkt) {
-            if (!pkt || !pkt->buffer) return;
+    // Router 的两个输出端口分别对应两类媒体。每一路 Decoder 只接收自身
+    // 类型的压缩包，避免旧测试中按 packet type 在 subscriber 回调里分流。
+    if (!graph.Connect<MediaPacketMessage>(
+            "source", "router", packet_edge_options) ||
+        !graph.Connect<MediaPacketMessage>(
+            "router", "video", "video-decoder", "in", packet_edge_options) ||
+        !graph.Connect<MediaPacketMessage>(
+            "router", "audio", "audio-decoder", "in", packet_edge_options) ||
+        !graph.Connect<MediaFrameMessage>(
+            "video-decoder", "video-counter", frame_edge_options) ||
+        !graph.Connect<MediaFrameMessage>(
+            "audio-decoder", "audio-counter", frame_edge_options)) {
+        PrintGraphError(graph, "connect mediaflow graph");
+        return 1;
+    }
 
-            if (pkt->type == MediaType::VIDEO && video_decoder) {
-                video_decoder->Decode(pkt);
-            } else if (pkt->type == MediaType::AUDIO && audio_decoder) {
-                audio_decoder->Decode(pkt);
-            }
-    });
+    if (!graph.Start()) {
+        PrintGraphError(graph, "start mediaflow graph");
+        return 1;
+    }
 
-    // 9. 启动统计打印
-    source->StartStatsPrint(5);
-
-    // 10. 阻塞主线程，等待用户输入退出
-    std::cout << "Press Enter to stop..." << std::endl;
+    std::cout << "Stream started through MediaFlow: " << kUrl << "\n"
+              << "Press Enter to stop...\n";
     std::cin.get();
 
-    source->StopStatsPrint();
-    source->Stop();
+    // 交互式停止使用 GracefulStop：先停止 Puller 生产，再排空已经进入 Graph
+    // 的包，并让两个 Decoder 输出内部残留帧。即使网络流没有发送 EOS，也能
+    // 通过图级 Flush 结束一次完整的解码生命周期。
+    const bool stopped = graph.GracefulStop(std::chrono::seconds(5));
+    if (!stopped) {
+        std::cerr << "MediaFlow graceful stop timed out or flush failed\n";
+    }
 
-    LOG_INFO("Total decoded: video={} frames, audio={} frames",
-             video_frame_count.load(), audio_frame_count.load());
+    auto video_counter = graph.GetNode<FrameCounterSink>("video-counter");
+    auto audio_counter = graph.GetNode<FrameCounterSink>("audio-counter");
+    auto video_decoder = graph.GetNode<DecoderNode>("video-decoder");
+    auto audio_decoder = graph.GetNode<DecoderNode>("audio-decoder");
+    auto source = graph.GetNode<StreamSourceNode>("source");
+    NodeMetricsSnapshot video_metrics;
+    NodeMetricsSnapshot audio_metrics;
+    NodeMetricsSnapshot source_metrics;
+    NodeMetricsSnapshot router_metrics;
+    graph.GetMetrics("video-decoder", video_metrics);
+    graph.GetMetrics("audio-decoder", audio_metrics);
+    graph.GetMetrics("source", source_metrics);
+    graph.GetMetrics("router", router_metrics);
+    EdgeMetricsSnapshot source_edge_metrics;
+    EdgeMetricsSnapshot video_edge_metrics;
+    EdgeMetricsSnapshot audio_edge_metrics;
+    graph.GetEdgeMetrics("source:out->router:in", source_edge_metrics);
+    graph.GetEdgeMetrics("router:video->video-decoder:in", video_edge_metrics);
+    graph.GetEdgeMetrics("router:audio->audio-decoder:in", audio_edge_metrics);
+    // 现场设备验证不仅要看最终帧数，还要保留 Decoder 的输入处理量和错误，
+    // 这样可以区分“没有收到视频包”和“收到包但 FFmpeg 没有产出帧”。
+    std::cout << "Decoder metrics: video(enqueued=" << video_metrics.enqueued
+              << ", processed=" << video_metrics.processed
+              << ", rejected=" << video_metrics.rejected << ")"
+              << ", audio(enqueued=" << audio_metrics.enqueued
+              << ", processed=" << audio_metrics.processed
+              << ", rejected=" << audio_metrics.rejected << ")\n";
+    std::cout << "Graph metrics: source(processed=" << source_metrics.processed
+              << ", rejected=" << source_metrics.rejected
+              << "), router(processed=" << router_metrics.processed
+              << ", rejected=" << router_metrics.rejected
+              << "), edges(source=" << source_edge_metrics.accepted
+              << "/" << source_edge_metrics.dropped_newest
+              << ", video=" << video_edge_metrics.accepted
+              << "/" << video_edge_metrics.dropped_newest
+              << ", audio=" << audio_edge_metrics.accepted
+              << "/" << audio_edge_metrics.dropped_newest << ")\n";
+    if (source) {
+        std::cout << "Source state: generation=" << source->Generation()
+                  << ", finished=" << source->Finished() << "\n";
+    }
+    if (video_decoder && !video_decoder->LastError().empty()) {
+        std::cerr << "Video decoder error: " << video_decoder->LastError() << "\n";
+    }
+    if (audio_decoder && !audio_decoder->LastError().empty()) {
+        std::cerr << "Audio decoder error: " << audio_decoder->LastError() << "\n";
+    }
+    std::cout << "Total decoded through MediaFlow: video="
+              << (video_counter ? video_counter->Count() : 0)
+              << " frames, audio="
+              << (audio_counter ? audio_counter->Count() : 0)
+              << " frames\n";
 
-    return 0;
+    // 该程序验证的是音视频双轨解码，不应只因为停止屏障成功就把“设备没有
+    // 发送媒体包”报告为通过。这样现场设备故障会被 CI/人工测试明确识别。
+    const bool decoded_both_tracks =
+        video_counter && video_counter->Count() > 0 &&
+        audio_counter && audio_counter->Count() > 0;
+    if (!decoded_both_tracks) {
+        std::cerr << "MediaFlow stream decode did not receive both audio and video "
+                     "frames\n";
+    }
+    return stopped && decoded_both_tracks ? 0 : 1;
 }

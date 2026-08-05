@@ -1023,9 +1023,201 @@ Publisher、EOS 按轨道汇合、Publisher 在两轨结束后关闭，以及
 |---|---|---|
 | 真实多轨发布 | 本地 RecordingPublisher 已验证消息和生命周期；真实 RTSP/RTMP 服务的多轨兼容性未验证 | 运行服务端集成测试 |
 | 长时断线恢复 | `AwaitingKeyframe` 状态和本地关键帧恢复已验证；真实远端断开、重连、关键帧恢复未做长时测试 | 使用受控网络故障做有限时长互操作测试 |
-| 现有端到端测试迁移 | `test_stream_decode`、摄像头、AVTP 和 ZLMediaKit 测试仍有旧手工编排 | 后续阶段逐个改为 Source/Router/Decoder/Encoder/Publisher 图 |
+| 现有端到端测试迁移 | `test_stream_decode` 已完成 Source/Router/双 Decoder 迁移；摄像头、AVTP 和 ZLMediaKit 测试仍有旧手工编排 | 后续阶段逐个改为 MediaFlow 图 |
 | 动态拓扑与跨轨同步 | 当前 Graph 拓扑启动后冻结，Publisher 依赖 FFmpeg 交织写入，尚未增加动态增删轨和 A/V 同步策略 | 进入集成阶段前先补时间戳、轨道选择和指标验收 |
 
 A3 的本地链路已完成“正常 EOS 可收尾”的第一版闭环，但真实网络和设备环境仍是
 下一阶段的验收边界。后续迁移应选择一条真实 RTSP/RTMP 流验证多轨交织、断线恢复
 和长时内存稳定性。
+
+## 21. A4 实施记录：迁移 RTSP 音视频解码测试
+
+### 21.1 实施范围
+
+A4 从现有端到端测试中选择 `test_stream_decode` 作为第一条迁移链路。该测试原先
+由主线程手工启动 `MediaStreamSession`、轮询 `StreamInfo`、创建两个 Decoder，再
+通过 subscriber 按 packet 类型分流。迁移后只保留测试自身的 RTSP 地址、超时配置
+和统计输出，媒体生命周期由 MediaFlow Graph 统一管理。
+
+### 21.2 当前组图
+
+```text
+StreamSourceNode<MediaPacketMessage>
+        -> TrackRouterNode
+             |-> video -> DecoderNode -> FrameCounterSink(video)
+             `-> audio -> DecoderNode -> FrameCounterSink(audio)
+```
+
+| 领域 | 实施内容 | 主要文件 |
+|---|---|---|
+| 拉流入口 | 使用 `StreamSourceNode` 直接持有 `FFmpegPuller`；连接、读取、代次和停止由节点处理 | `test/media/test_stream_decode.cpp` |
+| 音视频分流 | 使用 `TrackRouterNode` 的 `video`、`audio` 端口分别连接两个 Decoder，不再在 subscriber 回调中按 packet type 判断 | `test/media/test_stream_decode.cpp` |
+| 解码生命周期 | 两个 `DecoderNode` 在首包到来时根据 `MediaStreamInfo` 延迟 Open；Graph 停止时统一 Flush | `test/media/test_stream_decode.cpp` |
+| 统计终端 | 增加带媒体类型校验的 `FrameCounterSink`，忽略 EOS 控制消息，只统计真实解码帧 | `test/media/test_stream_decode.cpp` |
+| 停止流程 | 回车后调用 `Graph::GracefulStop(5s)`，等待 Source 停产、Edge/节点任务排空并输出残留帧 | `test/media/test_stream_decode.cpp` |
+
+这次迁移没有引入新的媒体线程、回调订阅或独立的 StreamInfo 等待循环。Graph 的
+启动优先级保证下游先于 Source 就绪，Source 的读取线程不会占用媒体节点的业务
+Executor；主线程只负责等待用户输入和读取统计快照。
+
+### 21.3 验证结果
+
+使用 `C:\Program Files\Microsoft Visual Studio\18\Community` 的 VS x64 环境，
+`test_stream_decode` 已成功重新编译和链接。该程序依赖固定地址
+`rtsp://192.168.66.83/live/mainstream` 和现场设备，当前未在无设备环境中执行
+真实播放验证。现场测试时 `192.168.66.83` 可 ping 通，RTSP 控制端口 554 可连接；
+当前 `live/mainstream` URL 按已有成功测试使用 TCP，另一个摄像头 RTP over UDP
+地址暂不纳入本阶段；
+`182.168.66.83` 不可达，因此当前代码中的 `192` 地址是有效目标。
+
+当前测试显式设置 `SetRtspTransport("tcp")`、`SetRtspAutoSwitchToTcp(false)`、
+`SetLowLatency(true)`，连接和读取超时均为 5 秒，与现有成功的摄像头发布/渲染
+测试保持一致。此前针对 UDP 的长时观测属于另一条地址/传输路径的排查结果，不作为
+当前 `live/mainstream` MediaFlow 迁移的验收结论。测试仍保留双轨帧计数和 Source/
+Edge/Decoder 指标，避免设备没有实际媒体包时误报通过。
+
+### 21.4 下一阶段入口
+
+下一步优先迁移 `test_local_mp4_decode_rtsp_publisher` 的本地文件视频链路：先将
+Source、Decoder、Encoder 和 Publisher 接入 MediaFlow，再保留其本地 RTSP 自测客户
+端。完成后才能在不依赖摄像头的环境验证 `Source -> Decode -> Encode -> Publish`
+的 EOS、关键帧启动和本地 RTSP 互操作；摄像头、AVTP 和 ZLMediaKit 链路继续按同样
+边界逐项迁移。
+
+### 21.5 与旧手工摄像头链路的对比
+
+为确认问题边界，重新配置构建目录启用了 `VIDEO_PIPELINE_BUILD_ZLMEDIAKIT_TEST`
+和 common-process 支持，并运行了 `test_rtsp_server_publisher`。其中
+`TestCameraAudioVideoDecodeEncodePublish` 使用的是 `SetRtspTransport("tcp")`、
+`SetLowLatency(true)` 和手工同步 `ReadPacket()` 循环；运行日志显示它成功打开了
+H.264/A-law 双轨，启动 H.264/AAC Encoder，并启动本地 RTSP 发布器。该函数本身是
+无限循环，现场运行 30 秒后由测试超时终止。
+
+当前 `test_stream_decode` 已按这套成功配置统一为 TCP；此前 UDP 观测显示 Source
+在 UDP 读超时后进入第 4 个 generation、`finished=1`，Source->Router Edge 接收数
+为 0，该结果仅说明 UDP 地址/传输路径不适用于当前 URL。另一个 RTP over UDP 地址
+留待后续单独接入，不影响当前 `live/mainstream` 的 MediaFlow 迁移。
+
+### 21.6 已知问题记录：音频突发导致视频包丢失
+
+#### 21.6.1 问题现象
+
+使用当前已经验证成功的配置连接 `rtsp://192.168.66.83/live/mainstream`：
+
+- RTSP 传输为 TCP；
+- `SetRtspAutoSwitchToTcp(false)`；
+- `SetLowLatency(true)`；
+- 连接和读取超时均为 5 秒。
+
+旧的同步测试可以同时解码摄像头的 H.264 视频和 G.711 音频，但将同一条拉流链路
+接入 MediaFlow 后，初始实现出现了“音频持续有帧、视频没有帧或视频帧数量明显不足”
+的现象。现场排查确认这不是摄像头 RTP over UDP 地址的问题，也不是当前 TCP
+传输配置的问题，而是 MediaFlow 异步队列在启动阶段处理突发数据时丢失了视频包。
+
+#### 21.6.2 实际数据路径
+
+问题发生在下面这条路径中：
+
+```text
+FFmpegPuller::ReadPacketResult()
+        -> StreamSourceNode::Emit(MediaPacketMessage)
+        -> source:out -> router:in
+        -> TrackRouterNode
+             |-> router:video -> video-decoder:in -> FrameCounterSink(video)
+             `-> router:audio -> audio-decoder:in -> FrameCounterSink(audio)
+```
+
+`StreamSourceNode` 使用独立读取线程连续调用 `FFmpegPuller::ReadPacketResult()`，
+读取成功后立即向 Graph 发送包。它不会按照包的 PTS 主动等待，也不会因为下游正在
+处理上一批包而同步调用 Decoder。`QueueTransport` 再把这些包转换为目标节点的异步
+任务，由共享的 `AsioExecutor` 执行。
+
+#### 21.6.3 根因分析
+
+初始实现使用了 MediaFlow 的默认配置：
+
+| 位置 | 初始配置 | 直接影响 |
+|---|---|---|
+| 每个节点的任务队列 | `max_pending_tasks=64` | Router 或 Decoder 尚未处理完上一批任务时，新任务达到上限并被拒绝 |
+| Source 到 Router 的包边 | 容量 `64`，`DropNewest` | 队列满后，新读出的包直接丢弃，不会重试 |
+| Router 到两个 Decoder 的包边 | 容量 `64`，`DropNewest` | 音频和视频分别排队，但各自的突发仍可能超过队列容量 |
+| Decoder 到统计 Sink 的帧边 | 容量 `64`，`DropNewest` | Decoder 产生帧的速度短时高于统计节点时，新帧可能被丢弃 |
+
+触发过程如下：
+
+1. 摄像头流的音频轨道为 16 kHz G.711，解码后每个包通常包含约 320 个采样，
+   因此音频包到达频率高于视频帧频率。
+2. RTSP/FFmpeg 在连接建立后可能先把接收缓冲区中的一段数据快速交给
+   `av_read_frame()`。这段时间 Source 读取速度远高于 Decoder 的处理速度。
+3. 音频包先进入 `source:out -> router:in` 的有限队列，占用大部分或全部槽位。
+   `DropNewest` 的语义是保留队列中已有的包、丢弃刚到达的包，因此随后到达的
+   视频包无法进入队列。
+4. 即使部分视频包进入 Router，视频包还要经过独立的 `video` 边。如果 H.264 的
+   关键帧、SPS/PPS 或关键帧后的必要连续包在任一层被丢弃，Decoder 就不能建立
+   可输出的画面；音频则可能继续正常解码，造成“只有音频”的表象。
+5. `OutputPort::Send()` 和 `QueueTransport::Send()` 对 `DropNewest` 的结果不会
+   自动重试，Source 也不会重新读取已丢弃的包。因此这不是延迟增加，而是不可恢复
+   的媒体数据损失。
+
+#### 21.6.4 为什么旧同步测试没有复现
+
+旧测试在同一个读取循环中执行以下操作：
+
+```text
+ReadPacket()
+    -> 根据 packet type 选择 Decoder
+    -> Decoder::Decode()
+    -> 继续 ReadPacket()
+```
+
+读取线程在调用 `Decode()` 返回之前不会继续快速填充另一个异步队列，因而不存在
+`Source` 和 `Decoder` 之间的突发积压。旧测试的正常结果只能证明摄像头地址、TCP
+会话、FFmpeg 解码器和媒体包本身可用，不能直接证明异步 Graph 的默认背压参数适合
+该流。
+
+#### 21.6.5 当前改进
+
+已在 `test/media/test_stream_decode.cpp` 中针对这条解码验证图调整为：
+
+| 位置 | 当前配置 | 目的 |
+|---|---|---|
+| Source、Router、Decoder、Sink 节点 | `max_pending_tasks=4096` | 给启动突发提供足够的任务缓冲空间 |
+| Source 到 Router、Router 到 Decoder 的包边 | 容量 `4096`，`DropNewest` | 保持包的 FIFO 顺序，同时避免默认 64 条队列过早溢出 |
+| Decoder 到统计 Sink 的帧边 | 容量 `1024`，`DropNewest` | 避免解码突发阶段统计节点成为瓶颈 |
+| Source 启动顺序 | 下游节点先启动，Source 最后启动 | 确保首包到达前 Router、Decoder 和 Sink 已完成注册 |
+| 运行指标 | 统计每个节点和每条 Edge 的接收、处理、拒绝、丢弃数量 | 区分“没有收到包”和“收到包但解码没有产出” |
+
+这里使用更大的有界队列是验证阶段的改进，不等同于无限扩大缓存。`DropNewest`
+仍然可能在持续吞吐不匹配时丢包，只是把启动阶段的短时突发与长期处理能力问题
+区分开来；验证程序也必须继续观察 `dropped_newest`，不能仅检查最终帧数。
+
+#### 21.6.6 修复后的现场验证
+
+使用相同的 TCP URL 和 5 秒超时配置运行约 5 秒，结果如下：
+
+| 指标 | 结果 |
+|---|---:|
+| 视频解码帧 | 66 |
+| 音频解码帧 | 178 |
+| Source -> Router 接收/丢弃 | `267 / 0` |
+| Router -> Video Decoder 接收/丢弃 | `89 / 0` |
+| Router -> Audio Decoder 接收/丢弃 | `178 / 0` |
+| 进程退出 | 正常，退出码 `0` |
+
+验证表明，扩大启动阶段的任务和包队列后，音频突发不再挤掉当前测试所需的视频
+包，视频和音频均能解码。摄像头 RTP over UDP 的另一条 URL 按要求暂不处理。
+
+#### 21.6.7 后续架构改进计划
+
+当前参数只能解决已观测到的启动突发，后续正式封装 `media` 各流程时应继续实现：
+
+1. **轨道隔离队列**：Source 进入 Router 前按媒体类型分成独立队列，避免音频流量
+    直接挤占视频队列容量。
+2. **视频关键帧保护**：在丢包策略中优先保护 SPS/PPS、关键帧和关键帧后的恢复窗口，
+    避免普通视频包丢弃后整个视频解码器长时间无输出。
+3. **可中断背压**：对不能丢失的录制、转发链路增加可中断的 `Block` 策略；停止
+     Graph 时必须先解除生产者等待，避免 Source 在关闭阶段永久阻塞。
+4. **按 PTS 的实时调度**：对本地缓冲突发或重连后的积压数据增加限速/追赶策略，
+    避免 Source 长时间以远高于实时的速度填充下游。
+5. **按轨道指标和验收门槛**：分别记录音频/视频的 accepted、dropped、rejected、
+     keyframe 等指标，并把“视频帧数大于零且 Edge 丢弃为零”纳入解码测试验收。
