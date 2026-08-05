@@ -65,6 +65,7 @@ struct EncodedTrackInfo {
     Rational time_base{1, 1000000};
     int width{0};
     int height{0};
+    float fps{0.0f};
     int sample_rate{0};
     int channels{0};
     std::vector<std::uint8_t> extra_data;

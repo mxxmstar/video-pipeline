@@ -12,7 +12,9 @@
 #include "mediaflow/core/node.h"
 
 #include "media/decoder/i_decoder.h"
+#include "media/encoder/i_encoder.h"
 #include "media/puller/i_puller.h"
+#include "media/publisher/i_publisher.h"
 
 #include <atomic>
 #include <cstdint>
@@ -44,6 +46,20 @@ struct MediaFrameMessage {
     }
 };
 
+/// Encoder 到 PublisherSink 之间传递的编码包消息。
+struct EncodedPacketMessage {
+    std::shared_ptr<MediaPacket> packet; ///< 编码后的压缩包。
+    EncodedTrackInfo track_info;         ///< Encoder 实际输出轨道描述。
+    int track_id{0};                     ///< MediaFlow 内部输出轨道 ID。
+    std::uint64_t generation{0};         ///< 产生该包的输入连接代次。
+
+    bool Valid() const {
+        return packet != nullptr && generation != 0 &&
+               track_info.media_type != MediaType::UNKNOWN &&
+               track_info.codec_type != CodecType::UNKNOWN;
+    }
+};
+
 /// Source 节点的重连策略。
 struct StreamSourceNodeOptions {
     int reconnect_interval_ms{100}; ///< 可恢复读错误后的等待时间。
@@ -54,6 +70,16 @@ struct StreamSourceNodeOptions {
 struct TrackSelection {
     int stream_index{-1};             ///< FFmpeg stream index；-1 表示首个匹配视频轨。
     CodecType codec{CodecType::UNKNOWN}; ///< 可选编码格式约束。
+};
+
+/// Encoder 节点的输出配置。
+struct EncoderNodeOptions {
+    int track_id{0}; ///< PublisherConfig 中对应的 track_id。
+};
+
+/// PublisherSink 的启动和断线恢复策略。
+struct PublisherSinkNodeOptions {
+    bool wait_for_keyframe_on_start{true}; ///< 首次启动前丢弃非关键视频包。
 };
 
 /**
@@ -205,6 +231,116 @@ private:
     std::uint64_t callback_generation_{0};
     bool decoder_open_{false};
     bool accepting_{false};
+};
+
+/**
+ * @brief 将解码帧适配为编码包的节点。
+ *
+ * EncoderNode 在 Init 阶段打开 IEncoder，并在每个 FrameMessage 到达时把
+ * Encode 返回的全部 packet 按原顺序发送到下游。每个输出包都会补齐本节点
+ * 负责的 track_id，但不会覆盖 Encoder 已生成的 time_base、PTS、DTS 和 duration。
+ * 重连代次变化时直接关闭旧 encoder 并重开，不把旧代次的 flush 包混入新链路。
+ */
+class EncoderNode final : public INode {
+public:
+    EncoderNode(std::unique_ptr<IEncoder> encoder,
+                EncoderConfig config,
+                EncoderNodeOptions options = {});
+    ~EncoderNode() override;
+
+    EncoderNode(const EncoderNode&) = delete;
+    EncoderNode& operator=(const EncoderNode&) = delete;
+
+    bool RegisterPorts(PortRegistry& registry) override;
+    bool Init() override;
+    bool Start() override;
+    void Stop() override;
+    void Deinit() override;
+    std::string Name() const override;
+
+    InputPort<MediaFrameMessage>& Input();
+    OutputPort<EncodedPacketMessage>& Output();
+
+    /// 在 Graph graceful barrier 内显式输出编码器残留包。
+    bool Flush();
+
+    EncodedTrackInfo OutputInfo() const;
+    std::string LastError() const;
+
+private:
+    void Process(MediaFrameMessage message);
+    bool OpenForGeneration(std::uint64_t generation);
+    bool EmitPackets(const std::vector<PacketPtr>& packets,
+                     std::uint64_t generation);
+    void SetError(std::string message);
+    void SetErrorLocked(std::string message);
+
+    std::unique_ptr<IEncoder> encoder_;
+    EncoderConfig config_;
+    EncoderNodeOptions options_;
+    InputPort<MediaFrameMessage> input_;
+    OutputPort<EncodedPacketMessage> output_;
+
+    mutable std::mutex state_mutex_;
+    std::string last_error_;
+    EncodedTrackInfo output_info_;
+    std::uint64_t active_generation_{0};
+    bool encoder_open_{false};
+    bool accepting_{false};
+};
+
+/**
+ * @brief 将编码包发布到现有 IPublisher 的终端节点。
+ *
+ * Publisher 不在 Graph Start 阶段盲目启动，因为此时 Encoder 还没有提供
+ * 实际 time_base、尺寸和 extradata。节点收到第一条完整 EncodedPacketMessage
+ * 后合并轨道描述、启动 Publisher，并在同一 Serialized 节点上下文中执行后续
+ * Publish。Publisher 断线或输入 generation 变化后，非关键视频包会被丢弃，
+ * 直到下一关键帧重新建立可播放入口。
+ */
+class PublisherSinkNode final : public SinkNode<EncodedPacketMessage> {
+public:
+    explicit PublisherSinkNode(
+        PublisherConfig config,
+        std::unique_ptr<IPublisher> publisher = nullptr,
+        PublisherSinkNodeOptions options = {});
+    ~PublisherSinkNode() override;
+
+    PublisherSinkNode(const PublisherSinkNode&) = delete;
+    PublisherSinkNode& operator=(const PublisherSinkNode&) = delete;
+
+    bool Init() override;
+    bool Start() override;
+    void Stop() override;
+    void Deinit() override;
+    int StartPriority() const override;
+    std::string Name() const override;
+
+    PublisherStats Stats() const;
+    PublisherResult LastResult() const;
+    std::string LastError() const;
+    PublisherConfig Config() const;
+
+protected:
+    void Process(EncodedPacketMessage message) override;
+
+private:
+    bool PrepareTrack(const EncodedPacketMessage& message);
+    bool StartPublisher(const EncodedPacketMessage& message);
+    bool IsVideoKeyframe(const EncodedPacketMessage& message) const;
+    void SetError(std::string message);
+
+    PublisherConfig config_;
+    std::unique_ptr<IPublisher> publisher_;
+    PublisherSinkNodeOptions options_;
+
+    mutable std::mutex state_mutex_;
+    PublisherResult last_result_;
+    std::string last_error_;
+    std::uint64_t active_generation_{0};
+    bool accepting_{false};
+    bool publisher_started_{false};
+    bool awaiting_keyframe_{false};
 };
 
 } // namespace mediaflow

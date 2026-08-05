@@ -171,7 +171,7 @@ PublisherResult FfmpegMuxProtocol::Write(
     if (waiting_for_keyframe_ &&
         (access_unit.media_type != MediaType::VIDEO || !access_unit.keyframe)) {
         return PublisherResult::Failure(
-            PublisherErrorCode::RuntimeDisconnected,
+            PublisherErrorCode::AwaitingKeyframe,
             "FFmpeg output is waiting for a video keyframe after reconnect");
     }
 
@@ -200,7 +200,7 @@ PublisherResult FfmpegMuxProtocol::Write(
     waiting_for_keyframe_ = access_unit.media_type == MediaType::VIDEO;
     if (waiting_for_keyframe_ && !access_unit.keyframe) {
         return PublisherResult::Failure(
-            PublisherErrorCode::RuntimeDisconnected,
+            PublisherErrorCode::AwaitingKeyframe,
             "FFmpeg output reconnected; waiting for the next video keyframe");
     }
 

@@ -788,7 +788,7 @@ ctest --test-dir build -C Debug --output-on-failure
 | 项目 | 当前状态 | 后续阶段 |
 |---|---|---|
 | FFmpeg 多轨显式选轨和独立路由 | Puller 仍可输出多个同类型 stream，`MultiStreamInfo` 仍需完善 selected track 契约 | A1 |
-| Publisher 重连后的等待关键帧状态 | `PublisherResult` 和 Publisher 内部状态尚未完整区分 AwaitingKeyframe 与 Closed | A2 |
+| Publisher 重连后的等待关键帧状态 | 已增加 `AwaitingKeyframe` 结果；默认 Publisher 在该状态保持会话，失败重连仍区分为 `RuntimeDisconnected` | 已完成/A2 |
 | RTSP 多轨唯一匹配 | 同 codec 多候选的显式 track 拒绝策略尚未完成 | A2/A3 |
 | FFmpeg 多轨交织 | mux 的 interleaved write 和有界 DTS 重排尚未实施 | A3 |
 | Graph Graceful Stop | MediaFlow 仍需 pending-task barrier、拓扑逆序停止和逐级 Flush 屏障 | A3 |
@@ -853,7 +853,7 @@ StreamSourceNode<MediaPacketMessage>
 | 多轨 selected track 契约 | Router 支持显式 stream index，但 Source 尚未发布完整的选轨控制对象，多个同 codec 轨道仍需上层明确选择 | A3 |
 | Graph EOS 传播 | Source 内部可识别 EOS，但当前 Graph 没有通用 EOS 控制消息，Decoder 不会因 EOS 自动 Flush | A3 |
 | Decoder Flush 屏障 | `DecoderNode::Flush()` 已提供，但 Immediate Stop 不调用它，避免与未完成 Decode 并发；需等 Graph Graceful Stop barrier | A3 |
-| Encoder/Publisher | 尚未实现 `EncoderNode` 和 `PublisherSinkNode` | A2 |
+| Encoder/Publisher | A2 已完成 `EncoderNode` 和 `PublisherSinkNode` 的单视频节点链路；真实网络长时播放仍待外部环境验证 | A3/集成验证 |
 | 现有媒体测试迁移 | `test_stream_decode`、AVTP 和 RTSP 发布测试仍是旧手工回调链 | A1 后续/A2 |
 
 ### 18.5 阶段结论
@@ -862,3 +862,66 @@ A1 的本地单视频 Source -> Router -> Decoder 图已经具备可编译、可
 最小实现，首包窗口和旧代次穿透问题已由节点边界处理。下一阶段入口为 A2：接入
 `EncoderNode` 和 `PublisherSinkNode`，同时完善 Publisher 重连后的等待关键帧语义；
 Graph 的完整 EOS/Flush/Graceful Stop 屏障继续留在 A3。
+
+## 19. A2 实施记录：Encoder + 单视频 Publisher
+
+### 19.1 已完成修改
+
+本阶段在 A1 的 `MediaFrameMessage` 基础上完成单路视频的编码和发布适配。节点
+不把 Publisher 启动放在 Graph 的静态 Start 阶段，而是等 Encoder 提供实际输出轨道
+信息后再创建/启动 Publisher，避免使用错误的 time base、尺寸或 extradata 写 header。
+
+| 领域 | 实际修改 | 主要文件 |
+|---|---|---|
+| 编码消息 | 增加 `EncodedPacketMessage`，携带编码包、`EncodedTrackInfo`、`track_id` 和 generation | `include/mediaflow/media_nodes.h` |
+| Encoder 节点 | 增加 `EncoderNode`，Init 打开编码器，逐帧转发 Encode 返回的全部 packet，并把输出 stream_index 统一设置为 MediaFlow track_id | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| Encoder 重连代次 | 输入 generation 变化时关闭旧 Encoder 并重新 Open；旧代次 Frame 不进入新 Encoder；旧上下文不在换代时隐式 Flush | `src/mediaflow/media_nodes.cpp` |
+| Encoder Flush | `EncoderNode::Flush()` 显式转发全部尾包，保留 Encoder 生成的 PTS、DTS、time_base 和 duration | `src/mediaflow/media_nodes.cpp` |
+| 输出轨道 | `EncodedTrackInfo` 增加视频 fps，FFmpegEncoder 从实际配置填充 fps；Publisher 使用实际 time_base、尺寸和 extradata | `include/media/encoder/i_encoder.h`、`src/media/encoder/ffmpeg_encoder.cpp` |
+| Publisher 节点 | 增加 `PublisherSinkNode`，收到完整编码轨道信息后生成/合并 `MediaTrackConfig`，再在 Serialized 节点上下文中 Start/Publish | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| 首次发布 | 默认先等待视频关键帧，避免从无法独立解码的 P/B 帧启动发布；音频不受该策略误阻塞 | `src/mediaflow/media_nodes.cpp` |
+| 关键帧恢复 | 新 generation 或 Publisher 断线后等待关键帧；非关键帧丢弃，关键帧重新启动或恢复 Publisher | `src/mediaflow/media_nodes.cpp` |
+| Publisher 结果语义 | 增加 `PublisherErrorCode::AwaitingKeyframe`；FFmpeg mux 重连后等待关键帧返回该状态，`DefaultPublisher` 不再把会话错误关闭 | `include/media/publisher/publisher_result.h`、`src/media/protocol/ffmpeg_mux_protocol.cpp`、`src/media/publisher/default_publisher.cpp` |
+| 测试 | 扩展 MediaFlow 本地测试，覆盖一帧多 packet、track_id、轨道元数据、Flush 尾包和 AwaitingKeyframe 后续关键帧 | `test/mediaflow/test_mediaflow_media_nodes.cpp` |
+
+### 19.2 当前推荐组图方式
+
+```text
+StreamSourceNode
+        -> TrackRouterNode
+        -> DecoderNode
+        -> EncoderNode
+        -> PublisherSinkNode
+```
+
+视频 Encoder 的 `EncoderNodeOptions::track_id` 必须与 Publisher 配置中的
+`MediaTrackConfig::track_id` 对应。Publisher 配置可以预先提供 URL 和部分轨道字段，
+但最终启动前必须能够从 Encoder 输出补齐有效的媒体类型、codec、尺寸、fps、time_base
+和必要的 extradata。没有显式轨道配置时，A2 单视频节点会根据第一条编码包动态创建
+一条轨道。
+
+### 19.3 验证结果
+
+- 使用 `C:\Program Files\Microsoft Visual Studio\18\Community` 的 VS 2026 x64 工具链编译 `video_pipeline_lib` 和 `test_mediaflow_media_nodes`。
+- `test_mediaflow_media_nodes` 通过：Encoder 一帧输出多个 packet，Publisher 收到的 packet 顺序保持不变，packet 的 stream_index 为配置的 track_id。
+- 测试验证 Publisher 首次丢弃非关键帧、关键帧启动发布、Flush 尾包继续发布；轨道 width、height、fps、time_base 和 extradata 均来自 Encoder 输出。
+- 测试验证 `AwaitingKeyframe` 不会导致 Publisher 被标记为关闭，后续关键帧仍使用第一次启动的 Publisher。
+- 联合回归通过：`test_mediaflow`、`test_mediaflow_media_nodes`、`test_ffmpeg_audio_encoder`、`test_ffmpeg_decoder_raw_packet`。
+- 尚未执行真实 RTSP/RTMP 服务、ffplay/VLC 30 分钟长时播放或网络断线互操作测试；这些仍是 A2 集成验收项。
+
+### 19.4 尚未完成项与下一阶段入口
+
+| 项目 | 当前状态 | 后续阶段 |
+|---|---|---|
+| 真实 Publisher 断线重连 | 协议结果和节点状态已区分；真实远端断开后的重连、关键帧恢复仍需服务端验证 | A2 集成验证 |
+| Graph EOS 传播 | Source 能识别 EOS，但没有通用 EOS 消息驱动 Encoder/Publisher 自动 Flush | A3 |
+| Graph Graceful Stop | Encoder Flush API 已接入，仍没有 pending-task barrier，Immediate Stop 不自动 Flush | A3 |
+| 音视频多轨 | 当前节点链路按单视频设计，PublisherSink 尚未汇合多轨并处理交织 | A3 |
+| 现有 RTSP/RTMP 测试迁移 | 现有媒体端到端测试仍保留手工 Puller/Decoder/Encoder/Publisher 回调 | A3/集成验证 |
+
+### 19.5 阶段结论
+
+A2 的本地 `Source -> Decode -> Encode -> Publish` 单视频节点链路已具备完整的
+消息代次、轨道元数据、编码多包转发、显式 Flush 和关键帧等待语义。下一阶段进入
+A3：音视频多轨汇合、FFmpeg mux interleaved write，以及 Graph 的有序停止和逐级
+Flush 屏障。

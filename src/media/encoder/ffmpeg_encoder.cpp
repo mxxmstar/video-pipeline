@@ -367,6 +367,10 @@ EncodedTrackInfo FFmpegEncoder::GetOutputInfo() const {
         if (config_.media_type == MediaType::VIDEO) {
             info.width = codec_ctx_->width;
             info.height = codec_ctx_->height;
+            if (config_.video.fps_num > 0 && config_.video.fps_den > 0) {
+                info.fps = static_cast<float>(config_.video.fps_num) /
+                           static_cast<float>(config_.video.fps_den);
+            }
         } else if (config_.media_type == MediaType::AUDIO) {
             info.sample_rate = codec_ctx_->sample_rate;
             info.channels = codec_ctx_->ch_layout.nb_channels;

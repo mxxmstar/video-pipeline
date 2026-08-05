@@ -15,6 +15,7 @@ enum class PublisherErrorCode {
     ConnectionFailed,
     RemoteRejected,
     RuntimeDisconnected,
+    AwaitingKeyframe, // 已重连但暂时丢弃非关键帧；Publisher 会话仍保持可写。
     InternalError,
 };
 
@@ -42,4 +43,3 @@ struct PublisherResult {
         return IsSuccess();
     }
 };
-

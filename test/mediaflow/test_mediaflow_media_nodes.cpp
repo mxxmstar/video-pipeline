@@ -199,6 +199,188 @@ private:
     std::vector<std::uint64_t> generations_;
 };
 
+struct EncoderState {
+    std::mutex mutex;
+    int open_count{0};
+    int encode_count{0};
+    int flush_count{0};
+    int close_count{0};
+};
+
+class RecordingEncoder final : public IEncoder {
+public:
+    explicit RecordingEncoder(std::shared_ptr<EncoderState> state)
+        : state_(std::move(state)) {}
+
+    bool Open(const EncoderConfig& config) override {
+        config_ = config;
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        ++state_->open_count;
+        return true;
+    }
+
+    bool Encode(FramePtr frame, std::vector<PacketPtr>& packets) override {
+        assert(frame);
+        int encode_index = 0;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            encode_index = ++state_->encode_count;
+        }
+
+        auto first = MakePacket(MediaType::VIDEO, 0, encode_index * 40,
+                                CodecType::H264);
+        first->keyframe = false;
+        packets.push_back(std::move(first));
+
+        // 一帧输出两个包，验证 EncoderNode 不会只转发 vector 的第一个元素。
+        auto second = MakePacket(MediaType::VIDEO, 0, encode_index * 40 + 20,
+                                 CodecType::H264);
+        second->keyframe = encode_index == 1;
+        packets.push_back(std::move(second));
+        return true;
+    }
+
+    bool Flush(std::vector<PacketPtr>& packets) override {
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            ++state_->flush_count;
+        }
+        auto tail = MakePacket(MediaType::VIDEO, 0, 100, CodecType::H264);
+        tail->keyframe = true;
+        packets.push_back(std::move(tail));
+        return true;
+    }
+
+    EncodedTrackInfo GetOutputInfo() const override {
+        EncodedTrackInfo info;
+        info.media_type = MediaType::VIDEO;
+        info.codec_type = CodecType::H264;
+        info.time_base = Rational{1, 1000};
+        info.width = config_.video.width;
+        info.height = config_.video.height;
+        info.fps = 25.0F;
+        info.extra_data = {0x01, 0x64, 0x00, 0x1f};
+        return info;
+    }
+
+    void Close() override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        ++state_->close_count;
+    }
+
+private:
+    std::shared_ptr<EncoderState> state_;
+    EncoderConfig config_;
+};
+
+struct PublisherState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    int start_count{0};
+    int stop_count{0};
+    int publish_attempts{0};
+    bool await_next_publish{false};
+    std::vector<MediaPacket> packets;
+    PublisherConfig config;
+};
+
+class RecordingPublisher final : public IPublisher {
+public:
+    explicit RecordingPublisher(std::shared_ptr<PublisherState> state)
+        : state_(std::move(state)) {}
+
+    PublisherResult Start() override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        ++state_->start_count;
+        started_ = true;
+        state_->config = config_;
+        return PublisherResult::Success();
+    }
+
+    PublisherResult Publish(const MediaPacket& packet) override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        if (!started_) {
+            return PublisherResult::Failure(
+                PublisherErrorCode::InvalidState, "publisher is stopped");
+        }
+        ++state_->publish_attempts;
+        state_->condition.notify_all();
+        if (state_->await_next_publish) {
+            state_->await_next_publish = false;
+            return PublisherResult::Failure(
+                PublisherErrorCode::AwaitingKeyframe,
+                "waiting for keyframe");
+        }
+        state_->packets.push_back(packet);
+        state_->condition.notify_all();
+        return PublisherResult::Success();
+    }
+
+    void Stop() override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        ++state_->stop_count;
+        started_ = false;
+    }
+
+    std::string GetPlayUrl() const override {
+        return "recording://publisher";
+    }
+
+    PublisherStats GetStats() const override {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        PublisherStats stats;
+        stats.packets_published = state_->packets.size();
+        return stats;
+    }
+
+    PublisherResult GetLastResult() const override {
+        return PublisherResult::Success();
+    }
+
+    void SetConfig(PublisherConfig config) {
+        config_ = std::move(config);
+    }
+
+private:
+    std::shared_ptr<PublisherState> state_;
+    PublisherConfig config_;
+    bool started_{false};
+};
+
+class VideoFrameSource final : public SourceNode<MediaFrameMessage> {
+public:
+    std::string Name() const override {
+        return "video-frame-source";
+    }
+
+    bool Start() override {
+        auto frame = std::make_shared<MediaFrame>();
+        frame->type = MediaType::VIDEO;
+        frame->time.pts_us = 0;
+        frame->meta = VideoFrameMeta{PixelFormat::kI420, 640, 360, 0, {}};
+        Emit(MediaFrameMessage{std::move(frame), 1});
+        return true;
+    }
+};
+
+bool WaitForPublished(const std::shared_ptr<PublisherState>& state,
+                      std::size_t count) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    return state->condition.wait_for(lock, std::chrono::seconds(2),
+                                     [state, count]() {
+        return state->packets.size() >= count;
+    });
+}
+
+bool WaitForPublishAttempts(const std::shared_ptr<PublisherState>& state,
+                            int count) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    return state->condition.wait_for(lock, std::chrono::seconds(2),
+                                     [state, count]() {
+        return state->publish_attempts >= count;
+    });
+}
+
 void TestSingleVideoChainAndReconnectGeneration() {
     auto decoder_state = std::make_shared<DecoderState>();
     auto executor = std::make_shared<AsioExecutor>("media-node-test", 2);
@@ -253,9 +435,130 @@ void TestSingleVideoChainAndReconnectGeneration() {
     graph.Stop();
 }
 
+void TestEncoderAndPublisherChain() {
+    auto encoder_state = std::make_shared<EncoderState>();
+    auto publisher_state = std::make_shared<PublisherState>();
+    auto executor = std::make_shared<AsioExecutor>("encoder-publisher-test", 2);
+
+    EncoderConfig encoder_config;
+    encoder_config.media_type = MediaType::VIDEO;
+    encoder_config.codec_type = CodecType::H264;
+    encoder_config.video.width = 640;
+    encoder_config.video.height = 360;
+    encoder_config.video.pixel_format = PixelFormat::kI420;
+
+    PublisherConfig publisher_config;
+    publisher_config.url = "recording://publisher";
+    publisher_config.protocol = PublishProtocol::FfmpegMux;
+
+    Graph graph;
+    assert(graph.AddNode<VideoFrameSource>("frames", executor, NodeOptions{}));
+    assert(graph.AddNode<EncoderNode>(
+        "encoder", executor, NodeOptions{},
+        std::make_unique<RecordingEncoder>(encoder_state), encoder_config,
+        EncoderNodeOptions{12}));
+    assert(graph.AddNode<PublisherSinkNode>(
+        "publisher", executor, NodeOptions{}, publisher_config,
+        std::make_unique<RecordingPublisher>(publisher_state),
+        PublisherSinkNodeOptions{true}));
+    assert(graph.Connect<MediaFrameMessage>("frames", "encoder"));
+    assert(graph.Connect<EncodedPacketMessage>("encoder", "publisher"));
+    assert(graph.Start());
+
+    // 第一帧的第一个包是非关键帧，第二个包为关键帧；首个非关键帧应被
+    // PublisherSink 丢弃，关键帧启动 Publisher，后续包继续发送。
+    assert(WaitForPublished(publisher_state, 1));
+    auto encoder = graph.GetNode<EncoderNode>("encoder");
+    auto publisher = graph.GetNode<PublisherSinkNode>("publisher");
+    assert(encoder && publisher);
+    assert(encoder->OutputInfo().fps == 25.0F);
+    assert(encoder->Flush());
+    assert(WaitForPublished(publisher_state, 2));
+
+    {
+        std::lock_guard<std::mutex> lock(publisher_state->mutex);
+        assert(publisher_state->start_count == 1);
+        assert(publisher_state->packets.size() == 2);
+        assert(publisher_state->packets[0].keyframe);
+        assert(publisher_state->packets[0].stream_index == 12);
+        assert(publisher_state->packets[1].keyframe);
+    }
+
+    const auto configured = publisher->Config();
+    assert(configured.tracks.size() == 1);
+    assert(configured.tracks[0].track_id == 12);
+    assert(configured.tracks[0].width == 640);
+    assert(configured.tracks[0].height == 360);
+    assert(configured.tracks[0].time_base_num == 1);
+    assert(configured.tracks[0].time_base_den == 1000);
+    assert(!configured.tracks[0].extra_data.empty());
+
+    {
+        std::lock_guard<std::mutex> lock(encoder_state->mutex);
+        assert(encoder_state->open_count == 1);
+        assert(encoder_state->encode_count == 1);
+        assert(encoder_state->flush_count == 1);
+    }
+
+    graph.Stop();
+}
+
+void TestPublisherAwaitingKeyframeState() {
+    auto encoder_state = std::make_shared<EncoderState>();
+    auto publisher_state = std::make_shared<PublisherState>();
+    publisher_state->await_next_publish = true;
+    auto executor = std::make_shared<AsioExecutor>("publisher-keyframe-test", 2);
+
+    EncoderConfig encoder_config;
+    encoder_config.media_type = MediaType::VIDEO;
+    encoder_config.codec_type = CodecType::H264;
+    encoder_config.video.width = 640;
+    encoder_config.video.height = 360;
+    encoder_config.video.pixel_format = PixelFormat::kI420;
+
+    PublisherConfig publisher_config;
+    publisher_config.url = "recording://publisher";
+    publisher_config.protocol = PublishProtocol::FfmpegMux;
+
+    Graph graph;
+    assert(graph.AddNode<VideoFrameSource>("frames", executor, NodeOptions{}));
+    assert(graph.AddNode<EncoderNode>(
+        "encoder", executor, NodeOptions{},
+        std::make_unique<RecordingEncoder>(encoder_state), encoder_config,
+        EncoderNodeOptions{12}));
+    assert(graph.AddNode<PublisherSinkNode>(
+        "publisher", executor, NodeOptions{}, publisher_config,
+        std::make_unique<RecordingPublisher>(publisher_state),
+        PublisherSinkNodeOptions{true}));
+    assert(graph.Connect<MediaFrameMessage>("frames", "encoder"));
+    assert(graph.Connect<EncodedPacketMessage>("encoder", "publisher"));
+    assert(graph.Start());
+
+    auto encoder = graph.GetNode<EncoderNode>("encoder");
+    auto publisher = graph.GetNode<PublisherSinkNode>("publisher");
+    assert(encoder && publisher);
+    assert(WaitForPublishAttempts(publisher_state, 1));
+    assert(encoder->Flush());
+    assert(WaitForPublished(publisher_state, 1));
+
+    {
+        std::lock_guard<std::mutex> lock(publisher_state->mutex);
+        // AwaitingKeyframe 不能让 PublisherSink 把会话标记为关闭；Flush
+        // 产生的下一关键帧应沿用第一次 Start 的 publisher。
+        assert(publisher_state->start_count == 1);
+        assert(publisher_state->publish_attempts == 2);
+        assert(publisher_state->packets.size() == 1);
+        assert(publisher_state->packets.front().keyframe);
+    }
+    assert(publisher->LastResult().IsSuccess());
+    graph.Stop();
+}
+
 } // namespace
 
 int main() {
     TestSingleVideoChainAndReconnectGeneration();
+    TestEncoderAndPublisherChain();
+    TestPublisherAwaitingKeyframeState();
     return 0;
 }

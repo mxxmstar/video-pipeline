@@ -54,6 +54,8 @@ PublisherResult DefaultPublisher::Publish(const MediaPacket& packet) {
     }
 
     last_result_ = adapter_->Send(packet);
+    // AwaitingKeyframe 只表示协议层已经重建连接、正在等待独立解码入口，
+    // 不能把 started_ 清掉；下一关键帧必须继续进入同一个 adapter 会话。
     if (last_result_.code == PublisherErrorCode::RuntimeDisconnected) {
         started_ = false;
     }
