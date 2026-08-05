@@ -32,6 +32,14 @@ public:
     /// 下游端口、队列和业务状态都已经就绪。普通节点默认使用 0，业务节点
     /// 只有在确实需要特殊启动顺序时才覆盖这个方法。
     virtual int StartPriority() const { return 0; }
+    /// 请求节点停止继续产生新消息，但暂不关闭节点内部媒体资源。
+    ///
+    /// GracefulStop 会先调用该阶段，等待已经进入 Graph 的消息全部排空，
+    /// 再调用 Flush/Stop。只有 SourceNode 一类的生产者通常需要覆写它。
+    virtual void StopProduction() {}
+    /// 在 pending barrier 内刷新节点内部缓存，并把尾部数据送往下游。
+    /// 普通节点没有内部缓存时保持默认成功即可。
+    virtual bool Flush() { return true; }
     /// 停止生产和接收新的业务工作。
     virtual void Stop() {}
     /// 释放 Init 阶段分配的资源。

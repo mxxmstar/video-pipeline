@@ -288,7 +288,10 @@ PublisherResult FfmpegMuxProtocol::WriteAvPacket(AVPacket* packet) {
 
     // 所有真正可能阻塞的 packet I/O 都经过同一组 deadline 和 interrupt callback。
     BeginIoOperation();
-    const int ret = av_write_frame(fmt_ctx_, packet);
+    // 音频和视频由不同 EncoderNode 并发进入 PublisherSink。使用 FFmpeg 的
+    // interleaved API 让 muxer 按各轨道 DTS 重新安排写入顺序，避免调用方的
+    // 到达顺序直接变成容器顺序并触发跨轨道非单调 DTS。
+    const int ret = av_interleaved_write_frame(fmt_ctx_, packet);
     EndIoOperation();
     const auto packet_size = packet->size > 0
         ? static_cast<std::uint64_t>(packet->size)

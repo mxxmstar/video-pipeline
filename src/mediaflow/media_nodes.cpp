@@ -72,6 +72,12 @@ bool StreamSourceNode::Start() {
     return true;
 }
 
+void StreamSourceNode::StopProduction() {
+    // GracefulStop 只需要停止读取线程并关闭 Puller，Decoder/Encoder 仍保持接收
+    // 状态，等待已经进入 Graph 的包排空后再由 Graph 统一调用 Stop。
+    Stop();
+}
+
 void StreamSourceNode::Stop() {
     // 先让读循环的代次检查失效，再关闭 puller。FFmpegPuller 的 Close 会
     // 唤醒正在 av_read_frame 中等待的线程，其他 Puller 也应遵守相同契约。
@@ -172,6 +178,15 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
             }
 
             case IPuller::PullReadStatus::EOS:
+                // 正常 EOF 必须沿媒体链路传播，后续 Decoder/Encoder 才能显式
+                // Flush，并把编码器中尚未输出的尾部 packet 交给 Publisher。
+                Emit(MediaPacketMessage{
+                    nullptr,
+                    nullptr,
+                    current_generation,
+                    true});
+                finished_.store(true);
+                return;
             case IPuller::PullReadStatus::FatalError:
             case IPuller::PullReadStatus::Stopped:
                 finished_.store(true);
@@ -238,8 +253,10 @@ void StreamSourceNode::UpdateStreamInfo(const MultiStreamInfo& info) {
 // TrackRouterNode
 // ─────────────────────────────────────────────────────────────────────────────
 
-TrackRouterNode::TrackRouterNode(TrackSelection selection)
-    : selection_(selection) {
+TrackRouterNode::TrackRouterNode(TrackSelection video_selection,
+                                 TrackSelection audio_selection)
+    : video_selection_(video_selection),
+      audio_selection_(audio_selection) {
     input_.SetHandler([this](MediaPacketMessage message) {
         Process(std::move(message));
     });
@@ -247,13 +264,16 @@ TrackRouterNode::TrackRouterNode(TrackSelection selection)
 
 bool TrackRouterNode::RegisterPorts(PortRegistry& registry) {
     return registry.Input("in", input_) &&
-           registry.Output("video", video_output_);
+           registry.Output("video", video_output_) &&
+           registry.Output("audio", audio_output_);
 }
 
 bool TrackRouterNode::Start() {
     accepting_.store(true);
-    selected_stream_index_ = selection_.stream_index;
-    selected_generation_ = 0;
+    selected_video_stream_index_ = video_selection_.stream_index;
+    selected_audio_stream_index_ = audio_selection_.stream_index;
+    selected_video_generation_ = 0;
+    selected_audio_generation_ = 0;
     return true;
 }
 
@@ -273,32 +293,61 @@ OutputPort<MediaPacketMessage>& TrackRouterNode::VideoOutput() {
     return video_output_;
 }
 
+OutputPort<MediaPacketMessage>& TrackRouterNode::AudioOutput() {
+    return audio_output_;
+}
+
 void TrackRouterNode::Process(MediaPacketMessage message) {
-    if (!accepting_.load() || !message.Valid() ||
-        message.packet->type != MediaType::VIDEO) {
+    if (!accepting_.load() || !message.Valid()) {
         return;
     }
 
-    // 自动选轨时，每个连接代次重新选择首个视频轨，避免重连后的 stream
-    // index 变化导致新连接被永久丢弃。
-    if (message.generation != selected_generation_) {
-        selected_generation_ = message.generation;
-        selected_stream_index_ = selection_.stream_index;
-    }
-
-    if (selection_.codec != CodecType::UNKNOWN &&
-        message.packet->codec != selection_.codec) {
+    if (message.eos) {
+        // EOS 不携带 packet，无法再根据媒体类型选择出口。向两个出口各发一
+        // 次，由下游各自根据是否存在真实输入决定如何结束自己的轨道。
+        video_output_.Send(message);
+        audio_output_.Send(std::move(message));
         return;
     }
 
-    if (selected_stream_index_ < 0) {
-        selected_stream_index_ = message.packet->stream_index;
-    }
-    if (message.packet->stream_index != selected_stream_index_) {
+    if (!message.packet ||
+        (message.packet->type != MediaType::VIDEO &&
+         message.packet->type != MediaType::AUDIO)) {
         return;
     }
 
-    video_output_.Send(std::move(message));
+    if (message.packet->type == MediaType::VIDEO) {
+        if (message.generation != selected_video_generation_) {
+            selected_video_generation_ = message.generation;
+            selected_video_stream_index_ = video_selection_.stream_index;
+        }
+        if (video_selection_.codec != CodecType::UNKNOWN &&
+            message.packet->codec != video_selection_.codec) {
+            return;
+        }
+        if (selected_video_stream_index_ < 0) {
+            selected_video_stream_index_ = message.packet->stream_index;
+        }
+        if (message.packet->stream_index == selected_video_stream_index_) {
+            video_output_.Send(std::move(message));
+        }
+        return;
+    }
+
+    if (message.generation != selected_audio_generation_) {
+        selected_audio_generation_ = message.generation;
+        selected_audio_stream_index_ = audio_selection_.stream_index;
+    }
+    if (audio_selection_.codec != CodecType::UNKNOWN &&
+        message.packet->codec != audio_selection_.codec) {
+        return;
+    }
+    if (selected_audio_stream_index_ < 0) {
+        selected_audio_stream_index_ = message.packet->stream_index;
+    }
+    if (message.packet->stream_index == selected_audio_stream_index_) {
+        audio_output_.Send(std::move(message));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -351,14 +400,14 @@ bool DecoderNode::Start() {
     accepting_ = true;
     active_generation_ = 0;
     callback_generation_ = 0;
+    flushed_ = false;
     return true;
 }
 
 void DecoderNode::Stop() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    // Graph 当前是 Immediate Stop，没有 pending-task barrier。停止阶段不在
-    // 这里 Flush，避免与 Executor 中尚未结束的 Decode 并发访问解码器；待 A3
-    // 的 Graceful Stop 屏障接入后，再由上层显式调用 Flush()。
+    // Stop 只关闭新的输入。GracefulStop 会先等待 Executor 和 Edge 排空，再
+    // 调用 Flush；这样 Flush 不会与尚未结束的 Decode 并发访问解码器。
     accepting_ = false;
 }
 
@@ -372,6 +421,7 @@ void DecoderNode::Deinit() {
     decoder_open_ = false;
     active_generation_ = 0;
     callback_generation_ = 0;
+    flushed_ = false;
 }
 
 std::string DecoderNode::Name() const {
@@ -389,7 +439,7 @@ OutputPort<MediaFrameMessage>& DecoderNode::Output() {
 bool DecoderNode::Flush() {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (!decoder_ || !decoder_open_) {
+        if (!decoder_ || !decoder_open_ || flushed_) {
             return true;
         }
     }
@@ -399,6 +449,10 @@ bool DecoderNode::Flush() {
     if (!decoder_->Flush()) {
         SetError("decoder flush failed");
         return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        flushed_ = true;
     }
     return true;
 }
@@ -415,8 +469,11 @@ void DecoderNode::Process(MediaPacketMessage message) {
         if (!accepting_) {
             return;
         }
-        if (!message.Valid() || !message.packet ||
-            message.packet->type != MediaType::VIDEO) {
+        if (!message.Valid() ||
+            (!message.eos && !message.packet) ||
+            (!message.eos && message.packet &&
+             message.packet->type != MediaType::VIDEO &&
+             message.packet->type != MediaType::AUDIO)) {
             invalid_message = true;
         }
         if (active_generation_ != 0 && message.generation < active_generation_) {
@@ -427,7 +484,20 @@ void DecoderNode::Process(MediaPacketMessage message) {
     }
 
     if (invalid_message) {
-        SetError("invalid video packet message");
+        SetError("invalid media packet message");
+        return;
+    }
+
+    if (message.eos) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            active_generation_ = message.generation;
+            callback_generation_ = message.generation;
+        }
+        if (!Flush()) {
+            return;
+        }
+        output_.Send(MediaFrameMessage{nullptr, message.generation, true});
         return;
     }
 
@@ -438,6 +508,7 @@ void DecoderNode::Process(MediaPacketMessage message) {
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         callback_generation_ = message.generation;
+        flushed_ = false;
     }
     if (!decoder_->Decode(std::move(message.packet))) {
         SetError("decoder decode failed");
@@ -495,7 +566,8 @@ bool DecoderNode::OpenForMessage(const MediaPacketMessage& message) {
 }
 
 bool DecoderNode::IsUsableStreamInfo(const MediaStreamInfo& info) const {
-    return info.media_type == MediaType::VIDEO &&
+    return (info.media_type == MediaType::VIDEO ||
+            info.media_type == MediaType::AUDIO) &&
            info.codec_type != CodecType::UNKNOWN &&
            IsValidTimeBase(info.time_base);
 }
@@ -517,6 +589,13 @@ bool DecoderNode::SameStream(const MediaStreamInfo& left,
         return left_video.width == right_video.width &&
                left_video.height == right_video.height &&
                left_video.pixel_format == right_video.pixel_format;
+    }
+    if (left.media_type == MediaType::AUDIO) {
+        const auto& left_audio = left.get_detail<AudioStreamInfo>();
+        const auto& right_audio = right.get_detail<AudioStreamInfo>();
+        return left_audio.sample_rate == right_audio.sample_rate &&
+               left_audio.channels == right_audio.channels &&
+               left_audio.channel_layout == right_audio.channel_layout;
     }
     return true;
 }
@@ -576,6 +655,7 @@ bool EncoderNode::Init() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     output_info_ = info;
     encoder_open_ = true;
+    flushed_ = false;
     return true;
 }
 
@@ -583,13 +663,14 @@ bool EncoderNode::Start() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     accepting_ = true;
     active_generation_ = 0;
+    flushed_ = false;
     return true;
 }
 
 void EncoderNode::Stop() {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    // 当前 Graph 仍是 Immediate Stop。Flush 必须在所有 Encode 任务完成后由
-    // 上层显式调用，避免 Stop 线程与节点 Executor 并发操作有状态 encoder。
+    // Stop 只关闭新的输入。GracefulStop 会在所有 Encode 任务完成后调用
+    // Flush，避免 Stop 线程与节点 Executor 并发操作有状态 encoder。
     accepting_ = false;
 }
 
@@ -602,6 +683,7 @@ void EncoderNode::Deinit() {
     encoder_open_ = false;
     active_generation_ = 0;
     output_info_ = {};
+    flushed_ = false;
 }
 
 std::string EncoderNode::Name() const {
@@ -620,7 +702,7 @@ bool EncoderNode::Flush() {
     std::uint64_t generation = 0;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (!encoder_ || !encoder_open_) {
+        if (!encoder_ || !encoder_open_ || flushed_) {
             return true;
         }
         generation = active_generation_;
@@ -634,7 +716,12 @@ bool EncoderNode::Flush() {
         SetError("encoder flush failed");
         return false;
     }
-    return EmitPackets(packets, generation);
+    const bool emitted = EmitPackets(packets, generation);
+    if (emitted) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        flushed_ = true;
+    }
+    return emitted;
 }
 
 EncodedTrackInfo EncoderNode::OutputInfo() const {
@@ -653,8 +740,9 @@ void EncoderNode::Process(MediaFrameMessage message) {
         if (!accepting_) {
             return;
         }
-        if (!message.Valid() || !message.frame ||
-            message.frame->type != config_.media_type) {
+        if (!message.Valid() || (!message.eos && !message.frame) ||
+            (!message.eos && message.frame &&
+             message.frame->type != config_.media_type)) {
             SetErrorLocked("invalid frame message for encoder");
             return;
         }
@@ -664,6 +752,24 @@ void EncoderNode::Process(MediaFrameMessage message) {
             // 进入已经为新代次打开的 encoder。
             return;
         }
+    }
+
+    if (message.eos) {
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            active_generation_ = message.generation;
+        }
+        if (!Flush()) {
+            return;
+        }
+        EncodedTrackInfo info;
+        {
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            info = output_info_;
+        }
+        output_.Send(EncodedPacketMessage{
+            nullptr, info, options_.track_id, message.generation, true});
+        return;
     }
 
     if (!OpenForGeneration(message.generation)) {
@@ -710,6 +816,7 @@ bool EncoderNode::OpenForGeneration(std::uint64_t generation) {
             return false;
         }
         encoder_open_ = true;
+        flushed_ = false;
     }
     active_generation_ = generation;
     return true;
@@ -781,6 +888,9 @@ bool PublisherSinkNode::Start() {
     active_generation_ = 0;
     publisher_started_ = false;
     awaiting_keyframe_ = options_.wait_for_keyframe_on_start;
+    pending_packets_.clear();
+    seen_track_ids_.clear();
+    eos_track_ids_.clear();
     return true;
 }
 
@@ -799,6 +909,9 @@ void PublisherSinkNode::Deinit() {
     }
     publisher_started_ = false;
     awaiting_keyframe_ = false;
+    pending_packets_.clear();
+    seen_track_ids_.clear();
+    eos_track_ids_.clear();
 }
 
 int PublisherSinkNode::StartPriority() const {
@@ -833,7 +946,15 @@ PublisherConfig PublisherSinkNode::Config() const {
 
 void PublisherSinkNode::Process(EncodedPacketMessage message) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    if (!accepting_ || !message.Valid() || !message.packet) {
+    if (!accepting_ || !message.Valid()) {
+        return;
+    }
+
+    if (message.eos) {
+        HandleEndOfStream(message);
+        return;
+    }
+    if (!message.packet) {
         return;
     }
 
@@ -848,13 +969,48 @@ void PublisherSinkNode::Process(EncodedPacketMessage message) {
         }
         publisher_started_ = false;
         awaiting_keyframe_ = true;
+        pending_packets_.clear();
+        eos_track_ids_.clear();
     }
     active_generation_ = message.generation;
 
+    // 多轨配置必须先收齐每条轨道的真实编码描述，才能一次性建立包含
+    // 音频和视频的 FFmpeg 输出上下文。等待期间使用有界队列，防止某条轨道
+    // 永远不出包时无限占用内存。
+    if (!publisher_started_) {
+        if (!PrepareTrack(message)) {
+            last_result_ = PublisherResult::Failure(
+                PublisherErrorCode::InvalidConfiguration, last_error_);
+            return;
+        }
+        if (options_.wait_for_all_tracks && config_.tracks.size() > 1 &&
+            !AllConfiguredTracksSeen()) {
+            if (pending_packets_.size() >= options_.max_pending_packets) {
+                last_result_ = PublisherResult::Failure(
+                    PublisherErrorCode::InvalidState,
+                    "publisher multi-track startup queue is full");
+                return;
+            }
+            pending_packets_.push_back(std::move(message));
+            return;
+        }
+    }
+
     const bool is_keyframe = IsVideoKeyframe(message);
     const bool is_video = message.track_info.media_type == MediaType::VIDEO;
-    if ((!publisher_started_ || awaiting_keyframe_) &&
-        options_.wait_for_keyframe_on_start && is_video && !is_keyframe) {
+    if (options_.wait_for_keyframe_on_start && awaiting_keyframe_ &&
+        HasConfiguredVideoTrack() && (!is_video || !is_keyframe) &&
+        (publisher_started_ || is_video || !AllConfiguredTracksSeen())) {
+        if (!publisher_started_) {
+            if (pending_packets_.size() >= options_.max_pending_packets) {
+                last_result_ = PublisherResult::Failure(
+                    PublisherErrorCode::InvalidState,
+                    "publisher keyframe queue is full");
+                return;
+            }
+            pending_packets_.push_back(std::move(message));
+            return;
+        }
         last_result_ = PublisherResult::Failure(
             PublisherErrorCode::AwaitingKeyframe,
             "publisher is waiting for the next video keyframe");
@@ -865,25 +1021,93 @@ void PublisherSinkNode::Process(EncodedPacketMessage message) {
         return;
     }
 
+    if (!pending_packets_.empty()) {
+        auto pending = std::move(pending_packets_);
+        pending_packets_.clear();
+        for (const auto& queued : pending) {
+            PublishPacket(queued);
+        }
+    }
+
+    PublishPacket(message);
+    return;
+}
+
+bool PublisherSinkNode::AllConfiguredTracksSeen() const {
+    if (config_.tracks.empty()) {
+        return true;
+    }
+    for (const auto& track : config_.tracks) {
+        if (!seen_track_ids_.contains(track.track_id)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PublisherSinkNode::HasConfiguredVideoTrack() const {
+    return std::any_of(
+        config_.tracks.begin(), config_.tracks.end(),
+        [](const MediaTrackConfig& track) {
+            return track.media_type == MediaType::VIDEO;
+        });
+}
+
+bool PublisherSinkNode::PublishPacket(const EncodedPacketMessage& message) {
+    if (!publisher_started_ || !message.packet || !message.Valid()) {
+        return false;
+    }
+
+    const bool is_video = message.track_info.media_type == MediaType::VIDEO;
+    const bool is_keyframe = IsVideoKeyframe(message);
+    if (options_.wait_for_keyframe_on_start && awaiting_keyframe_ &&
+        HasConfiguredVideoTrack() && (!is_video || !is_keyframe)) {
+        last_result_ = PublisherResult::Failure(
+            PublisherErrorCode::AwaitingKeyframe,
+            "publisher is waiting for the next video keyframe");
+        return true;
+    }
+
     last_result_ = publisher_->Publish(*message.packet);
     if (last_result_.IsSuccess()) {
         publisher_started_ = true;
-        awaiting_keyframe_ = false;
-        return;
+        if (is_video && is_keyframe) {
+            awaiting_keyframe_ = false;
+        } else if (!HasConfiguredVideoTrack()) {
+            awaiting_keyframe_ = false;
+        }
+        return true;
     }
 
     if (last_result_.code == PublisherErrorCode::AwaitingKeyframe) {
-        // 这是“协议已经重连但正在等关键帧”，不是 Publisher 已关闭；保留
-        // started 状态，让下一关键帧继续进入同一个 publisher 会话。
         publisher_started_ = true;
         awaiting_keyframe_ = true;
-        return;
+        return true;
     }
 
     publisher_started_ = false;
-    awaiting_keyframe_ = is_keyframe ||
-                         last_result_.code == PublisherErrorCode::RuntimeDisconnected;
+    awaiting_keyframe_ = true;
     last_error_ = last_result_.message;
+    return false;
+}
+
+void PublisherSinkNode::HandleEndOfStream(
+    const EncodedPacketMessage& message) {
+    eos_track_ids_.insert(message.track_id);
+
+    // 显式配置多轨时，只有所有轨道都收到 EOS 才能关闭 muxer；否则音频或
+    // 视频其中一条先结束会截断另一条轨道的尾部数据。
+    const bool all_tracks_finished = !config_.tracks.empty()
+        ? std::all_of(config_.tracks.begin(), config_.tracks.end(),
+                      [this](const MediaTrackConfig& track) {
+                          return eos_track_ids_.contains(track.track_id);
+                      })
+        : true;
+    if (all_tracks_finished && publisher_started_ && publisher_) {
+        publisher_->Stop();
+        publisher_started_ = false;
+        awaiting_keyframe_ = false;
+    }
 }
 
 bool PublisherSinkNode::PrepareTrack(const EncodedPacketMessage& message) {
@@ -953,6 +1177,7 @@ bool PublisherSinkNode::PrepareTrack(const EncodedPacketMessage& message) {
     if (!info.extra_data.empty()) {
         track->extra_data = info.extra_data;
     }
+    seen_track_ids_.insert(message.track_id);
     return true;
 }
 

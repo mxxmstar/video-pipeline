@@ -183,9 +183,13 @@ public:
         return "frame-sink";
     }
 
-protected:
+    protected:
     void Process(MediaFrameMessage message) override {
         assert(message.Valid());
+        if (message.eos) {
+            // EOS 是控制消息，不应计入解码帧 generation 断言。
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             generations_.push_back(message.generation);
@@ -320,6 +324,7 @@ public:
         std::lock_guard<std::mutex> lock(state_->mutex);
         ++state_->stop_count;
         started_ = false;
+        state_->condition.notify_all();
     }
 
     std::string GetPlayUrl() const override {
@@ -363,6 +368,36 @@ public:
     }
 };
 
+class EncodedPacketSource final : public SourceNode<EncodedPacketMessage> {
+public:
+    EncodedPacketSource(int track_id, EncodedTrackInfo info)
+        : track_id_(track_id), info_(std::move(info)) {}
+
+    std::string Name() const override {
+        return "encoded-source";
+    }
+
+    bool Start() override {
+        auto packet = MakePacket(
+            info_.media_type,
+            track_id_,
+            0,
+            info_.codec_type);
+        packet->time_base = info_.time_base;
+        packet->keyframe = info_.media_type == MediaType::VIDEO;
+        Emit(EncodedPacketMessage{
+            packet, info_, track_id_, 1, false});
+        // EOS 单独携带轨道描述，PublisherSink 才能判断多轨是否全部结束。
+        Emit(EncodedPacketMessage{
+            nullptr, info_, track_id_, 1, true});
+        return true;
+    }
+
+private:
+    int track_id_;
+    EncodedTrackInfo info_;
+};
+
 bool WaitForPublished(const std::shared_ptr<PublisherState>& state,
                       std::size_t count) {
     std::unique_lock<std::mutex> lock(state->mutex);
@@ -379,6 +414,14 @@ bool WaitForPublishAttempts(const std::shared_ptr<PublisherState>& state,
                                      [state, count]() {
         return state->publish_attempts >= count;
     });
+}
+
+bool WaitForPublisherStop(const std::shared_ptr<PublisherState>& state) {
+    std::unique_lock<std::mutex> lock(state->mutex);
+    return state->condition.wait_for(lock, std::chrono::seconds(2),
+                                     [state]() {
+                                         return state->stop_count >= 1;
+                                     });
 }
 
 void TestSingleVideoChainAndReconnectGeneration() {
@@ -554,11 +597,70 @@ void TestPublisherAwaitingKeyframeState() {
     graph.Stop();
 }
 
+void TestMultiTrackPublisherAndGracefulEos() {
+    auto publisher_state = std::make_shared<PublisherState>();
+    auto executor = std::make_shared<AsioExecutor>("publisher-multi-track-test", 2);
+
+    EncodedTrackInfo video_info;
+    video_info.media_type = MediaType::VIDEO;
+    video_info.codec_type = CodecType::H264;
+    video_info.time_base = Rational{1, 1000};
+    video_info.width = 640;
+    video_info.height = 360;
+    video_info.fps = 25.0F;
+    video_info.extra_data = {0x01, 0x64, 0x00, 0x1f};
+
+    EncodedTrackInfo audio_info;
+    audio_info.media_type = MediaType::AUDIO;
+    audio_info.codec_type = CodecType::AAC;
+    audio_info.time_base = Rational{1, 48000};
+    audio_info.sample_rate = 48000;
+    audio_info.channels = 2;
+
+    PublisherConfig publisher_config;
+    publisher_config.url = "recording://multi-track-publisher";
+    publisher_config.protocol = PublishProtocol::FfmpegMux;
+    publisher_config.tracks = {
+        MediaTrackConfig{1, MediaType::VIDEO, CodecType::H264,
+                         640, 360, 25.0F, 0, 0, 1, 1000,
+                         video_info.extra_data},
+        MediaTrackConfig{2, MediaType::AUDIO, CodecType::AAC,
+                         0, 0, 0.0F, 48000, 2, 1, 48000, {}}
+    };
+
+    Graph graph;
+    assert(graph.AddNode<EncodedPacketSource>(
+        "video-source", executor, NodeOptions{}, 1, video_info));
+    assert(graph.AddNode<EncodedPacketSource>(
+        "audio-source", executor, NodeOptions{}, 2, audio_info));
+    assert(graph.AddNode<PublisherSinkNode>(
+        "publisher", executor, NodeOptions{}, publisher_config,
+        std::make_unique<RecordingPublisher>(publisher_state),
+        PublisherSinkNodeOptions{true, true, 16}));
+    assert(graph.Connect<EncodedPacketMessage>("video-source", "publisher"));
+    assert(graph.Connect<EncodedPacketMessage>("audio-source", "publisher"));
+    assert(graph.Start());
+
+    assert(WaitForPublished(publisher_state, 2));
+    assert(WaitForPublisherStop(publisher_state));
+
+    auto publisher = graph.GetNode<PublisherSinkNode>("publisher");
+    assert(publisher);
+    const auto configured = publisher->Config();
+    assert(configured.tracks.size() == 2);
+    assert(configured.tracks[0].track_id == 1);
+    assert(configured.tracks[1].track_id == 2);
+
+    assert(graph.GracefulStop(std::chrono::seconds(2)));
+    assert(graph.GetState() == Graph::State::Stopped);
+}
+
 } // namespace
 
 int main() {
     TestSingleVideoChainAndReconnectGeneration();
     TestEncoderAndPublisherChain();
     TestPublisherAwaitingKeyframeState();
+    TestMultiTrackPublisherAndGracefulEos();
     return 0;
 }

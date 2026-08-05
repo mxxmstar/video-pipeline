@@ -925,3 +925,107 @@ A2 的本地 `Source -> Decode -> Encode -> Publish` 单视频节点链路已具
 消息代次、轨道元数据、编码多包转发、显式 Flush 和关键帧等待语义。下一阶段进入
 A3：音视频多轨汇合、FFmpeg mux interleaved write，以及 Graph 的有序停止和逐级
 Flush 屏障。
+
+## 20. A3 实施记录：多轨汇合与有序停止
+
+### 20.1 阶段目标
+
+A3 将 A2 的单视频链路扩展为可承载音频和视频的完整 MediaFlow 终端链路，重点
+解决三个会直接影响文件完整性和长时播放稳定性的边界问题：
+
+1. 音频、视频必须带着独立的轨道描述进入同一个 Publisher，不能依靠消息到达顺序
+   猜测轨道，也不能因某一条轨道先结束而提前关闭输出。
+2. Source 正常结束后，Decoder 和 Encoder 内部仍可能有尚未输出的数据，必须按照
+   上游到下游的顺序排空并 Flush，才能保留尾帧、尾包和正确的 EOS。
+3. 多个节点和 Edge 共享 Executor 时，停止线程必须确认业务任务和 Edge Drain 都已
+   结束，才能调用有状态媒体对象的 Flush/Close。
+
+### 20.2 架构与消息设计
+
+当前推荐的多轨组图如下：
+
+```text
+StreamSourceNode<MediaPacketMessage>
+        -> TrackRouterNode
+             |-> video -> DecoderNode -> EncoderNode(track_id=video) -+
+             |                                                         +-> PublisherSinkNode
+             `-> audio -> DecoderNode -> EncoderNode(track_id=audio) -+
+```
+
+| 设计项 | A3 实施内容 | 解决的问题 |
+|---|---|---|
+| EOS 消息 | `MediaPacketMessage`、`MediaFrameMessage`、`EncodedPacketMessage` 增加 `eos` 标志；控制消息只携带 generation 和轨道描述，不携带空媒体包 | EOS 不再被误当成坏包，且能沿每一级节点继续传播 |
+| 轨道路由 | `TrackRouterNode` 增加独立 `video`、`audio` 输出端口；两类轨道分别按 stream index、codec 和 generation 选择 | 音频不再进入视频 Decoder，多视频/多音频轨道不会因类型相同而混用 |
+| 轨道汇合 | `PublisherSinkNode` 维护 `track_id -> MediaTrackConfig` 的描述和已见轨道集合；配置多轨时收齐轨道描述后才启动 Publisher | FFmpeg 输出上下文一次性创建完整，避免缺少音频或视频流 |
+| 有界等待 | 多轨描述等待和首次关键帧等待均使用 `max_pending_packets` 有界队列 | 某一轨道长时间不出包时不会无限增长内存 |
+| EOS 汇合 | Publisher 按 `track_id` 记录 EOS，显式配置的所有轨道都结束后才 Stop Publisher | 单轨提前结束不会截断另一条轨道的尾部数据 |
+| 写入顺序 | `FfmpegMuxProtocol` 改用 `av_interleaved_write_frame()` | 由 muxer 按各轨道 DTS 交织写入，降低跨轨非单调 DTS 风险 |
+
+`EncodedPacketMessage` 始终携带 Encoder 实际生成的 `time_base`、codec、尺寸、
+帧率、采样率、声道数和 extradata。`track_id` 只负责 MediaFlow 内部轨道身份，
+不会用手工覆盖 packet 的时间基来掩盖 Encoder 适配问题。
+
+### 20.3 GracefulStop 停止流程
+
+`Graph::GracefulStop(timeout)` 采用明确的四段式屏障：
+
+1. 调用所有节点的 `StopProduction()`。Source 立即停止读取并关闭 Puller，普通
+   Decoder/Encoder/Publisher 暂不拒绝已进入 Graph 的消息。
+2. 等待所有 NodeContext 的 pending task 和所有 Edge 的排队消息、Drain 调度任务
+   同时归零。Edge 新增 `IsIdle()`，只检查队列为空是不够的，必须连同正在执行的
+   Drain 一起纳入屏障。
+3. 按节点注册顺序逐级调用 `Flush()`，每一级 Flush 后再次等待全图静默。这样
+   Decoder 的尾帧先进入 Encoder，Encoder 的尾包再进入 Publisher。
+4. 执行既有的逆启动优先级 Stop、关闭 Edge、停止 Executor，并按逆注册顺序
+   Deinit。超时或任一 Flush 失败时仍完成资源回收，但返回 `false`，明确告知调用
+   方尾部数据可能不完整。
+
+Immediate `Graph::Stop()` 仍保留原有快速语义，不执行等待和 Flush，适用于致命错误
+或不需要保留尾部数据的场景。媒体节点的 Flush 具有幂等保护，EOS 传播和 Graph
+级 Flush 不会重复输出同一批尾数据。
+
+### 20.4 实际修改
+
+| 领域 | 实际修改 | 主要文件 |
+|---|---|---|
+| Graph 屏障 | 增加 Node pending task 计数、Edge idle 判断、`StopProduction()`、`Flush()` 和 `GracefulStop()`；保持 Source 最后启动、按逆优先级停止 | `include/mediaflow/core/graph.h`、`include/mediaflow/core/node.h` |
+| Source EOS | FFmpeg/Puller 返回 EOS 时发送带 generation 的控制消息，不触发错误重连 | `src/mediaflow/media_nodes.cpp` |
+| Decoder | 支持音频/视频轨道；收到 EOS 后自动 Flush 并发送帧级 EOS；增加重复 Flush 保护 | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| Encoder | 收到帧级 EOS 后自动 Flush 并发送编码轨道 EOS；尾包保留 Encoder 的时间和元数据 | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| Publisher | 支持多轨描述合并、有限等待队列、按轨 EOS 汇合和所有轨道结束后的关闭 | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp` |
+| FFmpeg mux | 将单包写入改为交织写入 API | `include/media/protocol/ffmpeg_mux_protocol.h`、`src/media/protocol/ffmpeg_mux_protocol.cpp` |
+| 本地回归 | 新增双轨编码包源和 EOS 停止测试，覆盖轨道收齐、关键帧启动、两轨发布和 Graph graceful 停止 | `test/mediaflow/test_mediaflow_media_nodes.cpp` |
+
+### 20.5 验证结果
+
+使用 `C:\Program Files\Microsoft Visual Studio\18\Community` 的 VS x64 环境
+完成本地构建和回归，已通过：
+
+- `test_mediaflow`
+- `test_mediaflow_media_nodes`
+- `test_publisher_protocol`
+- `test_ffmpeg_audio_encoder`
+- `test_ffmpeg_decoder_raw_packet`
+
+其中 `test_mediaflow_media_nodes` 额外验证：音频/视频轨道配置完整后才启动
+Publisher、EOS 按轨道汇合、Publisher 在两轨结束后关闭，以及
+`Graph::GracefulStop()` 返回成功并进入 `Stopped` 状态。
+
+完整测试树曾在 `test_stream_decode` 链接阶段报告
+`LNK1136: invalid or corrupt file`。定位后确认是 `build-mediaflow-vs` 生成目录中
+单个旧对象损坏；删除该对象并重新编译后，`test_stream_decode` 目标已成功编译和
+链接。该目标及其他依赖外部流、摄像头、AVTP 网卡或 ZLMediaKit 的测试仍未执行
+真实运行验证。
+
+### 20.6 尚未完成项与下一阶段入口
+
+| 项目 | 当前状态 | 下一步 |
+|---|---|---|
+| 真实多轨发布 | 本地 RecordingPublisher 已验证消息和生命周期；真实 RTSP/RTMP 服务的多轨兼容性未验证 | 运行服务端集成测试 |
+| 长时断线恢复 | `AwaitingKeyframe` 状态和本地关键帧恢复已验证；真实远端断开、重连、关键帧恢复未做长时测试 | 使用受控网络故障做有限时长互操作测试 |
+| 现有端到端测试迁移 | `test_stream_decode`、摄像头、AVTP 和 ZLMediaKit 测试仍有旧手工编排 | 后续阶段逐个改为 Source/Router/Decoder/Encoder/Publisher 图 |
+| 动态拓扑与跨轨同步 | 当前 Graph 拓扑启动后冻结，Publisher 依赖 FFmpeg 交织写入，尚未增加动态增删轨和 A/V 同步策略 | 进入集成阶段前先补时间戳、轨道选择和指标验收 |
+
+A3 的本地链路已完成“正常 EOS 可收尾”的第一版闭环，但真实网络和设备环境仍是
+下一阶段的验收边界。后续迁移应选择一条真实 RTSP/RTMP 流验证多轨交织、断线恢复
+和长时内存稳定性。

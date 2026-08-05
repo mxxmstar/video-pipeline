@@ -17,11 +17,15 @@
 #include "media/publisher/i_publisher.h"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <vector>
 
 namespace mediaflow {
 
@@ -30,9 +34,10 @@ struct MediaPacketMessage {
     std::shared_ptr<MediaPacket> packet;                   ///< 压缩媒体包。
     std::shared_ptr<const MediaStreamInfo> stream_info;    ///< 当前包所属轨道描述。
     std::uint64_t generation{0};                           ///< 拉流连接代次。
+    bool eos{false};                                        ///< 当前代次是否已经正常结束。
 
     bool Valid() const {
-        return packet != nullptr && generation != 0;
+        return generation != 0 && (eos || packet != nullptr);
     }
 };
 
@@ -40,9 +45,10 @@ struct MediaPacketMessage {
 struct MediaFrameMessage {
     std::shared_ptr<MediaFrame> frame; ///< 解码后的媒体帧。
     std::uint64_t generation{0};       ///< 产生该帧的拉流连接代次。
+    bool eos{false};                    ///< 上游解码器已经完成该代次的 Flush。
 
     bool Valid() const {
-        return frame != nullptr && generation != 0;
+        return generation != 0 && (eos || frame != nullptr);
     }
 };
 
@@ -52,9 +58,10 @@ struct EncodedPacketMessage {
     EncodedTrackInfo track_info;         ///< Encoder 实际输出轨道描述。
     int track_id{0};                     ///< MediaFlow 内部输出轨道 ID。
     std::uint64_t generation{0};         ///< 产生该包的输入连接代次。
+    bool eos{false};                      ///< 该轨道已经完成编码器 Flush。
 
     bool Valid() const {
-        return packet != nullptr && generation != 0 &&
+        return generation != 0 && (eos || packet != nullptr) &&
                track_info.media_type != MediaType::UNKNOWN &&
                track_info.codec_type != CodecType::UNKNOWN;
     }
@@ -80,6 +87,8 @@ struct EncoderNodeOptions {
 /// PublisherSink 的启动和断线恢复策略。
 struct PublisherSinkNodeOptions {
     bool wait_for_keyframe_on_start{true}; ///< 首次启动前丢弃非关键视频包。
+    bool wait_for_all_tracks{true};        ///< 配置多轨时等待所有轨道描述齐全再 Start。
+    std::size_t max_pending_packets{256};  ///< 多轨等待期间允许缓存的最大包数。
 };
 
 /**
@@ -106,6 +115,7 @@ public:
 
     bool Init() override;
     bool Start() override;
+    void StopProduction() override;
     void Stop() override;
     void Deinit() override;
     std::string Name() const override;
@@ -149,7 +159,8 @@ private:
  */
 class TrackRouterNode final : public INode {
 public:
-    explicit TrackRouterNode(TrackSelection selection = {});
+    explicit TrackRouterNode(TrackSelection video_selection = {},
+                             TrackSelection audio_selection = {});
 
     bool RegisterPorts(PortRegistry& registry) override;
     bool Start() override;
@@ -161,15 +172,20 @@ public:
 
     /// 视频输出端口，连接到 DecoderNode。
     OutputPort<MediaPacketMessage>& VideoOutput();
+    OutputPort<MediaPacketMessage>& AudioOutput();
 
 private:
     void Process(MediaPacketMessage message);
 
     InputPort<MediaPacketMessage> input_;
     OutputPort<MediaPacketMessage> video_output_;
-    TrackSelection selection_;
-    int selected_stream_index_{-1};
-    std::uint64_t selected_generation_{0};
+    OutputPort<MediaPacketMessage> audio_output_;
+    TrackSelection video_selection_;
+    TrackSelection audio_selection_;
+    int selected_video_stream_index_{-1};
+    int selected_audio_stream_index_{-1};
+    std::uint64_t selected_video_generation_{0};
+    std::uint64_t selected_audio_generation_{0};
     std::atomic<bool> accepting_{false};
 };
 
@@ -203,8 +219,8 @@ public:
     /// 输出解码帧。
     OutputPort<MediaFrameMessage>& Output();
 
-    /// Graph 具备 graceful barrier 后由上层显式调用，输出 decoder 残留帧。
-    bool Flush();
+    /// Graph::GracefulStop 在任务排空后调用，输出 decoder 内部残留帧。
+    bool Flush() override;
 
     /// 最近一次解码失败的简要原因，便于节点级监控。
     std::string LastError() const;
@@ -231,6 +247,7 @@ private:
     std::uint64_t callback_generation_{0};
     bool decoder_open_{false};
     bool accepting_{false};
+    bool flushed_{false};
 };
 
 /**
@@ -262,7 +279,7 @@ public:
     OutputPort<EncodedPacketMessage>& Output();
 
     /// 在 Graph graceful barrier 内显式输出编码器残留包。
-    bool Flush();
+    bool Flush() override;
 
     EncodedTrackInfo OutputInfo() const;
     std::string LastError() const;
@@ -287,6 +304,7 @@ private:
     std::uint64_t active_generation_{0};
     bool encoder_open_{false};
     bool accepting_{false};
+    bool flushed_{false};
 };
 
 /**
@@ -327,6 +345,10 @@ protected:
 private:
     bool PrepareTrack(const EncodedPacketMessage& message);
     bool StartPublisher(const EncodedPacketMessage& message);
+    bool AllConfiguredTracksSeen() const;
+    bool HasConfiguredVideoTrack() const;
+    bool PublishPacket(const EncodedPacketMessage& message);
+    void HandleEndOfStream(const EncodedPacketMessage& message);
     bool IsVideoKeyframe(const EncodedPacketMessage& message) const;
     void SetError(std::string message);
 
@@ -341,6 +363,9 @@ private:
     bool accepting_{false};
     bool publisher_started_{false};
     bool awaiting_keyframe_{false};
+    std::deque<EncodedPacketMessage> pending_packets_;
+    std::unordered_set<int> seen_track_ids_;
+    std::unordered_set<int> eos_track_ids_;
 };
 
 } // namespace mediaflow

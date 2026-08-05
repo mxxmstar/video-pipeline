@@ -47,7 +47,7 @@ private:
     // 构造 AVPacket 后，按需经过 bitstream filter，再交给 WriteAvPacket 写出。
     PublisherResult WriteEncodedPacket(const EncodedAccessUnit& access_unit);
 
-    // 对已经准备好的 AVPacket 执行一次同步 av_write_frame，并更新统计信息。
+    // 对已经准备好的 AVPacket 执行一次同步 interleaved write，并更新统计信息。
     PublisherResult WriteAvPacket(AVPacket* packet);
 
     // 释放当前 FFmpeg 输出会话并按配置重新创建 context、stream、filter 和 header。

@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <typeindex>
 #include <type_traits>
 #include <unordered_map>
@@ -196,6 +197,11 @@ public:
         }
     }
 
+    /// 返回当前节点尚未完成的业务任务数量，供 GracefulStop 建立停止屏障。
+    std::size_t PendingTasks() const {
+        return pending_tasks_.load();
+    }
+
     const std::string id;                         ///< Graph 内唯一节点 ID。
     const std::shared_ptr<INode> node;             ///< 业务节点对象。
     const std::shared_ptr<IExecutor> executor;     ///< 节点任务使用的执行器。
@@ -278,6 +284,8 @@ public:
     virtual void Open() = 0;       ///< 打开并清空底层 Transport。
     virtual void Close() = 0;      ///< 关闭 Transport，拒绝新的发送。
     virtual bool Empty() const = 0;
+    /// Edge 既没有排队消息，也没有正在执行的 Drain 任务时才算真正空闲。
+    virtual bool IsIdle() const = 0;
     virtual void Schedule() = 0;   ///< 请求向目标 Executor 投递 Drain。
     virtual void Drain() = 0;      ///< 批量取出 Transport 消息并提交给节点。
 };
@@ -397,6 +405,10 @@ public:
 
     bool Empty() const override {
         return transport_->Empty();
+    }
+
+    bool IsIdle() const override {
+        return transport_->Empty() && !scheduled_.load();
     }
 
 private:
@@ -698,19 +710,62 @@ public:
     }
 
     /**
-     * 停止整张 Graph。
+     * 立即停止整张 Graph。
      *
-     * 当前实现是立即停止语义：关闭边后清除尚未执行的 Dispatch 任务。
-     * 后续可在此基础上增加等待队列排空和编码器 flush 的 Graceful 模式。
+     * 该接口会跳过排空和 Flush，关闭边后清除尚未执行的 Dispatch 任务，
+     * 适合发生致命错误或调用方不需要保留尾部媒体数据的场景。需要完整
+     * 传播 EOS、输出 Decoder/Encoder 尾数据时应使用 GracefulStop。
      */
     void Stop() {
+        (void)StopImpl(false, std::chrono::milliseconds(0));
+    }
+
+    /**
+     * 以有序方式停止 Graph。
+     *
+     * 该流程先停止 Source 继续生产，再等待所有 Edge 和节点任务排空；随后
+     * 按节点注册顺序逐级 Flush，确保 Decoder 的残留帧先进入 Encoder，Encoder
+     * 的残留 packet 再进入 Publisher。超时后仍会走资源回收，但会返回 false，
+     * 调用方可以把它作为尾部数据不完整的明确告警。
+     */
+    bool GracefulStop(
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+        return StopImpl(true, timeout);
+    }
+
+private:
+    bool StopImpl(bool graceful, std::chrono::milliseconds timeout) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ == State::Created || state_ == State::Stopped ||
                 state_ == State::Stopping) {
-                return;
+                return true;
             }
             state_ = State::Stopping;
+        }
+
+        bool graceful_completed = true;
+        if (graceful) {
+            // 只停止生产者，不能在这里让 Decoder/Encoder 拒绝已经入队的消息。
+            for (const auto& id : node_order_) {
+                nodes_.at(id)->node->StopProduction();
+            }
+
+            graceful_completed = WaitForQuiescence(timeout);
+            if (graceful_completed) {
+                // 节点注册顺序就是媒体链路的构建顺序；媒体节点按此顺序逐级
+                // 刷新，保证上游刚产生的尾部消息仍有机会进入下游屏障。
+                for (const auto& id : node_order_) {
+                    if (!nodes_.at(id)->node->Flush()) {
+                        graceful_completed = false;
+                        break;
+                    }
+                    if (!WaitForQuiescence(timeout)) {
+                        graceful_completed = false;
+                        break;
+                    }
+                }
+            }
         }
 
         // 停止顺序与启动顺序相反：Source 先停止生产，随后才让路由和解码
@@ -750,8 +805,10 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
         state_ = State::Stopped;
+        return graceful_completed;
     }
 
+public:
     /// 获取节点对象，主要用于监控、测试和上层控制接口。
     template <typename NodeType>
     std::shared_ptr<NodeType> GetNode(const std::string& id) const {
@@ -799,6 +856,37 @@ public:
     }
 
 private:
+    /// 等待节点任务和 Edge Drain 同时归零，避免 Flush 与 Decode/Encode 并发。
+    bool WaitForQuiescence(std::chrono::milliseconds timeout) const {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            bool idle = true;
+            for (const auto& id : node_order_) {
+                if (nodes_.at(id)->PendingTasks() != 0) {
+                    idle = false;
+                    break;
+                }
+            }
+            if (idle) {
+                for (const auto& edge : edges_) {
+                    if (!edge->IsIdle()) {
+                        idle = false;
+                        break;
+                    }
+                }
+            }
+            if (idle) {
+                return true;
+            }
+            if (timeout.count() == 0 ||
+                std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    /// 立即停止时仍复用同一套清理逻辑，区别只在于是否执行屏障和 Flush。
     void SetError(FlowErrorCode code, std::string message) {
         std::lock_guard<std::mutex> lock(mutex_);
         SetErrorLocked(code, std::move(message));
