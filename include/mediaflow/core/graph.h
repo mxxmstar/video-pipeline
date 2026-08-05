@@ -1,0 +1,653 @@
+#pragma once
+
+#include "mediaflow/core/executor.h"
+#include "mediaflow/core/node.h"
+#include "mediaflow/core/types.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <typeindex>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+/**
+ * @file graph.h
+ * @brief MediaFlow 的节点上下文、边调度和 Graph 生命周期实现。
+ *
+ * 数据流经过 Edge 的 Transport 进入目标 NodeContext。Queue Edge 只向目标
+ * Executor 投递一个 Drain 任务，Drain 再把有限批次的消息放入节点自己的
+ * Dispatch 队列。这样可以同时控制边队列和节点任务队列，避免慢节点造成
+ * 无界内存增长。
+ */
+namespace mediaflow {
+
+/// 节点运行期间累积的原子计数器。
+struct NodeMetrics {
+    std::atomic<std::uint64_t> enqueued{0};  ///< 进入节点输入边的消息数。
+    std::atomic<std::uint64_t> processed{0}; ///< 成功完成的节点任务数。
+    std::atomic<std::uint64_t> dropped{0};   ///< 因背压丢弃的消息数。
+    std::atomic<std::uint64_t> rejected{0};  ///< 关闭或任务队列满导致的拒绝数。
+    std::atomic<std::uint64_t> errors{0};    ///< 业务 Handler 抛出异常的次数。
+    std::atomic<std::size_t> pending_tasks{0};
+    std::atomic<std::size_t> max_pending_tasks{0};
+
+    /// 在不暴露原子变量的情况下生成一致的监控快照。
+    NodeMetricsSnapshot Snapshot() const {
+        return NodeMetricsSnapshot{
+            enqueued.load(),
+            processed.load(),
+            dropped.load(),
+            rejected.load(),
+            errors.load(),
+            pending_tasks.load(),
+            max_pending_tasks.load(),
+        };
+    }
+};
+
+/**
+ * @brief 节点的运行上下文。
+ *
+ * NodeContext 持有节点、执行器、端口表和任务队列。Serialized 模式下，
+ * dispatch_active_ 保证同一时刻只有一个泵任务在 Executor 中，多个上游
+ * Edge 的消息会按进入顺序依次执行。Concurrent 模式跳过内部串行队列，
+ * 但仍通过 max_pending_tasks 限制任务总量。
+ */
+class NodeContext final : public std::enable_shared_from_this<NodeContext> {
+public:
+    using Task = std::function<void()>;
+
+    NodeContext(std::string node_id,
+                std::shared_ptr<INode> node,
+                std::shared_ptr<IExecutor> executor,
+                NodeOptions options)
+        : id(std::move(node_id)),
+          node(std::move(node)),
+          executor(std::move(executor)),
+          options(options),
+          metrics(std::make_shared<NodeMetrics>()) {}
+
+    /**
+     * 将业务任务加入节点执行队列。
+     *
+     * 返回 false 表示节点已关闭、任务队列达到上限或 Executor 不再接收
+     * 任务。调用者不应在 false 后继续假设消息会被处理。
+     */
+    bool Dispatch(Task task) {
+        if (!task) {
+            return false;
+        }
+
+        if (options.execution_mode == NodeExecutionMode::Concurrent) {
+            {
+                std::lock_guard<std::mutex> lock(dispatch_mutex_);
+                // Concurrent 模式没有 deque，pending_tasks_ 同时承担有界计数职责。
+                if (dispatch_closed_ || pending_tasks_.load() >= options.max_pending_tasks) {
+                    metrics->rejected.fetch_add(1);
+                    return false;
+                }
+                pending_tasks_.fetch_add(1);
+                UpdateHighWatermark();
+            }
+
+            auto self = shared_from_this();
+            if (!executor || !executor->Post([self, task = std::move(task)]() mutable {
+                    self->RunTask(std::move(task));
+                })) {
+                pending_tasks_.fetch_sub(1);
+                metrics->rejected.fetch_add(1);
+                return false;
+            }
+            return true;
+        }
+
+        bool should_schedule = false;
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex_);
+            if (dispatch_closed_ || pending_tasks_.load() >= options.max_pending_tasks) {
+                metrics->rejected.fetch_add(1);
+                return false;
+            }
+
+            dispatch_queue_.push_back(std::move(task));
+            pending_tasks_.fetch_add(1);
+            UpdateHighWatermark();
+            if (!dispatch_active_) {
+                dispatch_active_ = true;
+                should_schedule = true;
+            }
+        }
+
+        // 只有从“无泵任务”切换到“有泵任务”时才需要 Post，避免每条消息
+        // 都向 Executor 投递一个 Drain 任务。
+        if (should_schedule && !ScheduleSerialized()) {
+            CloseDispatch();
+            return false;
+        }
+        return true;
+    }
+
+    /// 打开节点任务入口，并清理上一个 Graph 生命周期的排队任务。
+    void OpenDispatch() {
+        std::lock_guard<std::mutex> lock(dispatch_mutex_);
+        dispatch_queue_.clear();
+        pending_tasks_.store(0);
+        dispatch_active_ = false;
+        dispatch_closed_ = false;
+    }
+
+    /// 关闭节点任务入口，清理尚未开始的串行任务。
+    void CloseDispatch() {
+        std::size_t discarded = 0;
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex_);
+            dispatch_closed_ = true;
+            discarded = dispatch_queue_.size();
+            dispatch_queue_.clear();
+            dispatch_active_ = false;
+        }
+        if (discarded > 0) {
+            pending_tasks_.fetch_sub(discarded);
+        }
+    }
+
+    const std::string id;                         ///< Graph 内唯一节点 ID。
+    const std::shared_ptr<INode> node;             ///< 业务节点对象。
+    const std::shared_ptr<IExecutor> executor;     ///< 节点任务使用的执行器。
+    const NodeOptions options;                     ///< 节点并发和队列配置。
+    const std::shared_ptr<NodeMetrics> metrics;    ///< 节点共享统计对象。
+    std::unordered_map<std::string, PortBinding> ports;  ///< 已注册端口。
+
+private:
+    /// 向 Executor 投递一个“执行一个串行任务”的泵任务。
+    bool ScheduleSerialized() {
+        auto self = shared_from_this();
+        return executor && executor->Post([self]() {
+            self->RunSerializedOne();
+        });
+    }
+
+    /// 取出一条任务执行，完成后按需安排下一条任务。
+    void RunSerializedOne() {
+        Task task;
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex_);
+            if (dispatch_queue_.empty()) {
+                dispatch_active_ = false;
+                return;
+            }
+            task = std::move(dispatch_queue_.front());
+            dispatch_queue_.pop_front();
+        }
+
+        RunTask(std::move(task));
+
+        bool should_schedule = false;
+        {
+            std::lock_guard<std::mutex> lock(dispatch_mutex_);
+            if (dispatch_queue_.empty() || dispatch_closed_) {
+                dispatch_active_ = false;
+            } else {
+                should_schedule = true;
+            }
+        }
+
+        if (should_schedule && !ScheduleSerialized()) {
+            CloseDispatch();
+        }
+    }
+
+    /// 统一执行任务并把异常转换成 metrics，不让一个节点异常打穿线程池。
+    void RunTask(Task task) {
+        try {
+            task();
+            metrics->processed.fetch_add(1);
+        } catch (...) {
+            metrics->errors.fetch_add(1);
+        }
+        pending_tasks_.fetch_sub(1);
+    }
+
+    /// 使用 CAS 更新 pending task 的历史最高水位。
+    void UpdateHighWatermark() {
+        const auto current = pending_tasks_.load();
+        auto previous = metrics->max_pending_tasks.load();
+        while (current > previous &&
+               !metrics->max_pending_tasks.compare_exchange_weak(previous, current)) {
+        }
+    }
+
+    mutable std::mutex dispatch_mutex_;  ///< 保护 deque 和 Dispatch 状态。
+    std::deque<Task> dispatch_queue_;     ///< Serialized 模式的有界任务队列。
+    std::atomic<std::size_t> pending_tasks_{0};
+    bool dispatch_active_{false};         ///< 是否已有泵任务在 Executor 中。
+    bool dispatch_closed_{true};          ///< 初始关闭，Graph::Start 时打开。
+};
+
+/// Edge 的非模板接口，允许 Graph 统一管理不同消息类型的边。
+class IEdge : public std::enable_shared_from_this<IEdge> {
+public:
+    virtual ~IEdge() = default;
+    virtual void Open() = 0;       ///< 打开并清空底层 Transport。
+    virtual void Close() = 0;      ///< 关闭 Transport，拒绝新的发送。
+    virtual bool Empty() const = 0;
+    virtual void Schedule() = 0;   ///< 请求向目标 Executor 投递 Drain。
+    virtual void Drain() = 0;      ///< 批量取出 Transport 消息并提交给节点。
+};
+
+/**
+ * @brief 连接输出端口和目标输入端口的强类型 Edge。
+ *
+ * scheduled_ 是一个 CAS 门闩：同一条边即使短时间收到多次入队通知，
+ * 也只会有一个 Drain 任务在目标 Executor 中排队。Drain 结束后先释放
+ * 门闩，再检查队列是否仍有消息，覆盖“Drain 结束瞬间又有新消息入队”的
+ * 竞态窗口。
+ */
+template <typename T>
+class Edge final : public IEdge {
+public:
+    /// 构造 Transport 和发送结果统计回调；通知回调延后到 Initialize 绑定。
+    Edge(std::shared_ptr<NodeContext> destination,
+         InputPort<T>* input,
+         EdgeOptions options)
+        : destination_(std::move(destination)),
+          input_(input),
+          options_(options) {
+        if (options_.transport == TransportKind::Direct) {
+            auto direct = std::make_shared<DirectTransport<T>>();
+            direct->SetConsumer([destination = destination_, input = input_](T value) {
+                destination->Dispatch([input, value = std::move(value)]() mutable {
+                    input->Receive(std::move(value));
+                });
+            });
+            transport_ = std::move(direct);
+        } else {
+            transport_ = std::make_shared<QueueTransport<T>>(
+                options_.capacity,
+                options_.backpressure);
+        }
+
+        transport_->SetSendResultCallback([metrics = destination_->metrics](MailboxPushResult result) {
+            switch (result) {
+            case MailboxPushResult::Accepted:
+                metrics->enqueued.fetch_add(1);
+                break;
+            case MailboxPushResult::DroppedOldest:
+                metrics->enqueued.fetch_add(1);
+                metrics->dropped.fetch_add(1);
+                break;
+            case MailboxPushResult::DroppedNewest:
+                metrics->dropped.fetch_add(1);
+                break;
+            case MailboxPushResult::Closed:
+                metrics->rejected.fetch_add(1);
+                break;
+            }
+        });
+    }
+
+    /// 把此边的 Transport 挂到源输出端口。
+    void Attach(OutputPort<T>& output) {
+        output.AddTransport(transport_);
+    }
+
+    /**
+     * 绑定弱引用通知回调。
+     *
+     * 该步骤必须在 make_shared 完成后执行，不能放在构造函数中调用
+     * weak_from_this()，否则得到的弱引用为空，消息永远不会触发 Drain。
+     */
+    void Initialize() {
+        if (options_.transport == TransportKind::Queue) {
+            transport_->SetNotifyCallback([weak = weak_from_this()]() {
+                if (auto edge = weak.lock()) {
+                    edge->Schedule();
+                }
+            });
+        }
+    }
+
+    /// 打开边并清除上一个生命周期的排队消息。
+    void Open() override {
+        scheduled_.store(false);
+        transport_->Open();
+    }
+
+    /// 关闭边并复位调度门闩。
+    void Close() override {
+        transport_->Close();
+        scheduled_.store(false);
+    }
+
+    bool Empty() const override {
+        return transport_->Empty();
+    }
+
+private:
+    /// 只负责投递 Drain，不直接在发送线程执行消息处理。
+    void Schedule() override {
+        bool expected = false;
+        if (!scheduled_.compare_exchange_strong(expected, true)) {
+            return;
+        }
+
+        auto self = shared_from_this();
+        if (!destination_->executor || !destination_->executor->Post([self]() {
+                self->Drain();
+            })) {
+            scheduled_.store(false);
+            destination_->metrics->rejected.fetch_add(1);
+        }
+    }
+
+    /// 在目标 Executor 上批量排空边队列。
+    void Drain() override {
+        if (options_.transport == TransportKind::Direct) {
+            scheduled_.store(false);
+            return;
+        }
+
+        std::size_t count = 0;
+        while (count < std::max<std::size_t>(1, options_.max_batch_size)) {
+            auto value = transport_->TryReceive();
+            if (!value.has_value()) {
+                break;
+            }
+
+            if (!destination_->Dispatch([input = input_, value = std::move(*value)]() mutable {
+                    input->Receive(std::move(value));
+                })) {
+                destination_->metrics->rejected.fetch_add(1);
+            }
+            ++count;
+        }
+
+        scheduled_.store(false);
+        if (!transport_->Empty()) {
+            Schedule();
+        }
+    }
+
+    std::shared_ptr<NodeContext> destination_;  ///< 目标节点上下文。
+    InputPort<T>* input_;                       ///< 目标节点输入端口，不拥有其生命周期。
+    EdgeOptions options_;                       ///< 边的队列和批处理配置。
+    std::shared_ptr<ITransport<T>> transport_;  ///< 实际消息通道。
+    std::atomic<bool> scheduled_{false};        ///< 防止重复投递 Drain。
+};
+
+/**
+ * @brief 管理节点、边和执行器生命周期的有向图。
+ *
+ * Graph 构建阶段允许 AddNode/Connect；进入 Starting 后拓扑视为冻结。
+ * Start 顺序为打开 Dispatch/边、初始化节点、启动执行器、启动节点。
+ * Stop 顺序为停止节点、关闭边、关闭 Dispatch、停止执行器、反初始化节点。
+ */
+class Graph final {
+public:
+    /// Graph 的生命周期状态。
+    enum class State {
+        Created,
+        Starting,
+        Running,
+        Stopping,
+        Stopped,
+    };
+
+    /// 析构时执行幂等 Stop，确保拥有的节点和边被关闭。
+    ~Graph() {
+        Stop();
+    }
+
+    template <typename NodeType, typename... Args>
+    /**
+     * 创建并注册一个节点。
+     *
+     * NodeType 必须实现 INode，并在 RegisterPorts 中注册端口。Graph 保存
+     * 节点的 shared_ptr，因此节点对象会一直存活到 Graph 销毁。
+     */
+    bool AddNode(const std::string& id,
+                 std::shared_ptr<IExecutor> executor,
+                 NodeOptions options,
+                 Args&&... args) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == State::Starting || state_ == State::Running ||
+            state_ == State::Stopping || nodes_.contains(id) || !executor) {
+            return false;
+        }
+
+        auto node = std::make_shared<NodeType>(std::forward<Args>(args)...);
+        auto context = std::make_shared<NodeContext>(id, node, std::move(executor), options);
+        PortRegistry registry;
+        if (!node->RegisterPorts(registry)) {
+            return false;
+        }
+
+        context->ports = registry.Bindings();
+        nodes_.emplace(id, std::move(context));
+        node_order_.push_back(id);
+        return true;
+    }
+
+    template <typename T>
+    /// 连接默认 out -> in 端口。
+    bool Connect(const std::string& source,
+                 const std::string& destination,
+                 EdgeOptions options = {}) {
+        return Connect<T>(source, "out", destination, "in", options);
+    }
+
+    template <typename T>
+    /// 按端口名称连接两个同类型端口，并在构建期校验方向和 typeid。
+    bool Connect(const std::string& source,
+                 const std::string& source_port,
+                 const std::string& destination,
+                 const std::string& destination_port,
+                 EdgeOptions options = {}) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ == State::Starting || state_ == State::Running ||
+            state_ == State::Stopping) {
+            return false;
+        }
+
+        auto source_it = nodes_.find(source);
+        auto destination_it = nodes_.find(destination);
+        if (source_it == nodes_.end() || destination_it == nodes_.end()) {
+            return false;
+        }
+
+        const auto* source_binding = FindPort(*source_it->second, source_port);
+        const auto* destination_binding = FindPort(*destination_it->second, destination_port);
+        if (!source_binding || !destination_binding ||
+            source_binding->direction != PortDirection::Output ||
+            destination_binding->direction != PortDirection::Input ||
+            source_binding->type != typeid(T) ||
+            destination_binding->type != typeid(T)) {
+            return false;
+        }
+
+        auto* output = static_cast<OutputPort<T>*>(source_binding->port);
+        auto* input = static_cast<InputPort<T>*>(destination_binding->port);
+        auto edge = std::make_shared<Edge<T>>(destination_it->second, input, options);
+        edge->Initialize();
+        edge->Attach(*output);
+        edges_.push_back(std::move(edge));
+        return true;
+    }
+
+    /**
+     * 启动整张 Graph。
+     *
+     * 任何 Init、Executor::Start 或 Node::Start 失败都会调用 Rollback，
+     * 已完成的阶段按逆序撤销，避免部分启动留下线程或业务资源。
+     */
+    bool Start() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ == State::Starting || state_ == State::Running ||
+                state_ == State::Stopping) {
+                return false;
+            }
+            state_ = State::Starting;
+            for (const auto& id : node_order_) {
+                nodes_.at(id)->OpenDispatch();
+            }
+            for (auto& edge : edges_) {
+                edge->Open();
+            }
+        }
+
+        std::vector<std::shared_ptr<NodeContext>> initialized;
+        for (const auto& id : node_order_) {
+            auto context = nodes_.at(id);
+            if (!context->node->Init()) {
+                Rollback(initialized, {}, {});
+                return false;
+            }
+            initialized.push_back(std::move(context));
+        }
+
+        std::vector<std::shared_ptr<IExecutor>> started_executors;
+        std::unordered_set<IExecutor*> seen_executors;
+        for (const auto& id : node_order_) {
+            auto executor = nodes_.at(id)->executor;
+            if (seen_executors.insert(executor.get()).second) {
+                if (!executor->Start()) {
+                    Rollback(initialized, started_executors, {});
+                    return false;
+                }
+                started_executors.push_back(std::move(executor));
+            }
+        }
+
+        std::vector<std::shared_ptr<NodeContext>> started_nodes;
+        for (const auto& id : node_order_) {
+            auto context = nodes_.at(id);
+            if (!context->node->Start()) {
+                Rollback(initialized, started_executors, started_nodes);
+                return false;
+            }
+            started_nodes.push_back(std::move(context));
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = State::Running;
+        return true;
+    }
+
+    /**
+     * 停止整张 Graph。
+     *
+     * 当前实现是立即停止语义：关闭边后清除尚未执行的 Dispatch 任务。
+     * 后续可在此基础上增加等待队列排空和编码器 flush 的 Graceful 模式。
+     */
+    void Stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (state_ == State::Created || state_ == State::Stopped ||
+                state_ == State::Stopping) {
+                return;
+            }
+            state_ = State::Stopping;
+        }
+
+        for (const auto& id : node_order_) {
+            nodes_.at(id)->node->Stop();
+        }
+        for (auto& edge : edges_) {
+            edge->Close();
+        }
+        for (const auto& id : node_order_) {
+            nodes_.at(id)->CloseDispatch();
+        }
+
+        std::unordered_set<IExecutor*> seen_executors;
+        for (const auto& id : node_order_) {
+            auto executor = nodes_.at(id)->executor;
+            if (seen_executors.insert(executor.get()).second) {
+                executor->Stop();
+            }
+        }
+
+        for (auto it = node_order_.rbegin(); it != node_order_.rend(); ++it) {
+            nodes_.at(*it)->node->Deinit();
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = State::Stopped;
+    }
+
+    /// 获取节点对象，主要用于监控、测试和上层控制接口。
+    template <typename NodeType>
+    std::shared_ptr<NodeType> GetNode(const std::string& id) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = nodes_.find(id);
+        if (it == nodes_.end()) {
+            return nullptr;
+        }
+        return std::dynamic_pointer_cast<NodeType>(it->second->node);
+    }
+
+    /// 线程安全地读取 Graph 状态。
+    State GetState() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_;
+    }
+
+    /// 获取指定节点的线程安全指标快照。
+    bool GetMetrics(const std::string& id, NodeMetricsSnapshot& snapshot) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = nodes_.find(id);
+        if (it == nodes_.end()) {
+            return false;
+        }
+        snapshot = it->second->metrics->Snapshot();
+        return true;
+    }
+
+private:
+    /// 从 NodeContext 中查找端口，连接失败时返回空指针。
+    static const PortBinding* FindPort(const NodeContext& context,
+                                       const std::string& name) {
+        auto it = context.ports.find(name);
+        return it == context.ports.end() ? nullptr : &it->second;
+    }
+
+    /// 撤销 Start 已经完成的阶段，并把 Graph 置为可再次 Start 的 Stopped。
+    void Rollback(const std::vector<std::shared_ptr<NodeContext>>& initialized,
+                  const std::vector<std::shared_ptr<IExecutor>>& started_executors,
+                  const std::vector<std::shared_ptr<NodeContext>>& started_nodes) {
+        for (auto it = started_nodes.rbegin(); it != started_nodes.rend(); ++it) {
+            (*it)->node->Stop();
+        }
+        for (auto it = started_executors.rbegin(); it != started_executors.rend(); ++it) {
+            (*it)->Stop();
+        }
+        for (auto it = initialized.rbegin(); it != initialized.rend(); ++it) {
+            (*it)->node->Deinit();
+        }
+        for (auto& edge : edges_) {
+            edge->Close();
+        }
+        for (const auto& id : node_order_) {
+            nodes_.at(id)->CloseDispatch();
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        state_ = State::Stopped;
+    }
+
+    mutable std::mutex mutex_;  ///< 保护状态和拓扑容器。
+    State state_{State::Created};  ///< 当前生命周期状态。
+    std::unordered_map<std::string, std::shared_ptr<NodeContext>> nodes_;
+    std::vector<std::string> node_order_;  ///< 保证生命周期顺序稳定可控。
+    std::vector<std::shared_ptr<IEdge>> edges_;  ///< Graph 拥有的全部连接边。
+};
+
+} // namespace mediaflow

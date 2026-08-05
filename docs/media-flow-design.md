@@ -133,11 +133,8 @@ flowchart TD
 源框架使用过于通用的顶层命名空间。迁移后推荐统一放入：
 
 ```cpp
-namespace video_pipeline::flow {
-    // PipelineBuilder, MediaFlow, PipelineConfig
-}
-
-namespace video_pipeline::flow::core {
+namespace mediaflow {
+    // PipelineBuilder, MediaFlow, PipelineConfig,
     // Graph, Node, Port, Transport, Executor, Scheduler
 }
 ```
@@ -263,7 +260,7 @@ Stop sources
 
 不建议把源工程的 `common/queue` 整目录覆盖到当前工程。两边已有同名队列，但命名空间、底层实现和接口语义不同，直接覆盖会影响 Jitter Buffer 等现有调用方。
 
-推荐在 `pipeline/core/transport` 内部定义 Mailbox 所需的最小队列抽象，并适配当前队列：
+推荐在 `include/mediaflow/core/transport` 内部定义 Mailbox 所需的最小队列抽象，并适配当前队列：
 
 ```cpp
 template <typename T>
@@ -462,7 +459,7 @@ graph.Connect<PacketMessage>("encoder", "out", "publisher", "in", publish_edge);
 ### 9.1 推荐目录
 
 ```text
-include/pipeline/
+include/mediaflow/
   pipeline_builder.h
   pipeline_config.h
   pipeline_handle.h
@@ -494,9 +491,9 @@ src/pipeline/
     render_sink_node.cpp
 
 test/pipeline/
-  test_flow_graph.cpp
-  test_flow_backpressure.cpp
-  test_flow_lifecycle.cpp
+  test_mediaflow_graph.cpp
+  test_mediaflow_backpressure.cpp
+  test_mediaflow_lifecycle.cpp
   test_decoder_node.cpp
   test_pipeline_integration.cpp
 ```
@@ -506,20 +503,20 @@ test/pipeline/
 MediaFlow 内核基本为模板和头文件，建议单独建立 INTERFACE 目标：
 
 ```cmake
-add_library(video_pipeline_flow INTERFACE)
-add_library(video-pipeline::flow ALIAS video_pipeline_flow)
+add_library(video_pipeline_mediaflow INTERFACE)
+add_library(video-pipeline::mediaflow ALIAS video_pipeline_mediaflow)
 
-target_include_directories(video_pipeline_flow INTERFACE
+target_include_directories(video_pipeline_mediaflow INTERFACE
     "${CMAKE_SOURCE_DIR}/include"
 )
 
-target_link_libraries(video_pipeline_flow INTERFACE
+target_link_libraries(video_pipeline_mediaflow INTERFACE
     video-pipeline::boost
     Threads::Threads
 )
 ```
 
-业务节点的 `.cpp` 继续进入 `video_pipeline_lib`，并链接 `video-pipeline::flow`。不要照搬源框架对 `fmt`、`yaml-cpp`、`common_lib` 和多个未实际使用的 Boost component 的顶层依赖；依赖应按迁移后的真实 include 和链接需求收敛。
+业务节点的 `.cpp` 继续进入 `video_pipeline_lib`，并链接 `video-pipeline::mediaflow`。不要照搬源框架对 `fmt`、`yaml-cpp`、`common_lib` 和多个未实际使用的 Boost component 的顶层依赖；依赖应按迁移后的真实 include 和链接需求收敛。
 
 如果 Mailbox 继续使用 Boost.Lockfree，需要在当前 `find_package(Boost ...)` 和 `video-pipeline::boost` 中显式补充 `lockfree`。如果采用工程现有 moodycamel 队列，则无需仅为 MediaFlow 引入 Boost.Lockfree。
 
@@ -536,7 +533,7 @@ target_link_libraries(video_pipeline_flow INTERFACE
 | P1 | Drain 一次排空整个 Edge | 公平性差，并把压力转移到 Dispatch | 增加 batch/time budget 和轮转调度 |
 | P1 | Node 指标按目标节点聚合 | 无法定位具体拥塞 Edge | 增加 EdgeMetrics 和 queue high watermark |
 | P1 | bool 返回值错误信息不足 | 构图和启动失败难排查 | 使用 `PipelineResult`/`FlowError` 结构化错误 |
-| P1 | 源框架顶层命名空间过宽 | 易与依赖或应用代码冲突 | 改为 `video_pipeline::flow` |
+| P1 | 源框架顶层命名空间过宽 | 易与依赖或应用代码冲突 | 统一为 `mediaflow` |
 | P1 | DirectTransport 语义不清 | 线程模型误判 | 区分 Inline 与 ExecutorDispatch 两种 Transport |
 | P1 | 多下游共享消息可变 | 数据竞争或结果互相污染 | 默认只读消息；修改时 copy-on-write 或新 Buffer |
 | P2 | 全局 Asio Pool Manager | 多 Pipeline 生命周期互相影响 | 上移到 PipelineManager，显式注入 executor |
@@ -585,9 +582,9 @@ Pipeline 不应在任意节点异常后无条件继续运行。每个节点应�
 
 ### M0：迁移内核并建立编译基线（1 至 2 个开发日）
 
-- 将 Graph、Node、Port、Transport、Scheduler、Executor 移入 `include/pipeline/core`。
+- 将 Graph、Node、Port、Transport、Scheduler、Executor 移入 `include/mediaflow/core`。
 - 调整命名空间和 include 路径。
-- 建立 `video-pipeline::flow` CMake 目标。
+- 建立 `video-pipeline::mediaflow` CMake 目标。
 - 先以 MPMC 或正确的有界 Mailbox 替换源 SPSC DropOldest 实现。
 - 补齐 Transport Open/Clear 和 Graph 状态机。
 - 增加 `Source<int> -> Transform<int,int> -> Sink<int>` smoke test。
