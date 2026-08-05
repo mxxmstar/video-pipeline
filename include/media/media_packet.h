@@ -4,17 +4,20 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 
 #include "media/i_media_buffer.h"
 #include "common/log/logger.h"
 /// 媒体流类型
-enum class MediaType {    
-    VIDEO,            ///< 视频
-    AUDIO,            ///< 音频
-    PCAP,             ///< pcap数据包
+enum class MediaType : int {
+    // 数值是公共数据契约的一部分，不能依赖枚举成员声明顺序。
+    // UNKNOWN 必须与任何真实媒体类型不同，否则“未知类型”会被误判为视频。
     UNKNOWN = 0,      ///< 未知
+    VIDEO = 1,        ///< 视频
+    AUDIO = 2,        ///< 音频
+    PCAP = 3,         ///< pcap 数据包
 };
 
 /// 编码格式（值参考 FFmpeg 的 AVCodecID）
@@ -51,6 +54,23 @@ struct Rational {
     }
 };
 
+/// @brief 统一表示“没有时间戳”的值。
+///
+/// 0 是合法的媒体时间点（例如第一帧从 0 开始），因此不能再用 0 表示
+/// 时间戳缺失。该值与 FFmpeg 的 AV_NOPTS_VALUE 数值一致，但公共头文件
+/// 不依赖 FFmpeg 头文件。
+inline constexpr std::int64_t kNoTimestamp =
+    (std::numeric_limits<std::int64_t>::min)();
+
+/// @brief 判断时间戳是否有效。
+inline constexpr bool IsValidTimestamp(std::int64_t timestamp) {
+    return timestamp != kNoTimestamp;
+}
+
+/// @brief 判断时间基是否可以用于整数时间戳换算。
+inline constexpr bool IsValidTimeBase(const Rational& value) {
+    return value.num > 0 && value.den > 0;
+}
 
 /// 媒体包：一个编码帧或编码帧分片的数据及其描述信息
 class MediaPacket {
@@ -59,17 +79,20 @@ public:
     CodecType  codec{CodecType::UNKNOWN};        ///< 编码格式
     int stream_index{-1 };                       ///< 流索引
 
-    int64_t    pts{0};                            ///< 显示时间戳（微秒）
-    int64_t    dts{0};                            ///< 解码时间戳（微秒）
-    int64_t duration{0};                          ///< 持续时间（微秒）
-    Rational time_base{1, 1000000};              ///< 时间基（微秒/单位）
+    // pts/dts/duration 都是 time_base 下的整数 tick，不是固定微秒。
+    // 需要微秒时必须按 time_base 显式重标定，不能直接比较不同来源的值。
+    int64_t    pts{kNoTimestamp};                 ///< 显示时间戳（time_base tick）
+    int64_t    dts{kNoTimestamp};                 ///< 解码时间戳（time_base tick）
+    int64_t duration{kNoTimestamp};               ///< 持续时间（time_base tick）
+    Rational time_base{1, 1000000};                ///< 时间戳使用的时间基
 
     bool       keyframe{false};                   ///< 是否为关键帧
     std::shared_ptr<IMediaBuffer> buffer;          ///< 编码数据载荷
     BackendHandle backend;                         ///< 后端引擎句柄
 
     void Dump() const {
-        LOG_INFO("MediaPacket: type={}, codec={}, stream_index={}, pts={}, dts={}, duration={}, time_base={}, keyframe={}, buffer_size={}", 
-                 (int)type, (int)codec, stream_index, pts, dts, duration, time_base.toString(), keyframe, buffer->Size());
+        LOG_INFO("MediaPacket: type={}, codec={}, stream_index={}, pts={}, dts={}, duration={}, time_base={}, keyframe={}, buffer_size={}",
+                 (int)type, (int)codec, stream_index, pts, dts, duration,
+                 time_base.toString(), keyframe, buffer ? buffer->Size() : 0);
     }
 };

@@ -37,9 +37,11 @@ enum class SampleFormat {
 
 /// @brief 时间戳
 struct MediaTime {
-    int64_t pts_us{0};   ///< 显示时间戳（微秒）
-    int64_t dts_us{0};   ///< 解码时间戳（微秒）
-    int64_t duration_us{0}; ///< 持续时间（微秒）
+    // MediaFrame 的时间轴固定为微秒，但 0 仍然是合法起点，因此缺失值使用
+    // kNoTimestamp。编码器收到该哨兵时会按自身时间基生成连续时间戳。
+    int64_t pts_us{kNoTimestamp};       ///< 显示时间戳（微秒）
+    int64_t dts_us{kNoTimestamp};       ///< 解码时间戳（微秒）
+    int64_t duration_us{kNoTimestamp}; ///< 持续时间（微秒）
 };
 
 /// @brief 平面信息

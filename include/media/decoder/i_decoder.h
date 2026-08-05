@@ -14,6 +14,7 @@
 /// 职责：
 ///   - Open()       — 根据 StreamInfo 初始化解码器
 ///   - Decode()     — 输入一个 MediaPacket，输出零到多个 MediaFrame（通过回调）
+///   - Flush()      — 显式输出解码器内部残留帧
 ///   - Close()      — 销毁解码器资源
 ///
 /// 不负责：
@@ -32,6 +33,12 @@ public:
     /// @param info 流元信息（编码格式、分辨率、extra_data 等）
     /// @return true 初始化成功
     virtual bool Open(const MediaStreamInfo& info) = 0;
+
+    /// @brief 显式刷新解码器内部缓存。
+    ///
+    /// Flush 的输出仍通过 FrameCallback 发送。调用方必须在 Graph 的停止屏障内
+    /// 调用 Flush，确认输出完成后再调用 Close；Close 本身不再隐式产生媒体帧。
+    virtual bool Flush() = 0;
 
     /// @brief 关闭解码器，释放所有资源
     virtual void Close() = 0;

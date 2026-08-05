@@ -39,6 +39,7 @@ public:
     // ==================== IDecoder ====================
 
     bool Open(const MediaStreamInfo& info) override;
+    bool Flush() override;
     void Close() override;
     bool Decode(std::shared_ptr<MediaPacket> packet) override;
     void SetFrameCallback(FrameCallback cb) override;

@@ -151,10 +151,36 @@ int64_t AdaptiveJitterBuffer::WallMilliseconds() {
 
 // 优先使用 DTS，DTS 无效时回退到 PTS
 int64_t AdaptiveJitterBuffer::PacketTimestampUs(const MediaPacket& packet) {
-    constexpr int64_t kInvalidTimestamp = std::numeric_limits<int64_t>::min() / 2;
-    if (packet.dts > kInvalidTimestamp)
-        return packet.dts;
-    return packet.pts;
+    // JitterBuffer 的排序和延迟估算使用统一微秒轴。没有有效时间戳时返回
+    // 0 作为“无时间轴排序”的稳定兜底，不能把 kNoTimestamp 继续参与除法。
+    const int64_t timestamp = IsValidTimestamp(packet.dts)
+        ? packet.dts
+        : packet.pts;
+    if (!IsValidTimestamp(timestamp)) {
+        return 0;
+    }
+
+    // 目前 jitter buffer 的主要输入仍是微秒基准；对其他合法 time_base 做
+    // 轻量换算，避免把 90 kHz tick 直接当作微秒。使用 long double 是为了
+    // 避免中间乘法在 Windows 64 位整数上溢出，最终结果再夹到 int64 范围。
+    const Rational base = IsValidTimeBase(packet.time_base)
+        ? packet.time_base
+        : Rational{1, 1000000};
+    const long double micros =
+        static_cast<long double>(timestamp) *
+        static_cast<long double>(base.num) * 1'000'000.0L /
+        static_cast<long double>(base.den);
+    const long double max_value =
+        static_cast<long double>((std::numeric_limits<int64_t>::max)());
+    const long double min_value =
+        static_cast<long double>((std::numeric_limits<int64_t>::min)());
+    if (micros >= max_value) {
+        return (std::numeric_limits<int64_t>::max)();
+    }
+    if (micros <= min_value) {
+        return (std::numeric_limits<int64_t>::min)();
+    }
+    return static_cast<int64_t>(micros);
 }
 
 int64_t AdaptiveJitterBuffer::PacketTimestampMs(const MediaPacket& packet) {

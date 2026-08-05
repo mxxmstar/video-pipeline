@@ -47,6 +47,7 @@ public:
         uint64_t packets_received{0}; ///< 累计接收包数
         double   bitrate{0.0};        ///< 当前码率（kbps）
         uint32_t reconnect_count{0};  ///< 累计重连次数
+        uint64_t jitter_dropped_packets{0}; ///< jitter buffer 丢弃包数
     };
 
     /// @brief 构造
@@ -118,34 +119,45 @@ private:
     // ==================== 内部流程 ====================
 
     /// @brief 打开拉流器（由 Start 或 Reconnect 调用）
-    void connect();
+    void connect(std::uint64_t generation);
 
     /// @brief 读循环（通过 io_context::post 调度）
-    void readLoop();
+    void readLoop(std::uint64_t generation);
 
     /// @brief 发起异步重连
-    void doReconnect();
+    void doReconnect(std::uint64_t generation);
 
     /// @brief 启动解码器驱动定时器
-    void startDecoderDriveTimer();
+    void startDecoderDriveTimer(std::uint64_t generation);
 
     /// @brief 解码器驱动定时器回调
-    void onDecoderDriveTimer(const boost::system::error_code& ec);
+    void onDecoderDriveTimer(const boost::system::error_code& ec,
+                             std::uint64_t generation);
 
     /// @brief 入队媒体包
-    void enqueuePacket(std::shared_ptr<MediaPacket> packet);
+    void enqueuePacket(std::shared_ptr<MediaPacket> packet,
+                       std::uint64_t generation);
 
     /// @brief 分发媒体包
-    void dispatchPacket(std::shared_ptr<MediaPacket> packet);
+    void dispatchPacket(std::shared_ptr<MediaPacket> packet,
+                        std::uint64_t generation);
     
     /// @brief 清空 jitter buffer
     void clearJitterBuffer();
 
     /// @brief 启动 Watchdog 定时器
-    void startWatchdog();
+    void startWatchdog(std::uint64_t generation);
 
     /// @brief Watchdog 检测回调
-    void onWatchdog(const boost::system::error_code& ec);
+    void onWatchdog(const boost::system::error_code& ec,
+                    std::uint64_t generation);
+
+    /// @brief 检查异步任务是否仍属于当前启动代次。
+    ///
+    /// Stop/Start 很快连续发生时，旧的 readLoop 或 timer handler 仍可能已经
+    /// 排在 io_context 队列中。所有异步入口都必须经过这个闸门，防止旧连接
+    /// 的数据进入新的生命周期。
+    bool isGenerationActive(std::uint64_t generation) const;
 
     // ==================== 状态变更 ====================
 
@@ -160,6 +172,7 @@ private:
 
     std::atomic<State> state_{State::KIDLE}; ///< 当前状态
     std::atomic<bool> running_{false};      ///< 读线程运行标志
+    std::atomic<std::uint64_t> generation_{0}; ///< 当前启动代次
 
     boost::asio::steady_timer reconnect_timer_;      ///< 重连延迟定时器
     boost::asio::steady_timer watchdog_timer_;       ///< Watchdog 定时器
@@ -176,9 +189,10 @@ private:
     std::chrono::steady_clock::time_point last_read_time_; ///< 上次成功读时间
 
     // ── 统计 ──
-    std::atomic<uint64_t> async_bytes_received_{0};   ///< 周期内字节（原子）
-    std::atomic<uint64_t> async_packets_received_{0}; ///< 周期内包数（原子）
-    Stats stats_;                                      ///< 累积统计快照
+    mutable std::mutex stats_mutex_;              ///< 保护统计快照和码率窗口
+    Stats stats_;                                 ///< 累积统计快照
+    std::chrono::steady_clock::time_point stats_window_start_{};
+    uint64_t stats_window_bytes_{0};              ///< 当前码率窗口的字节数
 
     // ── Jitter buffer ──
     std::unique_ptr<AdaptiveJitterBuffer> jitter_buffer_;

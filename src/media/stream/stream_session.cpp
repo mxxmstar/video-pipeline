@@ -103,41 +103,73 @@ bool MediaStreamSession::Start() {
         return false;
     }
 
+    const State current_state = state_.load();
+    if (current_state == State::KCONNECTING ||
+        current_state == State::KCONNECTED ||
+        current_state == State::KRECONNECTING) {
+        LOG_WARN("Start() rejected: session is already active ({})",
+                 StateNameImpl(current_state));
+        return false;
+    }
+
+    // 每次 Start 都产生新的代次。旧代次的异步 handler 即使已经排队，
+    // 也只能在入口处发现代次不匹配并退出。
+    const std::uint64_t generation = generation_.fetch_add(1) + 1;
+    running_ = true;
     setState(State::KCONNECTING);
 
     // 打开拉流器（同步）
     if (!puller_->Open(url_)) {
-        setState(State::KERROR);
+        if (isGenerationActive(generation)) {
+            running_ = false;
+            setState(State::KERROR);
+        }
+        return false;
+    }
+
+    if (!isGenerationActive(generation)) {
+        // Stop 可能在 Open 阻塞期间被调用，不能把已打开的连接泄漏给旧代次。
+        puller_->Close();
         return false;
     }
 
     // 获取并分发 StreamInfo
     MultiStreamInfo info = puller_->GetStreamInfo();
-    if (streaminfo_cb_) {
-        streaminfo_cb_(info);
+    StreamInfoCallback streaminfo_cb;
+    {
+        std::lock_guard<std::mutex> lock(cb_mutex_);
+        streaminfo_cb = streaminfo_cb_;
+    }
+    if (streaminfo_cb) {
+        streaminfo_cb(info);
     }
 
     // 标记运行状态
     running_ = true;
     last_read_time_ = std::chrono::steady_clock::now();
     reconnect_count_ = 0;
-    stats_ = {};
-    async_bytes_received_ = 0;
-    async_packets_received_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        stats_ = {};
+        stats_window_start_ = std::chrono::steady_clock::now();
+        stats_window_bytes_ = 0;
+    }
     clearJitterBuffer();
 
     setState(State::KCONNECTED);
 
     // 通过 post 调度读循环到 io_context（由外部线程池驱动）
-    boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+    boost::asio::post(io_, [self = shared_from_this(), generation]() {
+        self->readLoop(generation);
+    });
 
     // 启动 Watchdog
     if (watchdog_interval_ms_ > 0) {
-        startWatchdog();
+        startWatchdog(generation);
     }
 
     if (jitter_buffer_interval_ms_ > 0) {
-        startDecoderDriveTimer();
+        startDecoderDriveTimer(generation);
     }
 
     return true;
@@ -145,12 +177,14 @@ bool MediaStreamSession::Start() {
 
 void MediaStreamSession::Stop() {
     State expected = state_.load();
-    // 只有 CONNECTED / RECONNECTING / ERROR 需要真正停止
-    if (expected != State::KCONNECTED && expected != State::KRECONNECTING && expected != State::KERROR) {
+    // CONNECTING 也必须可停止，否则 Open 阶段无法取消，调用方会永久卡在
+    // “连接中”。KIDLE/KSTOPPED 已经没有需要取消的异步工作。
+    if (expected == State::KIDLE || expected == State::KSTOPPED) {
         return;
     }
 
-    // 设置停止标志
+    // 先使所有旧 handler 失效，再取消 timer 和关闭底层 I/O。
+    generation_.fetch_add(1);
     running_ = false;
 
     // 取消定时器
@@ -170,17 +204,31 @@ void MediaStreamSession::Stop() {
 
 // ── 内部：连接（同步） ──────────────────────────────────────────────
 
-void MediaStreamSession::connect() {
+void MediaStreamSession::connect(std::uint64_t generation) {
+    if (!isGenerationActive(generation)) {
+        return;
+    }
+
     if (!puller_->Open(url_)) {
         LOG_ERROR("Reconnect Open failed");
-        doReconnect();
+        doReconnect(generation);
+        return;
+    }
+
+    if (!isGenerationActive(generation)) {
+        puller_->Close();
         return;
     }
 
     // 分发 StreamInfo（重连后可能变化）
     MultiStreamInfo info = puller_->GetStreamInfo();
-    if (streaminfo_cb_) {
-        streaminfo_cb_(info);
+    StreamInfoCallback streaminfo_cb;
+    {
+        std::lock_guard<std::mutex> lock(cb_mutex_);
+        streaminfo_cb = streaminfo_cb_;
+    }
+    if (streaminfo_cb) {
+        streaminfo_cb(info);
     }
 
     reconnect_count_ = 0;
@@ -188,77 +236,135 @@ void MediaStreamSession::connect() {
     clearJitterBuffer();
     setState(State::KCONNECTED);
 
-    // 重新 post 读循环（io_context 线程池仍在运行）
-    running_ = true;
-    boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+    // 重新 post 读循环（io_context 线程池仍在运行）。running_ 在重连期间
+    // 一直保持为 true，但代次检查仍然保留，防止旧 timer 重新启动读循环。
+    boost::asio::post(io_, [self = shared_from_this(), generation]() {
+        self->readLoop(generation);
+    });
 
     // 重启 Watchdog
     if (watchdog_interval_ms_ > 0) {
         boost::system::error_code ec;
         watchdog_timer_.cancel();
-        startWatchdog();
+        startWatchdog(generation);
     }
     if (jitter_buffer_interval_ms_ > 0) {
-        startDecoderDriveTimer();
+        startDecoderDriveTimer(generation);
     }
 }
 
 // ── 内部：读循环（通过 io_context::post 调度，单次执行） ───────
 
-void MediaStreamSession::readLoop() {
+void MediaStreamSession::readLoop(std::uint64_t generation) {
     // 每次 handler 入口先检查是否应继续
-    if (!running_) {
+    if (!isGenerationActive(generation)) {
         return;
     }
 
     // 读一个包（可能阻塞，故在 io_context 多线程环境下需保证其它线程可处理定时器）
     std::shared_ptr<MediaPacket> packet;
-    bool ok = puller_->ReadPacket(packet);
+    const IPuller::PullReadResult result = puller_->ReadPacketResult();
 
-    if (!running_) {
+    if (!isGenerationActive(generation)) {
         return;
     }
 
-    if (ok) {
+    if (result.status == IPuller::PullReadStatus::Packet) {
+        packet = result.packet;
         // 空 packet = 非目标流跳过，继续下一轮
         if (!packet) {
-            boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+            boost::asio::post(io_, [self = shared_from_this(), generation]() {
+                self->readLoop(generation);
+            });
             return;
         }
 
-        // 更新统计
-        async_bytes_received_  += packet->buffer ? packet->buffer->Size() : 0;
-        async_packets_received_++;
+        // 更新累计统计和码率窗口。统计只在这里写入，查询通过 mutex 获取
+        // 快照，避免外部监控线程与读循环并发访问普通字段。
+        const std::uint64_t bytes = packet->buffer ? packet->buffer->Size() : 0;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            ++stats_.packets_received;
+            stats_.bytes_received += bytes;
+            stats_window_bytes_ += bytes;
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - stats_window_start_).count();
+            if (elapsed_ms >= 1000) {
+                stats_.bitrate = static_cast<double>(stats_window_bytes_) * 8.0 /
+                                 static_cast<double>(elapsed_ms);
+                stats_window_start_ = now;
+                stats_window_bytes_ = 0;
+            }
+        }
         last_read_time_ = std::chrono::steady_clock::now();
 
         if (jitter_buffer_interval_ms_ > 0)
-            enqueuePacket(std::move(packet));
+            enqueuePacket(std::move(packet), generation);
         else
-            dispatchPacket(std::move(packet));
+            dispatchPacket(std::move(packet), generation);
 
         // 继续下一轮
-        boost::asio::post(io_, [self = shared_from_this()]() { self->readLoop(); });
+        boost::asio::post(io_, [self = shared_from_this(), generation]() {
+            self->readLoop(generation);
+        });
+        return;
+    }
 
-    } else {
-        // 读取失败：EOF 或错误
-        LOG_WARN("ReadLoop: ReadPacket failed, reconnecting...");
-        doReconnect();
+    if (result.status == IPuller::PullReadStatus::NoData) {
+        // NoData 不是故障，不增加重连次数；下一轮继续读取即可。
+        boost::asio::post(io_, [self = shared_from_this(), generation]() {
+            self->readLoop(generation);
+        });
+        return;
+    }
+
+    switch (result.status) {
+        case IPuller::PullReadStatus::RetryableError:
+            LOG_WARN("ReadLoop: retryable read error: {}",
+                     result.message.empty() ? "unknown" : result.message);
+            doReconnect(generation);
+            return;
+        case IPuller::PullReadStatus::EOS:
+            // 本地文件或其他有限输入正常结束，不应被当作网络故障重连。
+            running_ = false;
+            puller_->Close();
+            clearJitterBuffer();
+            setState(State::KSTOPPED);
+            return;
+        case IPuller::PullReadStatus::Stopped:
+            running_ = false;
+            setState(State::KSTOPPED);
+            return;
+        case IPuller::PullReadStatus::FatalError:
+            LOG_ERROR("ReadLoop: fatal read error: {}",
+                      result.message.empty() ? "unknown" : result.message);
+            running_ = false;
+            puller_->Close();
+            setState(State::KERROR);
+            return;
+        case IPuller::PullReadStatus::Packet:
+        case IPuller::PullReadStatus::NoData:
+            // 上方已处理，保留分支使编译器覆盖所有枚举值。
+            return;
     }
 }
 
-void MediaStreamSession::startDecoderDriveTimer() {
-    if (!running_ || jitter_buffer_interval_ms_ <= 0)
+void MediaStreamSession::startDecoderDriveTimer(std::uint64_t generation) {
+    if (!isGenerationActive(generation) || jitter_buffer_interval_ms_ <= 0)
         return;
 
     decoder_timer_.expires_after(std::chrono::milliseconds(jitter_buffer_interval_ms_));
     decoder_timer_.async_wait(
-        [self = shared_from_this()](boost::system::error_code ec) {
-            self->onDecoderDriveTimer(ec);
+        [self = shared_from_this(), generation](boost::system::error_code ec) {
+            self->onDecoderDriveTimer(ec, generation);
         });
 }
 
-void MediaStreamSession::onDecoderDriveTimer(const boost::system::error_code& ec) {
-    if (ec || !running_ || jitter_buffer_interval_ms_ <= 0)
+void MediaStreamSession::onDecoderDriveTimer(
+    const boost::system::error_code& ec,
+    std::uint64_t generation) {
+    if (ec || !isGenerationActive(generation) || jitter_buffer_interval_ms_ <= 0)
         return;
 
     if (state_.load() != State::KCONNECTED)
@@ -269,21 +375,29 @@ void MediaStreamSession::onDecoderDriveTimer(const boost::system::error_code& ec
         packet = jitter_buffer_->PopReady();
 
     if (packet)
-        dispatchPacket(std::move(packet));
+        dispatchPacket(std::move(packet), generation);
 
-    startDecoderDriveTimer();
+    startDecoderDriveTimer(generation);
 }
 
-void MediaStreamSession::enqueuePacket(std::shared_ptr<MediaPacket> packet) {
-    if (!packet)
+void MediaStreamSession::enqueuePacket(std::shared_ptr<MediaPacket> packet,
+                                       std::uint64_t generation) {
+    if (!packet || !isGenerationActive(generation))
         return;
 
     if (jitter_buffer_ && !jitter_buffer_->Push(std::move(packet))) {
         LOG_DEBUG("Jitter buffer full, dropping incoming packet");
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.jitter_dropped_packets;
     }
 }
 
-void MediaStreamSession::dispatchPacket(std::shared_ptr<MediaPacket> packet) {
+void MediaStreamSession::dispatchPacket(std::shared_ptr<MediaPacket> packet,
+                                        std::uint64_t generation) {
+    if (!packet || !isGenerationActive(generation)) {
+        return;
+    }
+
     PacketCallback cb;
     {
         std::lock_guard<std::mutex> lock(cb_mutex_);
@@ -301,8 +415,8 @@ void MediaStreamSession::clearJitterBuffer() {
 
 // ── 内部：异步重连 ────────────────────────────────────────────────
 
-void MediaStreamSession::doReconnect() {
-    if (!running_)
+void MediaStreamSession::doReconnect(std::uint64_t generation) {
+    if (!isGenerationActive(generation))
         return;
 
     setState(State::KRECONNECTING);
@@ -317,36 +431,45 @@ void MediaStreamSession::doReconnect() {
     // 检查重连上限
     if (max_reconnect_count_ >= 0 && reconnect_count_ >= max_reconnect_count_) {
         LOG_ERROR("Max reconnect reached ({})", reconnect_count_);
+        running_ = false;
         setState(State::KERROR);
         return;
     }
 
     reconnect_count_++;
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        ++stats_.reconnect_count;
+    }
 
     LOG_INFO("Reconnect attempt {} in {} ms", reconnect_count_, reconnect_interval_ms_);
 
     // 异步等待后重试
     reconnect_timer_.expires_after(std::chrono::milliseconds(reconnect_interval_ms_));
     reconnect_timer_.async_wait(
-        [self = shared_from_this()](boost::system::error_code ec) {
-            if (ec || !self->running_)
+        [self = shared_from_this(), generation](boost::system::error_code ec) {
+            if (ec || !self->isGenerationActive(generation))
                 return;
-            self->connect();
+            self->connect(generation);
         });
 }
 
 // ── 内部：Watchdog ──────────────────────────────────────────────────
 
-void MediaStreamSession::startWatchdog() {
+void MediaStreamSession::startWatchdog(std::uint64_t generation) {
+    if (!isGenerationActive(generation) || watchdog_interval_ms_ <= 0) {
+        return;
+    }
     watchdog_timer_.expires_after(std::chrono::milliseconds(watchdog_interval_ms_));
     watchdog_timer_.async_wait(
-        [self = shared_from_this()](boost::system::error_code ec) {
-            self->onWatchdog(ec);
+        [self = shared_from_this(), generation](boost::system::error_code ec) {
+            self->onWatchdog(ec, generation);
         });
 }
 
-void MediaStreamSession::onWatchdog(const boost::system::error_code& ec) {
-    if (ec || !running_)
+void MediaStreamSession::onWatchdog(const boost::system::error_code& ec,
+                                    std::uint64_t generation) {
+    if (ec || !isGenerationActive(generation))
         return;
 
     auto now     = std::chrono::steady_clock::now();
@@ -355,24 +478,38 @@ void MediaStreamSession::onWatchdog(const boost::system::error_code& ec) {
     if (idle_ms > watchdog_interval_ms_) {
         LOG_WARN("Watchdog timeout: idle={}ms > interval={}ms", idle_ms, watchdog_interval_ms_);
         // Watchdog 超时触发重连
-        doReconnect();
+        doReconnect(generation);
         return;
     }
 
     // 继续下一轮检测
-    startWatchdog();
+    startWatchdog(generation);
 }
 
 // ── 统计 ────────────────────────────────────────────────────────────
 
 MediaStreamSession::Stats MediaStreamSession::GetStats() const {
-    return stats_;
+    std::lock_guard<std::mutex> lock(stats_mutex_);
+    Stats snapshot = stats_;
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - stats_window_start_).count();
+    if (elapsed_ms > 0 && stats_window_bytes_ > 0) {
+        // 1 bit/ms 等于 1 kbps，因此无需再乘除额外的 1000。
+        snapshot.bitrate = static_cast<double>(stats_window_bytes_) * 8.0 /
+                           static_cast<double>(elapsed_ms);
+    }
+    return snapshot;
 }
 
 // ── 状态 ────────────────────────────────────────────────────────────
 
 MediaStreamSession::State MediaStreamSession::GetState() const {
     return state_.load();
+}
+
+bool MediaStreamSession::isGenerationActive(std::uint64_t generation) const {
+    return running_.load() && generation_.load() == generation;
 }
 
 void MediaStreamSession::setState(State s) {

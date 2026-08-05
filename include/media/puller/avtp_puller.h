@@ -143,6 +143,7 @@ public:
     /// 返回 true 且 packet=nullptr 表示成功读取到一个非目标包/中间分片，
     /// 上层可以继续调下一次；返回 false 表示底层超时、关闭或错误。
     bool ReadPacket(std::shared_ptr<MediaPacket>& packet) override;
+    PullReadResult ReadPacketResult() override;
 
     /// @brief 返回 Open() 阶段缓存的流信息。
     MultiStreamInfo GetStreamInfo() const override;

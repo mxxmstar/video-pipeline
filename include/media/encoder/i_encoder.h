@@ -54,6 +54,22 @@ struct EncoderConfig {
     bool global_header{false};       // 是否在 extradata 中存储全局头信息
 };
 
+/// @brief 编码器实际输出轨道描述。
+///
+/// 节点和 Publisher 只依赖这份描述，不需要通过 dynamic_cast 访问 FFmpeg
+/// 私有对象。time_base 是编码器真正使用的时间基，extra_data 是当前编码会话
+/// 的 codec extradata 快照。
+struct EncodedTrackInfo {
+    MediaType media_type{MediaType::UNKNOWN};
+    CodecType codec_type{CodecType::UNKNOWN};
+    Rational time_base{1, 1000000};
+    int width{0};
+    int height{0};
+    int sample_rate{0};
+    int channels{0};
+    std::vector<std::uint8_t> extra_data;
+};
+
 // 编码器抽象接口
 class IEncoder {
 public:
@@ -63,6 +79,10 @@ public:
     virtual bool Open(const EncoderConfig& cfg) = 0;
     // 编码一帧数据，frame==nullptr 表示刷新（flush）编码器
     virtual bool Encode(FramePtr frame, std::vector<PacketPtr>& packets) = 0;
+    // 显式刷新编码器并返回所有残留 packet；Close 不负责向外输出 packet。
+    virtual bool Flush(std::vector<PacketPtr>& packets) = 0;
+    // 查询当前编码会话的实际输出描述。
+    virtual EncodedTrackInfo GetOutputInfo() const = 0;
     // 关闭编码器，释放资源
     virtual void Close() = 0;
 };

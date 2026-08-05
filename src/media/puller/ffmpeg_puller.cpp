@@ -25,22 +25,6 @@ extern "C" {
 
 namespace {
 
-AVRational ToAVRational(const Rational& rational) {
-    return AVRational{
-        rational.num > 0 ? rational.num : 1,
-        rational.den > 0 ? rational.den : AV_TIME_BASE,
-    };
-}
-
-int64_t TimestampToUs(int64_t timestamp, const Rational& time_base) {
-    if (timestamp == AV_NOPTS_VALUE) {
-        return 0;
-    }
-
-    constexpr AVRational kMicrosecondTimeBase{1, AV_TIME_BASE};
-    return av_rescale_q(timestamp, ToAVRational(time_base), kMicrosecondTimeBase);
-}
-
 } // namespace
 
 // ── ctor / dtor ────────────────────────────────────────────────────
@@ -72,6 +56,10 @@ std::string FFmpegPuller::BuildRtspTransportOption() const {
 // ── IPuller ─────────────────────────────────────────────────────────
 
 bool FFmpegPuller::Open(const std::string& url) {
+    // Open 允许被重连路径重复调用。先完整关闭上一次上下文，避免旧的
+    // AVFormatContext、codecpar 缓存和 packet 对象池与新连接交叉存在。
+    Close();
+
     // 1. 分配 FFmpeg 格式上下文
     fmt_ctx_ = avformat_alloc_context();
     if (!fmt_ctx_) {
@@ -231,10 +219,19 @@ void FFmpegPuller::Close() {
 }
 
 bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
+    const PullReadResult result = ReadPacketResult();
+    packet = result.packet;
+    return result.status == PullReadStatus::Packet ||
+           result.status == PullReadStatus::NoData;
+}
+
+IPuller::PullReadResult FFmpegPuller::ReadPacketResult() {
+    // 所有 FFmpeg I/O 都由同一把锁保护，Close() 可以通过设置中断标志
+    // 唤醒 av_read_frame，然后安全地等待这里释放格式上下文。
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (fmt_ctx_ == nullptr) {
-        LOG_ERROR("fmt_ctx_ is nullptr");
-        return false;
+        return {PullReadStatus::Stopped, nullptr, 0,
+                "FFmpeg puller is not open"};
     }
 
     // 从对象池分配一个临时packet
@@ -253,7 +250,8 @@ bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
     }
     if (!pkt) {
         LOG_ERROR("packet pool allocate failed");
-        return false;
+        return {PullReadStatus::FatalError, nullptr, AVERROR(ENOMEM),
+                "packet pool allocate failed"};
     }
 
     // 2. 读取一帧
@@ -270,25 +268,26 @@ bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
         }
         if (ret == AVERROR_EOF) {
             LOG_DEBUG("av_read_frame EOF");
-            return false;
+            return {PullReadStatus::EOS, nullptr, ret, "end of input"};
         }
         if (interrupt_ctx_.interrupted.load()) {
             LOG_DEBUG("av_read_frame interrupted");
-            return false;
+            return {PullReadStatus::Stopped, nullptr, ret,
+                    "FFmpeg read interrupted"};
         }
         bool transient_error = ret == AVERROR(EAGAIN) || interrupt_ctx_.timed_out.load();
 #ifdef ETIMEDOUT
         transient_error = transient_error || ret == AVERROR(ETIMEDOUT);
 #endif
         if (transient_error) {
-            packet = nullptr;
             LOG_DEBUG("av_read_frame timeout/transient error, keep reading");
-            return true;
+            return {PullReadStatus::RetryableError, nullptr, ret,
+                    "temporary FFmpeg read error"};
         }
         char buf[AV_ERROR_MAX_STRING_SIZE];
         av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret);
         LOG_ERROR("av_read_frame error: {}", buf);
-        return false;
+        return {PullReadStatus::FatalError, nullptr, ret, buf};
     }
 
     // 3. 只处理选中的视频流或音频流
@@ -300,8 +299,8 @@ bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
             std::lock_guard<std::mutex> pool_lock(pool_mutex_);
             packet_pool_.push_back(pkt);
         }
-        packet = nullptr;
-        return true;
+        return {PullReadStatus::NoData, nullptr, 0,
+                "packet belongs to an unselected stream"};
     }
     
     AVCodecParameters* stream_codecpar = codecpars_[stream_idx];
@@ -317,7 +316,8 @@ bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
             packet_pool_.push_back(pkt);
         }
         LOG_ERROR("av_packet_alloc failed");
-        return false;
+        return {PullReadStatus::FatalError, nullptr, AVERROR(ENOMEM),
+                "owned AVPacket allocation failed"};
     }
     av_packet_move_ref(owned, pkt);  // 转移 buffer/side-data，pkt 变空
     av_packet_unref(pkt);
@@ -339,10 +339,14 @@ bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
         stream->time_base.num,
         stream->time_base.den,
     };
-    mp->pts      = TimestampToUs(owned->pts, packet_time_base);
-    mp->dts      = TimestampToUs(owned->dts, packet_time_base);
-    mp->duration = TimestampToUs(owned->duration, packet_time_base);
-    mp->time_base = Rational{1, AV_TIME_BASE};
+    // 保留 demuxer 原始时间基。这样 packet 中的整数时间戳与 FFmpeg
+    // backend AVPacket 完全一致，跨节点传递时不会因为隐式转换丢精度。
+    mp->pts      = owned->pts == AV_NOPTS_VALUE ? kNoTimestamp : owned->pts;
+    mp->dts      = owned->dts == AV_NOPTS_VALUE ? kNoTimestamp : owned->dts;
+    mp->duration = owned->duration == AV_NOPTS_VALUE
+        ? kNoTimestamp
+        : owned->duration;
+    mp->time_base = packet_time_base;
     mp->keyframe = is_keyframe;
 
     mp->buffer = std::make_shared<FFmpegPacketBuffer>(owned);
@@ -350,8 +354,7 @@ bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
     mp->backend.type = BackendHandle::FFMPEG;
     mp->backend.ptr  = std::static_pointer_cast<FFmpegPacketBuffer>(mp->buffer)->GetPacket();
 
-    packet = std::move(mp);
-    return true;
+    return PullReadResult::PacketResult(std::move(mp));
 }
 
 MultiStreamInfo FFmpegPuller::GetStreamInfo() const {

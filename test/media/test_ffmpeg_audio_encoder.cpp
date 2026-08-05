@@ -73,7 +73,17 @@ int main() {
     for (int i = 0; i < 8; ++i) {
         assert(encoder.Encode(MakeS16AudioFrame(i), packets));
     }
-    assert(encoder.Encode(nullptr, packets));
+    // A0 后停止流程必须通过显式 Flush 取出编码器/FIFO 中的尾部 packet，
+    // Close 只负责释放资源，不再承担隐式输出职责。
+    assert(encoder.Flush(packets));
+
+    const auto output_info = encoder.GetOutputInfo();
+    assert(output_info.media_type == MediaType::AUDIO);
+    assert(output_info.codec_type == CodecType::AAC);
+    assert(output_info.time_base.num == 1);
+    assert(output_info.time_base.den == 1'000'000);
+    assert(output_info.sample_rate == kSampleRate);
+    assert(output_info.channels == kChannels);
 
     std::size_t audio_packets = 0;
     for (const auto& packet : packets) {
@@ -82,6 +92,9 @@ int main() {
         }
         assert(packet->type == MediaType::AUDIO);
         assert(packet->codec == CodecType::AAC);
+        assert(packet->stream_index == 0);
+        assert(packet->time_base.num == output_info.time_base.num);
+        assert(packet->time_base.den == output_info.time_base.den);
         assert(packet->buffer);
         assert(packet->buffer->Size() > 0);
         ++audio_packets;

@@ -749,3 +749,54 @@ ctest --test-dir build -C Debug --output-on-failure
 `Source -> Decode -> Encode -> Publish` 具备明确的轨道、时间、代次、背压、错误和
 停止契约，再扩展业务分支。这样 MediaFlow 才真正接管流程编排，而不是只在现有回调
 链外再包一层类。
+
+## 17. A0 实施记录
+
+### 17.1 已完成修改
+
+本节只记录本次实际落地的 A0 修改。尚未实现的多轨发布、关键帧恢复和图级有序
+停止仍保留在后续阶段，不视为本次完成项。
+
+| 领域 | 实际修改 | 主要文件 |
+|---|---|---|
+| 媒体类型 | 将 `MediaType` 改为显式唯一值：`UNKNOWN=0`、`VIDEO=1`、`AUDIO=2`、`PCAP=3`，消除未知类型与视频冲突 | `include/media/media_packet.h` |
+| 时间戳契约 | 增加 `kNoTimestamp`、时间戳有效性和时间基校验；`MediaPacket` 时间戳统一解释为 `time_base` tick，`MediaFrame` 继续使用微秒 | `include/media/media_packet.h`、`include/media/media_frame.h` |
+| FFmpeg 拉流 | `Open()` 重复调用前先关闭旧上下文；输出 packet 保留 demuxer 原始时间基；读取结果区分 `EOS`、暂时错误、致命错误和主动停止 | `src/media/puller/ffmpeg_puller.cpp` |
+| AVTP 拉流 | 保留旧 `bool ReadPacket()`，新增结构化读取结果适配，区分无数据、可重试读取和已关闭 | `include/media/puller/i_puller.h`、`include/media/puller/avtp_puller.h`、`src/media/puller/avtp_puller.cpp` |
+| Puller 公共接口 | 增加 `PullReadStatus` 和 `PullReadResult`；旧接口继续保留，避免现有手工链路一次性迁移 | `include/media/puller/i_puller.h` |
+| Session 生命周期 | 为 Start/Stop/重连/read/timer handler 引入 generation；CONNECTING 可停止；流信息回调改为锁内快照；旧代次回调不能进入新代次 | `include/media/stream/stream_session.h`、`src/media/stream/stream_session.cpp` |
+| Session 统计 | 实际累计字节、包数、码率、重连次数和 jitter 丢弃数；查询返回受锁保护的快照 | `include/media/stream/stream_session.h`、`src/media/stream/stream_session.cpp` |
+| Decoder 生命周期 | 增加显式 `Flush()`；`Open()` 先关闭旧上下文；`Close()` 不再隐式回调残留帧；输入 packet 的来源时间基不同时显式重标定 | `include/media/decoder/i_decoder.h`、`include/media/decoder/ffmpeg_decoder.h`、`src/media/decoder/ffmpeg_decoder.cpp` |
+| Encoder 生命周期 | 增加显式 `Flush()` 和 `EncodedTrackInfo`；`Close()` 不再静默丢弃 flush packet | `include/media/encoder/i_encoder.h`、`include/media/encoder/ffmpeg_encoder.h`、`src/media/encoder/ffmpeg_encoder.cpp` |
+| Encoder 时间与元数据 | 修正视频帧率时间基、Frame 微秒 PTS 到 codec time base 的换算、音频 FIFO PTS 累加；输出 packet 自动填写 stream、time base、duration 和 keyframe | `src/media/encoder/ffmpeg_encoder.cpp` |
+| Encoder 选择 | 优先使用 FFmpeg 默认 codec encoder，避免平台专用 AAC 编码器因采样率限制导致同一配置在不同机器上行为不同 | `src/media/encoder/ffmpeg_encoder.cpp` |
+| Jitter 时间轴 | 无效时间戳不再参与排序；合法非微秒时间基先换算到微秒轴 | `src/media/stream/jitterbuffer/adaptive_jitter_buffer.cpp` |
+
+### 17.2 验证结果
+
+- 配置环境：Visual Studio 2026 Community，使用 `VsDevCmd.bat -arch=x64 -host_arch=x64` 初始化工具链。
+- 构建：现有 `build` 目录的 Debug 目标完整构建通过，`video_pipeline_lib` 及全部测试目标均成功链接。
+- 回归测试：`test_mediaflow`、`test_publisher_protocol`、`test_ffmpeg_audio_encoder`、`test_ffmpeg_decoder_raw_packet` 共 4 项通过。
+- 扩展本地回归：排除外部流、摄像头、AVTP 网卡、图形窗口和推理模型依赖后，共 21 项测试通过。
+- AAC 编码测试验证了 16 kHz 输入、flush 输出和 packet 元数据；原始 FFmpeg packet 解码测试验证了保留 stream time base 后仍可正常解码。
+- 尚未执行依赖摄像头、网络服务、图形设备或 AVTP 网卡的集成测试，因此本次验证不覆盖外部服务故障恢复。
+
+### 17.3 尚未完成项
+
+以下内容仍按原计划进入后续 P0/A1-A3，不应被当前 A0 记录替代：
+
+| 项目 | 当前状态 | 后续阶段 |
+|---|---|---|
+| FFmpeg 多轨显式选轨和独立路由 | Puller 仍可输出多个同类型 stream，`MultiStreamInfo` 仍需完善 selected track 契约 | A1 |
+| Publisher 重连后的等待关键帧状态 | `PublisherResult` 和 Publisher 内部状态尚未完整区分 AwaitingKeyframe 与 Closed | A2 |
+| RTSP 多轨唯一匹配 | 同 codec 多候选的显式 track 拒绝策略尚未完成 | A2/A3 |
+| FFmpeg 多轨交织 | mux 的 interleaved write 和有界 DTS 重排尚未实施 | A3 |
+| Graph Graceful Stop | MediaFlow 仍需 pending-task barrier、拓扑逆序停止和逐级 Flush 屏障 | A3 |
+| SourceNode、DecoderNode、EncoderNode、PublisherSinkNode | A0 只修复底层契约，媒体适配节点尚未接入主链路 | A1/A2 |
+
+### 17.4 A0 后的接入约束
+
+后续节点实现必须直接使用本节已经落地的契约：读取循环按 `PullReadStatus` 分支，
+节点代次由消息上下文携带，Decoder/Encoder 在停止屏障中显式 Flush，Publisher 使用
+`EncodedTrackInfo` 和 packet 自带 `time_base`。测试中不得再通过手工覆盖 packet 的
+`stream_index` 或 `time_base` 来掩盖适配层缺失。

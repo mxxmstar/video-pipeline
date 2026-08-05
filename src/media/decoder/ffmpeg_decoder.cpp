@@ -39,7 +39,7 @@ AVRational FrameTimeBase(const AVFrame* frame, const MediaStreamInfo& stream_inf
 
 int64_t TimestampToUs(int64_t timestamp, AVRational time_base) {
     if (timestamp == AV_NOPTS_VALUE) {
-        return 0;
+        return kNoTimestamp;
     }
 
     constexpr AVRational kMicrosecondTimeBase{1, AV_TIME_BASE};
@@ -64,6 +64,10 @@ FFmpegDecoder::~FFmpegDecoder() {
 // ── IDecoder ─────────────────────────────────────────────────────────
 
 bool FFmpegDecoder::Open(const MediaStreamInfo& info) {
+    // Open 可能被重连/重建路径重复调用。先关闭旧上下文，保证 extradata、
+    // codec 状态和旧回调不会泄漏到新一代媒体流。
+    Close();
+
     if (info.codec_type == CodecType::UNKNOWN) {
         LOG_ERROR("FFmpegDecoder:Open rejected: unknown codec");
         return false;
@@ -149,12 +153,26 @@ bool FFmpegDecoder::Open(const MediaStreamInfo& info) {
     return true;
 }
 
+bool FFmpegDecoder::Flush() {
+    if (!codec_ctx_) {
+        return true;
+    }
+
+    // FFmpeg 的 send/receive API 要求通过 nullptr 明确进入 drain 状态。
+    // 这里只负责输出残留帧，不释放上下文，便于调用方在需要时继续查询状态。
+    const int ret = avcodec_send_packet(codec_ctx_, nullptr);
+    if (ret < 0 && ret != AVERROR_EOF) {
+        char buf[AV_ERROR_MAX_STRING_SIZE];
+        av_make_error_string(buf, AV_ERROR_MAX_STRING_SIZE, ret);
+        LOG_ERROR("FFmpegDecoder:Flush: avcodec_send_packet failed: {}", buf);
+        return false;
+    }
+    return ReceiveFrames();
+}
+
 void FFmpegDecoder::Close() {
     if (codec_ctx_) {
-        // 冲刷解码器残留帧
-        avcodec_send_packet(codec_ctx_, nullptr);
-        (void)ReceiveFrames();
-
+        // Close 只释放资源，不再隐式触发回调。需要保留尾帧时必须先显式 Flush。
         avcodec_free_context(&codec_ctx_);
         codec_ctx_ = nullptr;
     }
@@ -177,6 +195,31 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
     AVPacket* temporary_packet = nullptr;
     if (packet->backend.type == BackendHandle::FFMPEG) {
         avpkt = static_cast<AVPacket*>(packet->backend.ptr);
+        if (!avpkt) {
+            LOG_ERROR("FFmpegDecoder:Decode: backend AVPacket is null");
+            return false;
+        }
+
+        // AVPacket 自身不携带 time_base，MediaPacket 才是跨节点的时间基契约。
+        // 来源和 decoder time base 不一致时先做引用拷贝再重标定，避免修改
+        // 上游共享 packet，也避免 FFmpeg 把错误 tick 当成当前 codec 的时间轴。
+        const AVRational source_time_base = ToAVRational(packet->time_base);
+        const AVRational decoder_time_base = IsValidTimeBase(codec_ctx_->pkt_timebase)
+            ? codec_ctx_->pkt_timebase
+            : source_time_base;
+        if (source_time_base.num != decoder_time_base.num ||
+            source_time_base.den != decoder_time_base.den) {
+            temporary_packet = av_packet_alloc();
+            if (!temporary_packet || av_packet_ref(temporary_packet, avpkt) < 0) {
+                av_packet_free(&temporary_packet);
+                LOG_ERROR("FFmpegDecoder:Decode: AVPacket timestamp copy failed");
+                return false;
+            }
+            av_packet_rescale_ts(temporary_packet,
+                                 source_time_base,
+                                 decoder_time_base);
+            avpkt = temporary_packet;
+        }
     } else {
         const std::size_t packet_size = packet->buffer->Size();
         if (!packet->buffer->Data() || packet_size == 0 ||
@@ -216,12 +259,6 @@ bool FFmpegDecoder::Decode(std::shared_ptr<MediaPacket> packet) {
             temporary_packet->flags |= AV_PKT_FLAG_KEY;
         }
         avpkt = temporary_packet;
-    }
-
-    if (!avpkt) {
-        av_packet_free(&temporary_packet);
-        LOG_ERROR("backend AVPacket is null");
-        return false;
     }
 
     const int ret = avcodec_send_packet(codec_ctx_, avpkt);

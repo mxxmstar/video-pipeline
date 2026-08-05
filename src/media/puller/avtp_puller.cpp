@@ -642,6 +642,25 @@ bool AvtpPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {
     return ReadOneMediaPacket(packet);
 }
 
+IPuller::PullReadResult AvtpPuller::ReadPacketResult() {
+    std::shared_ptr<MediaPacket> packet;
+    if (ReadPacket(packet)) {
+        if (packet) {
+            return PullReadResult::PacketResult(std::move(packet));
+        }
+        return {PullReadStatus::NoData, nullptr, 0,
+                "AVTP packet filtered or access unit is incomplete"};
+    }
+
+    // EthernetCapture 的超时在旧接口中表现为 false；只要捕获器仍存在，
+    // 就把它解释为可重试状态。Close() 会释放 capture_，从而准确映射为 Stopped。
+    if (capture_) {
+        return {PullReadStatus::RetryableError, nullptr, 0,
+                "AVTP capture read timeout or transient error"};
+    }
+    return {PullReadStatus::Stopped, nullptr, 0, "AVTP puller is closed"};
+}
+
 bool AvtpPuller::ReadOneMediaPacket(std::shared_ptr<MediaPacket>& packet) {
     packet.reset();
     if (!capture_) {

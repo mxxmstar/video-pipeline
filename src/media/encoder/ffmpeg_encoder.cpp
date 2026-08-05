@@ -176,10 +176,17 @@ bool FFmpegEncoder::Open(const EncoderConfig& cfg) {
 
     // 设置编码参数
     codec_ctx_->codec_id = codec_id;
+    // 用户提供完整 time base 时完全尊重配置；未提供时按媒体类型推导。
+    // 视频帧率是 fps_num/fps_den，对应时间基必须是 fps_den/fps_num。
+    const int default_time_base_num =
+        cfg.media_type == MediaType::VIDEO ? cfg.video.fps_den : 1;
+    const int default_time_base_den =
+        cfg.media_type == MediaType::VIDEO
+            ? cfg.video.fps_num
+            : cfg.audio.sample_rate;
     codec_ctx_->time_base = AVRational{
-        cfg.time_base_num > 0 ? cfg.time_base_num : 1,
-        cfg.time_base_den > 0 ? cfg.time_base_den :
-            (cfg.media_type == MediaType::AUDIO ? cfg.audio.sample_rate : cfg.video.fps_num)
+        cfg.time_base_num > 0 ? cfg.time_base_num : default_time_base_num,
+        cfg.time_base_den > 0 ? cfg.time_base_den : default_time_base_den,
     };
     codec_ctx_->bit_rate = cfg.bitrate;
     codec_ctx_->thread_count = 1;
@@ -323,6 +330,12 @@ bool FFmpegEncoder::Encode(FramePtr frame, std::vector<PacketPtr>& packets) {
     return ReceivePackets(packets);
 }
 
+bool FFmpegEncoder::Flush(std::vector<PacketPtr>& packets) {
+    // 将显式 Flush 统一转到现有 Encode(nullptr) 路径，保证视频和音频
+    // 都遵守同一个“输出全部残留 packet 后再 Close”的调用契约。
+    return Encode(nullptr, packets);
+}
+
 // 关闭编码器，释放所有资源
 void FFmpegEncoder::Close() {
     if (audio_fifo_) {
@@ -330,10 +343,8 @@ void FFmpegEncoder::Close() {
         audio_fifo_ = nullptr;
     }
     if (codec_ctx_) {
-        // flush 编码器并丢弃剩余包
-        std::vector<PacketPtr> ignored;
-        (void)avcodec_send_frame(codec_ctx_, nullptr);
-        (void)ReceivePackets(ignored);
+        // Close 不再隐式 Flush。调用方如果需要尾部 packet，必须在停止屏障中
+        // 先调用 Flush；这样不会出现 Close 回调已经结束但尾包被静默丢弃。
         avcodec_free_context(&codec_ctx_);
         codec_ctx_ = nullptr;
     }
@@ -344,6 +355,29 @@ void FFmpegEncoder::Close() {
     encoder_sample_fmt_ = AV_SAMPLE_FMT_NONE;
     next_pts_ = 0;
     next_audio_pts_ = -1;
+}
+
+EncodedTrackInfo FFmpegEncoder::GetOutputInfo() const {
+    EncodedTrackInfo info;
+    info.media_type = config_.media_type;
+    info.codec_type = config_.codec_type;
+    if (codec_ctx_) {
+        info.time_base = Rational{codec_ctx_->time_base.num,
+                                  codec_ctx_->time_base.den};
+        if (config_.media_type == MediaType::VIDEO) {
+            info.width = codec_ctx_->width;
+            info.height = codec_ctx_->height;
+        } else if (config_.media_type == MediaType::AUDIO) {
+            info.sample_rate = codec_ctx_->sample_rate;
+            info.channels = codec_ctx_->ch_layout.nb_channels;
+        }
+        if (codec_ctx_->extradata && codec_ctx_->extradata_size > 0) {
+            info.extra_data.assign(
+                codec_ctx_->extradata,
+                codec_ctx_->extradata + codec_ctx_->extradata_size);
+        }
+    }
+    return info;
 }
 
 std::vector<std::uint8_t> FFmpegEncoder::GetExtraData() const {
@@ -389,9 +423,16 @@ bool FFmpegEncoder::ReceivePackets(std::vector<PacketPtr>& packets) {
         auto media_packet = std::make_shared<MediaPacket>();
         media_packet->type = config_.media_type;
         media_packet->codec = config_.codec_type;
-        media_packet->pts = pkt->pts;
-        media_packet->dts = pkt->dts;
-        media_packet->duration = pkt->duration;
+        // 编码器输出的 packet 已经位于 codec_ctx_->time_base 中，直接保留
+        // tick；AV_NOPTS_VALUE 映射为公共层统一的 kNoTimestamp。
+        media_packet->pts = pkt->pts == AV_NOPTS_VALUE ? kNoTimestamp : pkt->pts;
+        media_packet->dts = pkt->dts == AV_NOPTS_VALUE ? kNoTimestamp : pkt->dts;
+        media_packet->duration = pkt->duration == AV_NOPTS_VALUE
+            ? kNoTimestamp
+            : pkt->duration;
+        media_packet->stream_index = 0;
+        media_packet->time_base = Rational{codec_ctx_->time_base.num,
+                                           codec_ctx_->time_base.den};
         media_packet->keyframe = (pkt->flags & AV_PKT_FLAG_KEY) != 0;
         media_packet->buffer = pkt_buffer;
         media_packet->backend.type = BackendHandle::FFMPEG;
@@ -498,9 +539,13 @@ bool FFmpegEncoder::EncodeAudioFrame(FramePtr frame,
             next_audio_pts_ = 0;
         }
         output->pts = next_audio_pts_;
-        next_audio_pts_ +=
-            static_cast<int64_t>(nb_samples) * 1'000'000LL /
-            std::max(1, codec_ctx_->sample_rate);
+        // FIFO 中消耗的是样本数，但 packet PTS 使用 codec_ctx_->time_base。
+        // 对常见的 1/sample_rate 和显式的 1/1000000 都通过同一换算处理，
+        // 避免把“样本 tick”误当成“微秒 tick”而造成长时间 A/V 漂移。
+        next_audio_pts_ += av_rescale_q(
+            nb_samples,
+            AVRational{1, std::max(1, codec_ctx_->sample_rate)},
+            codec_ctx_->time_base);
 
         const bool ok = SendFrameToEncoder(output, packets);
         av_frame_free(&output);
@@ -578,6 +623,21 @@ const AVCodec* FFmpegEncoder::FindVideoEncoder(AVCodecID codec_id, AVPixelFormat
         return nullptr;
     }
 
+    // 优先使用 FFmpeg 为该 codec 注册的默认编码器。Windows 上编码器枚举
+    // 顺序可能把 aac_mf 放在软件 AAC 前面，而 MFT 对采样率支持不完整，
+    // 直接遍历会让同一配置在不同机器上得到不同结果。
+    if (const AVCodec* preferred = avcodec_find_encoder(codec_id)) {
+        if (accepts(preferred, input_fmt)) {
+            encoder_fmt = input_fmt;
+            return preferred;
+        }
+        if (input_fmt == AV_PIX_FMT_YUV420P &&
+            accepts(preferred, AV_PIX_FMT_NV12)) {
+            encoder_fmt = AV_PIX_FMT_NV12;
+            return preferred;
+        }
+    }
+
     // 遍历所有编码器
     const AVCodec* fallback = nullptr;
     void* iter = nullptr;
@@ -625,6 +685,14 @@ const AVCodec* FFmpegEncoder::FindAudioEncoder(AVCodecID codec_id, AVSampleForma
     if (!encoder_name.empty()) {
         const AVCodec* named = avcodec_find_encoder_by_name(encoder_name.c_str());
         return choose_format(named) ? named : nullptr;
+    }
+
+    // 与视频编码器一致，先采用 FFmpeg 默认实现，避免平台专用 MFT 因
+    // 采样率/布局限制抢占同 codec 的通用软件实现。
+    if (const AVCodec* preferred = avcodec_find_encoder(codec_id)) {
+        if (choose_format(preferred)) {
+            return preferred;
+        }
     }
 
     // 遍历所有编码器
@@ -1238,8 +1306,12 @@ bool FFmpegEncoder::CopyPackedAudioFrameToAVFrame(const MediaFrame& src, AVFrame
 }
 
 int64_t FFmpegEncoder::ResolveFramePts(const MediaFrame& frame) {
-    if (frame.time.pts_us != 0 || next_pts_ == 0) {
-        const int64_t pts = frame.time.pts_us;
+    if (IsValidTimestamp(frame.time.pts_us)) {
+        // MediaFrame 明确使用微秒，送入 FFmpeg 前必须换算到编码器 time_base。
+        const int64_t pts = av_rescale_q(
+            frame.time.pts_us,
+            AVRational{1, 1'000'000},
+            codec_ctx_ ? codec_ctx_->time_base : AVRational{1, 1'000'000});
         next_pts_ = std::max(next_pts_, pts + 1);
         return pts;
     }

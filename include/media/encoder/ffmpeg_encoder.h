@@ -22,6 +22,8 @@ public:
 
     bool Open(const EncoderConfig& cfg) override;
     bool Encode(FramePtr frame, std::vector<PacketPtr>& packets) override;
+    bool Flush(std::vector<PacketPtr>& packets) override;
+    EncodedTrackInfo GetOutputInfo() const override;
     void Close() override;
 
     std::vector<std::uint8_t> GetExtraData() const;

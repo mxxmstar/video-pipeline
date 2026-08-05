@@ -40,7 +40,7 @@ struct MediaStreamInfo {
     MediaType media_type   = MediaType::UNKNOWN; ///< 媒体类型（视频/音频）
     CodecType codec_type   = CodecType::UNKNOWN; ///< 编码格式（H264/H265/AAC/…）
     int       stream_index = -1;                  ///< 流索引
-    Rational time_base{1, 1000000}; ///< 时间基（微秒/单位）
+    Rational time_base{1, 1000000}; ///< 时间戳使用的时间基；时间戳为该基准下的 tick
     std::vector<uint8_t> extra_data; ///< 额外数据（如 H.264 SPS/PPS）
     std::variant<VideoStreamInfo, AudioStreamInfo> detail;
 
