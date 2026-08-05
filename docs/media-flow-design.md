@@ -2,7 +2,7 @@
 
 本文档评估并设计将用户指定的源框架迁移到当前 `video-pipeline` 工程的方案。迁移后的模块命名为 `MediaFlow`。目标不是替换现有媒体、推理和发布模块，而是在其上增加统一的 Pipeline 编排与执行层，使拉流、解码、推理、编码、发布和渲染能够通过类型安全的图进行组合。
 
-最后更新：2026-08-04。
+最后更新：2026-08-05。
 
 ## 1. 结论
 
@@ -522,22 +522,38 @@ target_link_libraries(video_pipeline_mediaflow INTERFACE
 
 ## 10. 已知问题与改进方案
 
-| 优先级 | 问题 | 影响 | 推荐改进 |
-|---|---|---|---|
-| P0 | 队列命名空间和 `full()` 接口不兼容 | 无法直接编译 | 增加 MediaFlow 内部 Mailbox 适配，不覆盖现有 common queue |
-| P0 | SPSC 的 `DropOldest` 由生产侧 `pop()` | 并发未定义、可能丢错数据或破坏队列 | DropOldest 改用 MPMC/覆盖 Ring；SPSC 只用 Block/DropNewest |
-| P0 | Transport Close 后无 Open 路径 | Graph 无法可靠重启 | 给 Transport/Edge 增加 Open/Clear，并纳入 Start 回滚测试 |
-| P0 | Dispatch 队列无界 | 慢节点导致内存持续增长 | 增加 `max_pending_tasks`、batch Drain 和明确溢出策略 |
-| P0 | Init/Start 部分失败回滚不完整 | 资源泄漏、节点状态不一致 | 记录已完成阶段并逆序回滚 |
-| P1 | DropFrameScheduler 等同 FIFO | 配置名与实际行为不一致 | 实现 latency/keyframe-aware 策略，未实现前移除或标记 experimental |
-| P1 | Drain 一次排空整个 Edge | 公平性差，并把压力转移到 Dispatch | 增加 batch/time budget 和轮转调度 |
-| P1 | Node 指标按目标节点聚合 | 无法定位具体拥塞 Edge | 增加 EdgeMetrics 和 queue high watermark |
-| P1 | bool 返回值错误信息不足 | 构图和启动失败难排查 | 使用 `PipelineResult`/`FlowError` 结构化错误 |
-| P1 | 源框架顶层命名空间过宽 | 易与依赖或应用代码冲突 | 统一为 `mediaflow` |
-| P1 | DirectTransport 语义不清 | 线程模型误判 | 区分 Inline 与 ExecutorDispatch 两种 Transport |
-| P1 | 多下游共享消息可变 | 数据竞争或结果互相污染 | 默认只读消息；修改时 copy-on-write 或新 Buffer |
-| P2 | 全局 Asio Pool Manager | 多 Pipeline 生命周期互相影响 | 上移到 PipelineManager，显式注入 executor |
-| P2 | Graph 拓扑在运行期间未冻结 | 并发 Add/Connect 不安全 | Build 后 Freeze，运行期禁止修改 |
+| 优先级 | 问题 | 影响 | 推荐改进 | 状态 |
+|---|---|---|---|---|
+| P0 | 队列命名空间和 `full()` 接口不兼容 | 无法直接编译 | 增加 MediaFlow 内部 Mailbox 适配，不覆盖现有 common queue | 已完成：核心使用自有互斥保护有界队列 |
+| P0 | SPSC 的 `DropOldest` 由生产侧 `pop()` | 并发未定义、可能丢错数据或破坏队列 | DropOldest 改用 MPMC/覆盖 Ring；SPSC 只用 Block/DropNewest | 已完成：DropOldest 在受 mutex 保护的队列内淘汰队首 |
+| P0 | Transport Close 后无 Open 路径 | Graph 无法可靠重启 | 给 Transport/Edge 增加 Open/Clear，并纳入 Start 回滚测试 | 已完成：Transport/Edge 支持 Open/Close，Close 清空残留消息 |
+| P0 | Dispatch 队列无界 | 慢节点导致内存持续增长 | 增加 `max_pending_tasks`、batch Drain 和明确溢出策略 | 已完成：节点任务有界、Edge 支持 batch/time budget，超限拒绝 |
+| P0 | Init/Start 部分失败回滚不完整 | 资源泄漏、节点状态不一致 | 记录已完成阶段并逆序回滚 | 已完成：Init、Executor Start、Node Start 均有逆序回滚 |
+| P1 | DropFrameScheduler 等同 FIFO | 配置名与实际行为不一致 | 实现 latency/keyframe-aware 策略，未实现前移除或标记 experimental | 延后：当前核心未接入或暴露该调度器 |
+| P1 | Drain 一次排空整个 Edge | 公平性差，并把压力转移到 Dispatch | 增加 batch/time budget 和轮转调度 | 部分完成：已增加 batch/time budget，轮转调度延后 |
+| P1 | Node 指标按目标节点聚合 | 无法定位具体拥塞 Edge | 增加 EdgeMetrics 和 queue high watermark | 已完成：Edge 有独立计数、当前深度和 high watermark |
+| P1 | bool 返回值错误信息不足 | 构图和启动失败难排查 | 使用 `PipelineResult`/`FlowError` 结构化错误 | 已完成：Graph 提供 `FlowError` 和 `LastError()` |
+| P1 | 源框架顶层命名空间过宽 | 易与依赖或应用代码冲突 | 统一为 `mediaflow` | 已完成：核心 API 统一使用 `mediaflow` |
+| P1 | DirectTransport 语义不清 | 线程模型误判 | 区分 Inline 与 ExecutorDispatch 两种 Transport | 已完成：新增 `ExecutorDispatchTransport`，保留兼容别名 |
+| P1 | 多下游共享消息可变 | 数据竞争或结果互相污染 | 默认只读消息；修改时 copy-on-write 或新 Buffer | 延后：当前保持只读约定，后续补消息所有权契约 |
+| P2 | 全局 Asio Pool Manager | 多 Pipeline 生命周期互相影响 | 上移到 PipelineManager，显式注入 executor | 延后：当前由 Graph 显式注入 Executor |
+| P2 | Graph 拓扑在运行期间未冻结 | 并发 Add/Connect 不安全 | Build 后 Freeze，运行期禁止修改 | 已完成：首次成功 Start 后禁止 AddNode/Connect |
+
+### 10.1 P0/P1 实施记录（2026-08-05）
+
+本阶段先处理核心可直接承载的已知问题，实际改动如下：
+
+- `include/mediaflow/core/transport.h`：新增正确的有界队列生命周期；`Close()` 清空队列并拒绝新消息，`Open()` 清理旧消息后重新打开；`DropOldest` 不再依赖生产侧并发消费；将无中间队列的传输命名为 `ExecutorDispatchTransport`。
+- `include/mediaflow/core/graph.h`：为 Edge 增加稳定 ID、独立统计、队列 high watermark、批量和时间预算；为 Graph 增加参数校验、结构化错误、启动失败回滚和成功启动后的拓扑冻结；边的 Transport 回调使用弱引用，避免 Transport 自引用造成生命周期泄漏。
+- `include/mediaflow/core/types.h`：增加 `FlowError`、`FlowErrorCode`、`EdgeMetricsSnapshot`，并扩展 Edge 的时间预算配置。
+- `test/mediaflow/test_mediaflow.cpp`：覆盖 Close/Open、ExecutorDispatch、构图错误、拓扑冻结、Init/Start 回滚、有界 Dispatch、Edge 统计和连续 100 次重启。
+
+验证结果：
+
+- 使用 Visual Studio 2026 开发者环境构建 `test_mediaflow` 成功。
+- `ctest --test-dir build-mediaflow-vs -R "^test_mediaflow$" --repeat until-fail:20 --output-on-failure` 连续 20 次通过。
+
+仍未在本阶段实现的内容：DropFrameScheduler 的延迟/关键帧感知策略、真正的轮转公平调度、多下游消息可变性约束、PipelineManager 和媒体业务适配节点。这些项目继续按 M1 至 M3 计划推进，不能以当前核心测试结果代替媒体链路集成验收。
 
 ## 11. 可观测性
 

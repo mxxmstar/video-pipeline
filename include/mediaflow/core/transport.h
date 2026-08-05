@@ -138,6 +138,9 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             closed_ = true;
+            // Close 是立即停止语义的一部分，释放尚未处理的消息，避免 Graph
+            // 停止后仍然长期持有大帧或大 packet 的内存。
+            queue_.clear();
         }
         space_cv_.notify_all();
     }
@@ -178,14 +181,14 @@ private:
 };
 
 /**
- * @brief 不缓存消息的同步 Transport。
+ * @brief 不缓存消息、但投递到下游 Executor 的 Transport。
  *
- * DirectTransport 仍然通过下游 NodeContext::Dispatch 把业务处理投递到
+ * ExecutorDispatchTransport 仍然通过下游 NodeContext::Dispatch 把业务处理投递到
  * 目标执行器，因此它只省略中间队列，不会让媒体处理逻辑意外跑在发送方
  * 线程中。它适合低延迟或明确要求无缓冲的边，不适合可能阻塞的网络写入。
  */
 template <typename T>
-class DirectTransport final : public ITransport<T> {
+class ExecutorDispatchTransport final : public ITransport<T> {
 public:
     using Consumer = std::function<void(T)>;
 
@@ -265,5 +268,9 @@ private:
     typename ITransport<T>::NotifyCallback notify_callback_;
     typename ITransport<T>::SendResultCallback send_result_callback_;
 };
+
+/// 兼容早期代码的名称；新代码应使用 ExecutorDispatchTransport。
+template <typename T>
+using DirectTransport = ExecutorDispatchTransport<T>;
 
 } // namespace mediaflow

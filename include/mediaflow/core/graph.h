@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -49,6 +50,42 @@ struct NodeMetrics {
             errors.load(),
             pending_tasks.load(),
             max_pending_tasks.load(),
+        };
+    }
+};
+
+/// 单条 Edge 的原子统计，统计范围独立于目标节点。
+struct EdgeMetrics {
+    std::atomic<std::uint64_t> accepted{0};
+    std::atomic<std::uint64_t> dropped_newest{0};
+    std::atomic<std::uint64_t> dropped_oldest{0};
+    std::atomic<std::uint64_t> rejected{0};
+    std::atomic<std::uint64_t> schedules{0};
+    std::atomic<std::uint64_t> drain_batches{0};
+    std::atomic<std::uint64_t> drained{0};
+    std::atomic<std::size_t> queue_size{0};
+    std::atomic<std::size_t> queue_high_watermark{0};
+
+    /// 更新当前队列深度，并用 CAS 保留历史最高水位。
+    void UpdateQueueSize(std::size_t size) {
+        queue_size.store(size);
+        auto previous = queue_high_watermark.load();
+        while (size > previous &&
+               !queue_high_watermark.compare_exchange_weak(previous, size)) {
+        }
+    }
+
+    EdgeMetricsSnapshot Snapshot() const {
+        return EdgeMetricsSnapshot{
+            accepted.load(),
+            dropped_newest.load(),
+            dropped_oldest.load(),
+            rejected.load(),
+            schedules.load(),
+            drain_batches.load(),
+            drained.load(),
+            queue_size.load(),
+            queue_high_watermark.load(),
         };
     }
 };
@@ -236,6 +273,8 @@ private:
 class IEdge : public std::enable_shared_from_this<IEdge> {
 public:
     virtual ~IEdge() = default;
+    virtual const std::string& Id() const = 0;
+    virtual EdgeMetricsSnapshot Metrics() const = 0;
     virtual void Open() = 0;       ///< 打开并清空底层 Transport。
     virtual void Close() = 0;      ///< 关闭 Transport，拒绝新的发送。
     virtual bool Empty() const = 0;
@@ -260,9 +299,10 @@ public:
          EdgeOptions options)
         : destination_(std::move(destination)),
           input_(input),
-          options_(options) {
-        if (options_.transport == TransportKind::Direct) {
-            auto direct = std::make_shared<DirectTransport<T>>();
+          options_(options),
+          metrics_(std::make_shared<EdgeMetrics>()) {
+        if (options_.transport == TransportKind::ExecutorDispatch) {
+            auto direct = std::make_shared<ExecutorDispatchTransport<T>>();
             direct->SetConsumer([destination = destination_, input = input_](T value) {
                 destination->Dispatch([input, value = std::move(value)]() mutable {
                     input->Receive(std::move(value));
@@ -275,23 +315,49 @@ public:
                 options_.backpressure);
         }
 
-        transport_->SetSendResultCallback([metrics = destination_->metrics](MailboxPushResult result) {
+        // Transport 会持有回调；回调不能再强引用 Transport，否则边销毁后会
+        // 形成 transport -> callback -> transport 的环，导致队列和媒体载荷泄漏。
+        std::weak_ptr<ITransport<T>> weak_transport = transport_;
+        transport_->SetSendResultCallback([
+                edge_metrics = metrics_,
+                node_metrics = destination_->metrics,
+                weak_transport](MailboxPushResult result) {
             switch (result) {
             case MailboxPushResult::Accepted:
-                metrics->enqueued.fetch_add(1);
+                edge_metrics->accepted.fetch_add(1);
+                node_metrics->enqueued.fetch_add(1);
                 break;
             case MailboxPushResult::DroppedOldest:
-                metrics->enqueued.fetch_add(1);
-                metrics->dropped.fetch_add(1);
+                edge_metrics->accepted.fetch_add(1);
+                edge_metrics->dropped_oldest.fetch_add(1);
+                node_metrics->enqueued.fetch_add(1);
+                node_metrics->dropped.fetch_add(1);
                 break;
             case MailboxPushResult::DroppedNewest:
-                metrics->dropped.fetch_add(1);
+                edge_metrics->dropped_newest.fetch_add(1);
+                node_metrics->dropped.fetch_add(1);
                 break;
             case MailboxPushResult::Closed:
-                metrics->rejected.fetch_add(1);
+                edge_metrics->rejected.fetch_add(1);
+                node_metrics->rejected.fetch_add(1);
                 break;
             }
+            if (auto transport = weak_transport.lock()) {
+                edge_metrics->UpdateQueueSize(transport->Size());
+            }
         });
+    }
+
+    void SetId(std::string id) {
+        edge_id_ = std::move(id);
+    }
+
+    const std::string& Id() const override {
+        return edge_id_;
+    }
+
+    EdgeMetricsSnapshot Metrics() const override {
+        return metrics_->Snapshot();
     }
 
     /// 把此边的 Transport 挂到源输出端口。
@@ -319,12 +385,14 @@ public:
     void Open() override {
         scheduled_.store(false);
         transport_->Open();
+        metrics_->UpdateQueueSize(transport_->Size());
     }
 
     /// 关闭边并复位调度门闩。
     void Close() override {
         transport_->Close();
         scheduled_.store(false);
+        metrics_->UpdateQueueSize(transport_->Size());
     }
 
     bool Empty() const override {
@@ -339,6 +407,7 @@ private:
             return;
         }
 
+        metrics_->schedules.fetch_add(1);
         auto self = shared_from_this();
         if (!destination_->executor || !destination_->executor->Post([self]() {
                 self->Drain();
@@ -355,8 +424,17 @@ private:
             return;
         }
 
+        const auto start_time = std::chrono::steady_clock::now();
+        const auto max_batch_size = std::max<std::size_t>(1, options_.max_batch_size);
         std::size_t count = 0;
-        while (count < std::max<std::size_t>(1, options_.max_batch_size)) {
+        metrics_->drain_batches.fetch_add(1);
+        while (count < max_batch_size) {
+            if (count > 0 && options_.max_drain_time_us > 0 &&
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start_time).count() >=
+                    options_.max_drain_time_us) {
+                break;
+            }
             auto value = transport_->TryReceive();
             if (!value.has_value()) {
                 break;
@@ -367,9 +445,11 @@ private:
                 })) {
                 destination_->metrics->rejected.fetch_add(1);
             }
+            metrics_->drained.fetch_add(1);
             ++count;
         }
 
+        metrics_->UpdateQueueSize(transport_->Size());
         scheduled_.store(false);
         if (!transport_->Empty()) {
             Schedule();
@@ -380,6 +460,8 @@ private:
     InputPort<T>* input_;                       ///< 目标节点输入端口，不拥有其生命周期。
     EdgeOptions options_;                       ///< 边的队列和批处理配置。
     std::shared_ptr<ITransport<T>> transport_;  ///< 实际消息通道。
+    std::string edge_id_;                       ///< 源端口到目标端口的稳定标识。
+    std::shared_ptr<EdgeMetrics> metrics_;      ///< 本边独立统计。
     std::atomic<bool> scheduled_{false};        ///< 防止重复投递 Drain。
 };
 
@@ -419,7 +501,28 @@ public:
                  Args&&... args) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == State::Starting || state_ == State::Running ||
-            state_ == State::Stopping || nodes_.contains(id) || !executor) {
+            state_ == State::Stopping || topology_frozen_) {
+            SetErrorLocked(FlowErrorCode::GraphRunning,
+                           "Graph topology is frozen or lifecycle is active");
+            return false;
+        }
+        if (id.empty()) {
+            SetErrorLocked(FlowErrorCode::InvalidArgument, "Node id must not be empty");
+            return false;
+        }
+        if (nodes_.contains(id)) {
+            SetErrorLocked(FlowErrorCode::DuplicateNode,
+                           "Node id already exists: " + id);
+            return false;
+        }
+        if (!executor) {
+            SetErrorLocked(FlowErrorCode::InvalidArgument,
+                           "Node executor must not be null: " + id);
+            return false;
+        }
+        if (options.max_pending_tasks == 0) {
+            SetErrorLocked(FlowErrorCode::InvalidOptions,
+                           "max_pending_tasks must be greater than zero: " + id);
             return false;
         }
 
@@ -427,12 +530,15 @@ public:
         auto context = std::make_shared<NodeContext>(id, node, std::move(executor), options);
         PortRegistry registry;
         if (!node->RegisterPorts(registry)) {
+            SetErrorLocked(FlowErrorCode::NodeRegistrationFailed,
+                           "Node port registration failed: " + id);
             return false;
         }
 
         context->ports = registry.Bindings();
         nodes_.emplace(id, std::move(context));
         node_order_.push_back(id);
+        ClearErrorLocked();
         return true;
     }
 
@@ -453,32 +559,54 @@ public:
                  EdgeOptions options = {}) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (state_ == State::Starting || state_ == State::Running ||
-            state_ == State::Stopping) {
+            state_ == State::Stopping || topology_frozen_) {
+            SetErrorLocked(FlowErrorCode::GraphRunning,
+                           "Graph topology is frozen or lifecycle is active");
+            return false;
+        }
+        if (options.capacity == 0 || options.max_batch_size == 0 ||
+            options.max_drain_time_us < 0) {
+            SetErrorLocked(FlowErrorCode::InvalidOptions,
+                           "Edge capacity, batch size and drain budget are invalid");
             return false;
         }
 
         auto source_it = nodes_.find(source);
         auto destination_it = nodes_.find(destination);
         if (source_it == nodes_.end() || destination_it == nodes_.end()) {
+            SetErrorLocked(FlowErrorCode::NodeNotFound,
+                           "Edge endpoint node does not exist");
             return false;
         }
 
         const auto* source_binding = FindPort(*source_it->second, source_port);
         const auto* destination_binding = FindPort(*destination_it->second, destination_port);
-        if (!source_binding || !destination_binding ||
-            source_binding->direction != PortDirection::Output ||
-            destination_binding->direction != PortDirection::Input ||
-            source_binding->type != typeid(T) ||
+        if (!source_binding || !destination_binding) {
+            SetErrorLocked(FlowErrorCode::PortNotFound,
+                           "Edge endpoint port does not exist");
+            return false;
+        }
+        if (source_binding->direction != PortDirection::Output ||
+            destination_binding->direction != PortDirection::Input) {
+            SetErrorLocked(FlowErrorCode::PortDirectionMismatch,
+                           "Edge endpoint directions are incompatible");
+            return false;
+        }
+        if (source_binding->type != typeid(T) ||
             destination_binding->type != typeid(T)) {
+            SetErrorLocked(FlowErrorCode::PortTypeMismatch,
+                           "Edge endpoint message types are incompatible");
             return false;
         }
 
         auto* output = static_cast<OutputPort<T>*>(source_binding->port);
         auto* input = static_cast<InputPort<T>*>(destination_binding->port);
         auto edge = std::make_shared<Edge<T>>(destination_it->second, input, options);
+        edge->SetId(source + ":" + source_port + "->" + destination + ":" + destination_port);
         edge->Initialize();
         edge->Attach(*output);
         edges_.push_back(std::move(edge));
+        ClearErrorLocked();
         return true;
     }
 
@@ -493,6 +621,13 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             if (state_ == State::Starting || state_ == State::Running ||
                 state_ == State::Stopping) {
+                SetErrorLocked(FlowErrorCode::GraphRunning,
+                               "Graph is already starting, running, or stopping");
+                return false;
+            }
+            if (nodes_.empty()) {
+                SetErrorLocked(FlowErrorCode::InvalidArgument,
+                               "Graph must contain at least one node");
                 return false;
             }
             state_ = State::Starting;
@@ -508,6 +643,8 @@ public:
         for (const auto& id : node_order_) {
             auto context = nodes_.at(id);
             if (!context->node->Init()) {
+                SetError(FlowErrorCode::NodeInitFailed,
+                         "Node Init failed: " + id);
                 Rollback(initialized, {}, {});
                 return false;
             }
@@ -520,6 +657,8 @@ public:
             auto executor = nodes_.at(id)->executor;
             if (seen_executors.insert(executor.get()).second) {
                 if (!executor->Start()) {
+                    SetError(FlowErrorCode::ExecutorStartFailed,
+                             "Executor Start failed for node: " + id);
                     Rollback(initialized, started_executors, {});
                     return false;
                 }
@@ -531,6 +670,8 @@ public:
         for (const auto& id : node_order_) {
             auto context = nodes_.at(id);
             if (!context->node->Start()) {
+                SetError(FlowErrorCode::NodeStartFailed,
+                         "Node Start failed: " + id);
                 Rollback(initialized, started_executors, started_nodes);
                 return false;
             }
@@ -539,6 +680,8 @@ public:
 
         std::lock_guard<std::mutex> lock(mutex_);
         state_ = State::Running;
+        topology_frozen_ = true;
+        ClearErrorLocked();
         return true;
     }
 
@@ -612,7 +755,39 @@ public:
         return true;
     }
 
+    /// 获取指定 Edge 的独立统计快照。
+    bool GetEdgeMetrics(const std::string& id, EdgeMetricsSnapshot& snapshot) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& edge : edges_) {
+            if (edge->Id() == id) {
+                snapshot = edge->Metrics();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// 获取最近一次构图或启动失败的结构化原因。
+    FlowError LastError() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_error_;
+    }
+
 private:
+    void SetError(FlowErrorCode code, std::string message) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        SetErrorLocked(code, std::move(message));
+    }
+
+    void SetErrorLocked(FlowErrorCode code, std::string message) {
+        last_error_.code = code;
+        last_error_.message = std::move(message);
+    }
+
+    void ClearErrorLocked() {
+        last_error_ = FlowError{};
+    }
+
     /// 从 NodeContext 中查找端口，连接失败时返回空指针。
     static const PortBinding* FindPort(const NodeContext& context,
                                        const std::string& name) {
@@ -645,6 +820,8 @@ private:
 
     mutable std::mutex mutex_;  ///< 保护状态和拓扑容器。
     State state_{State::Created};  ///< 当前生命周期状态。
+    bool topology_frozen_{false};  ///< 首次成功启动后禁止修改节点和边。
+    FlowError last_error_;         ///< 最近一次失败原因。
     std::unordered_map<std::string, std::shared_ptr<NodeContext>> nodes_;
     std::vector<std::string> node_order_;  ///< 保证生命周期顺序稳定可控。
     std::vector<std::shared_ptr<IEdge>> edges_;  ///< Graph 拥有的全部连接边。
