@@ -1,0 +1,751 @@
+# MediaFlow 封装 media 流程评估与实施指南
+
+本文档基于当前工程中 `include/media`、`src/media`、`include/mediaflow` 和
+`test/media` 的实际实现，评估如何使用 MediaFlow 封装拉流、解码、编码和发布流程，
+并列出 `media` 模块在正式接入前仍需完成的修改。
+
+本文档是 [`media-flow-design.md`](media-flow-design.md) 的媒体接入细化说明。
+前者描述框架总体设计和阶段规划，本文档聚焦可直接执行的文件级改造、接口契约、
+节点行为、测试方法和验收标准。
+
+> 审计基线：2026-08-05，当前 `main` 分支。
+
+## 1. 结论
+
+使用 MediaFlow 封装现有 `media` 流程是可行的，但当前还不适合只增加四个节点后就
+直接替换现有手工链路。主要原因不是底层编解码或协议能力缺失，而是以下跨组件契约
+尚不完整：
+
+1. 媒体类型、轨道身份和时间基存在歧义，节点化后会被多线程和多轨场景放大。
+2. 拉流会话的停止、重连和回调生命周期还不能可靠覆盖快速停止/重启。
+3. 解码器和编码器缺少适合图生命周期的显式刷新接口。
+4. 编码器输出没有完整填写发布所需的轨道与时间基信息。
+5. 发布端对音视频交织、重连后等待关键帧和多轨唯一路由仍有缺口。
+6. MediaFlow 当前只有立即停止语义，尚缺少媒体组件所需的在途任务屏障和有序刷新。
+
+推荐采用以下方式实施：
+
+- 保留 `IPuller`、`MediaStreamSession`、`IDecoder`、`IEncoder`、`IPublisher` 和协议
+  实现的领域职责。
+- 在 `mediaflow` 命名空间中增加轻量适配节点，不让 FFmpeg、AVTP 或 RTSP 类直接
+  继承 MediaFlow 节点基类。
+- 一个有状态媒体对象只由一个 Serialized 节点拥有和调用。
+- 先修复 P0 数据与生命周期契约，再实现主链路节点；不要在节点中重复补丁式猜测
+  `stream_index`、`time_base` 或 `duration`。
+
+首期目标链路为：
+
+```text
+PipelineController
+  |-- 输入探测、轨道选择、错误监督、停止请求
+  `-- MediaFlow Graph
+        StreamSourceNode
+          -> TrackRouterNode
+          -> DecoderNode
+          -> EncoderNode
+          -> PublisherSinkNode
+```
+
+对于不需要转码的场景，可使用：
+
+```text
+StreamSourceNode -> TrackMapNode -> PublisherSinkNode
+```
+
+后续再接入推理、OSD、渲染、录像和 WebRTC，不应在首期节点中预先混入这些职责。
+
+## 2. 适配边界
+
+### 2.1 应由 MediaFlow 管理的内容
+
+- 节点拓扑和端口类型。
+- 节点使用哪个 Executor。
+- Edge 的队列容量、背压和丢弃统计。
+- 节点生命周期、启动顺序和停止顺序。
+- Pipeline 级错误、重启策略和指标汇总。
+- 消息的流、轨道、代次和序号上下文。
+
+### 2.2 继续由 media 管理的内容
+
+- FFmpeg demux、decode、encode 和 mux 细节。
+- AVTP、RTP、RTCP、RTSP 的协议解析和网络发送。
+- 编解码器参数、extradata、像素格式和采样格式转换。
+- 拉流器的协议专用配置和 I/O 中断机制。
+- Publisher 的协议能力和输出 URL。
+
+### 2.3 不推荐的改造方式
+
+- 不让 `FFmpegDecoder`、`FFmpegEncoder` 或 `DefaultPublisher` 直接继承 `INode`。
+- 不把 MediaFlow 的队列逻辑塞入 `MediaStreamSession`、FFmpeg muxer 或 RTSP session。
+- 不继续用 `MediaPacket::stream_index` 同时表示输入 stream 和输出 track。
+- 不在测试或 PublisherNode 中手工猜测编码 packet 的时间基和持续时间。
+- 不允许节点在自己的工作线程中直接调用 `Graph::Stop()`；这可能让 Executor
+  尝试 join 当前线程。节点只上报事件，由外部控制线程停止 Graph。
+
+## 3. 当前可复用程度
+
+| 区域 | 当前状态 | 接入判断 |
+|---|---|---|
+| MediaFlow Graph、Node、Port | 已具备类型安全连接和基本生命周期 | 可复用，但需补媒体停止屏障和拓扑生命周期顺序 |
+| QueueTransport | 已具备有界容量、Block、DropNewest、DropOldest | 可复用；媒体链路需按数据类型单独配置 |
+| Node Dispatch | 已有 Serialized、Concurrent 和任务上限 | 有状态媒体节点只能使用 Serialized |
+| FFmpeg/AVTP Puller | 已输出统一 `MediaPacket` | 可复用；需补读结果、轨道选择和重复启动契约 |
+| MediaStreamSession | 已有重连、watchdog 和回调 | 需较大生命周期修复后再由 SourceNode 包装 |
+| FFmpegDecoder | 已支持 packet 输入和多 frame 回调 | 可复用；需显式 Flush、重复 Open 和停止并发修复 |
+| FFmpegEncoder | 已支持视频、音频和 `Encode(nullptr)` | 可复用；需修复 PTS、time base、track 和输出描述 |
+| DefaultPublisher | 已统一协议适配和结构化结果 | 可复用；需修复线程查询、重连结果和失败状态语义 |
+| FFmpeg mux | 已支持多轨、超时、filter 和基础重连 | 需改音视频交织和关键帧恢复状态 |
+| RTSP Server | 已有异步会话、代次闸门和客户端隔离 | 可复用；需补协议入口队列上限和多轨唯一匹配 |
+| 媒体适配节点 | 尚未实现 | 需要新增 |
+
+## 4. 消息与数据契约
+
+### 4.1 不再把 stream_index 当作通用轨道 ID
+
+当前工程至少存在三种编号域：
+
+| 编号 | 含义 | 生命周期 |
+|---|---|---|
+| `MediaStreamInfo::stream_index` | 输入 demuxer 中的 stream 编号 | 当前输入连接 |
+| MediaFlow `source_track_id` | Pipeline 内识别输入轨道的逻辑编号 | 当前 Pipeline 代次 |
+| `MediaTrackConfig::track_id` | 当前 Publisher 任务中的输出轨道编号 | 当前发布任务 |
+| FFmpeg `AVStream::index` | 输出 mux context 内的 stream 编号 | 当前输出连接 |
+
+这些编号可能碰巧相等，但定义不同。节点间消息应显式携带输入轨道和输出轨道，
+PublisherSinkNode 再完成逻辑输出轨道到 Publisher 配置的映射。
+
+首期可以令 `source_track_id` 等于输入 `stream_index`，但必须把这个关系限制在
+PipelineBuilder 的一次配置映射中，不能继续作为 Publisher 的隐含全局约定。
+
+### 4.2 MediaPacket 时间戳契约
+
+当前 `MediaPacket` 注释把 `pts`、`dts`、`duration` 写成微秒，同时类中又保留
+`time_base`。编码器实际输出的是 codec time base 下的 tick，但没有填写
+`time_base`，因此测试只能手工改成微秒。
+
+建议统一为以下契约：
+
+- `MediaPacket::pts`、`dts`、`duration` 均为 `time_base` 下的整数 tick。
+- `MediaPacket::time_base` 必须满足 `num > 0 && den > 0`。
+- Puller 可以继续把 packet 规范化到 `1/1000000`，但这只是合法实现之一。
+- Encoder 输出 packet 使用编码器实际 `AVCodecContext::time_base`。
+- Publisher 和 Decoder 必须根据 `time_base` 做显式重标定。
+- `MediaFrame::MediaTime` 继续使用字段名明确的微秒单位。
+- 无时间戳不能继续与合法的 `0` 混用，应定义统一的 `kNoTimestamp`，或使用
+  显式有效标志。
+
+建议增加公共时间工具，所有组件复用同一实现：
+
+```cpp
+namespace mediaflow {
+
+bool IsValidTimeBase(const Rational& value);
+int64_t RescaleTimestamp(int64_t value,
+                         const Rational& source,
+                         const Rational& destination);
+
+} // namespace mediaflow
+```
+
+### 4.3 建议的消息结构
+
+新消息只放在 `mediaflow` 命名空间，不增加更长的嵌套命名空间：
+
+```cpp
+namespace mediaflow {
+
+struct MessageContext {
+    std::string pipeline_id;
+    std::string stream_id;
+    int source_track_id{-1};
+    int output_track_id{-1};
+    std::uint64_t generation{0};
+    std::uint64_t sequence{0};
+};
+
+struct PacketMessage {
+    MessageContext context;
+    std::shared_ptr<const MediaPacket> packet;
+};
+
+struct FrameMessage {
+    MessageContext context;
+    std::shared_ptr<const MediaFrame> frame;
+};
+
+struct StreamDescriptorMessage {
+    std::string pipeline_id;
+    std::string stream_id;
+    std::uint64_t generation{0};
+    MultiStreamInfo streams;
+};
+
+enum class PipelineEventSeverity {
+    Info,
+    Warning,
+    RecoverableError,
+    FatalError,
+};
+
+struct PipelineEvent {
+    PipelineEventSeverity severity{PipelineEventSeverity::Info};
+    std::string node_id;
+    MessageContext context;
+    std::string code;
+    std::string message;
+};
+
+} // namespace mediaflow
+```
+
+消息约束：
+
+- 同一 `(stream_id, source_track_id, generation)` 内的 `sequence` 单调递增。
+- 重连导致 codec、分辨率、采样率或 extradata 变化时，递增 `generation`。
+- 下游不得把旧代次 packet/frame 与新代次状态混合处理。
+- fan-out 后输入默认只读。需要修改载荷时创建新对象或使用显式 copy-on-write。
+- `BackendHandle::ptr` 的有效期必须由同一个消息中的 `buffer` 保证；不得脱离
+  `buffer` 单独缓存裸指针。
+
+### 4.4 控制消息的顺序
+
+流描述必须先于该代次的第一条 packet 被下游观察到。由于独立 Edge 之间没有全局
+顺序保证，不能简单地把 `StreamDescriptorMessage` 和 `PacketMessage` 放在两个并行
+Edge 后假设描述一定先到。
+
+首期推荐采用“启动前探测”方式：
+
+1. PipelineController 让 Session 进入 Prepared 状态，打开输入但不开始读循环。
+2. 读取 `MultiStreamInfo`，完成轨道选择、Decoder 和 Encoder 配置。
+3. Encoder 准备完成后生成 Publisher 所需的输出轨道描述。
+4. 构建并启动 Graph，下游全部就绪后最后激活 SourceNode。
+
+后续需要在线变更时，再引入同一 FIFO 消息流中的 `variant<Descriptor, Packet, EOS>`，
+或实现明确的控制面屏障。
+
+## 5. 目标节点设计
+
+### 5.1 StreamSourceNode
+
+建议直接包装 `MediaStreamSession`，不要在新链路中再经过 `MediaStreamSource` 的
+subscriber fan-out。MediaFlow 的 `OutputPort` 已经承担 fan-out、队列和背压，继续
+叠加 subscriber 会产生重复分发层和不清晰的线程边界。
+
+职责：
+
+- 在开始读取前设置 StreamInfo、Packet、State 和 Event 回调。
+- 将 session packet 包装为 `PacketMessage`，补充流 ID、轨道、代次和序号。
+- 只接受 PipelineBuilder 选中的输入轨道，或把所有轨道交给 TrackRouterNode。
+- Stop 时先递增节点代次并关闭 Emit 闸门，再解绑回调，最后停止 Session。
+- 迟到回调必须因为代次不匹配而被丢弃。
+- 不在 session 回调内执行解码、发布或长时间日志 I/O。
+
+建议生命周期：
+
+| 阶段 | 行为 |
+|---|---|
+| 构造 | 保存 session、流 ID 和选轨配置，不启动 I/O |
+| `Init` | 校验 Prepared session 和 StreamInfo，注册回调 |
+| `Start` | 激活读循环，Source 必须是最后启动的业务节点 |
+| `Stop` | 关闭 Emit、解绑回调、停止读循环和定时器 |
+| `Deinit` | 释放 session；确保不存在可触达节点的回调 |
+
+Source 的阻塞 `ReadPacket()` 应运行在专用输入线程或专用输入 Executor，不应占用
+decode、publish 或 Pipeline 控制线程。
+
+### 5.2 TrackRouterNode
+
+当前 FFmpegPuller 会缓存所有音视频 stream，并输出这些 stream 的 packet，但
+`MultiStreamInfo::video_stream_idx_` 和 `audio_stream_idx_` 只记录最后一个对应类型。
+只按 `MediaType` 路由会把多个同类型 stream 送进同一个 Decoder。
+
+因此需要二选一：
+
+1. 在 Puller 层增加显式选轨，只输出配置中的 stream index；首期推荐。
+2. 新增 TrackRouterNode，按 `source_track_id` 路由到不同命名端口。
+
+DecoderNode 必须再次校验 `source_track_id`，不能只检查 VIDEO/AUDIO。
+
+### 5.3 DecoderNode
+
+首期一个 DecoderNode 只负责一个输入轨道和一个 `IDecoder` 实例。
+
+职责：
+
+- `Init` 中按不可变 `MediaStreamInfo` 打开 Decoder。
+- 使用 Serialized Executor 调用 `Decode()`。
+- FrameCallback 只把 frame 包装为 `FrameMessage` 并 Emit。
+- packet 的轨道或 generation 不匹配时拒绝处理并计数。
+- 解码错误按配置上报 `RestartNode` 或 `StopPipeline`，不在节点线程直接停止 Graph。
+- Graceful Stop 时先等待最后一个 Decode 结束，再 Flush，Emit 残留 frame，最后 Close。
+
+重连处理：
+
+- StreamInfo 未变化：可以清理解码状态并从下一关键帧恢复。
+- codec、extradata、分辨率或音频参数变化：停止当前 Pipeline 代次并重建 Decoder。
+- 首期不建议在运行中的 DecoderNode 内原地切换所有参数；重建整路 Graph 更容易
+  保证 Publisher 和其他分支同步更新。
+
+### 5.4 EncoderNode
+
+首期一个 EncoderNode 只负责编码一个输出轨道。
+
+职责：
+
+- 在 `Init` 中打开 Encoder，并保存实际输出 time base、codec、extradata 和媒体参数。
+- 将 `MediaFrame::time.pts_us` 重标定到编码器 time base 后送给 FFmpeg。
+- 遍历一次 Encode 产生的全部 packet，并逐个 Emit。
+- 为每个输出 packet 填写 `stream_index` 或独立的输出 track、`time_base`、duration、
+  media type、codec 和 keyframe。
+- Graceful Stop 时调用显式 Flush，Emit 所有 packet 后再 Close。
+- 编码器实例和 audio FIFO 只能在 Serialized Executor 上访问。
+
+EncoderNode 不应依赖 `dynamic_cast<FFmpegEncoder*>` 获取 extradata。应由 `IEncoder`
+暴露统一输出描述，例如：
+
+```cpp
+struct EncodedTrackInfo {
+    MediaType media_type{MediaType::UNKNOWN};
+    CodecType codec_type{CodecType::UNKNOWN};
+    Rational time_base{1, 1000000};
+    int width{0};
+    int height{0};
+    int sample_rate{0};
+    int channels{0};
+    std::vector<std::uint8_t> extra_data;
+};
+```
+
+### 5.5 PublisherSinkNode
+
+一个 PublisherSinkNode 对应一个 Publisher 任务，可以接收一个或多个输出轨道。
+
+职责：
+
+- 在所有必需的 `EncodedTrackInfo` 准备完成后创建并启动 Publisher。
+- 把 `PacketMessage::output_track_id` 映射为 Publisher `track_id`。
+- 只在独立 Serialized publish Executor 上调用 Start、Publish 和 Stop。
+- 把 `PublisherResult` 转换为 PipelineEvent 和节点指标。
+- 区分“packet 被策略丢弃”“Publisher 仍已连接”“需要重连”和“Publisher 已关闭”。
+- Graceful Stop 时等待编码器 flush packet 全部写完，再写 trailer/关闭 Publisher。
+
+对于当前只接受 `MediaPacket` 的接口，可以在 PublisherSinkNode 内复制 packet 头：
+
+```cpp
+MediaPacket routed = *message.packet;
+routed.stream_index = message.context.output_track_id;
+publisher->Publish(routed);
+```
+
+该操作只复制元数据和 `shared_ptr`，不会复制编码载荷。长期建议让 Publisher API
+显式接受逻辑 track，彻底取消 `stream_index == track_id` 的兼容假设。
+
+### 5.6 JitterBufferNode
+
+抖动缓冲处理网络到达抖动和乱序，MediaFlow Edge 处理处理速度不匹配，两者职责不同。
+不应因为有 Edge 队列就直接删除抖动缓冲，也不应把二者配置成两个大缓存。
+
+当前 `AdaptiveJitterBuffer` 不建议直接用于首期多轨链路：
+
+- 一个实例混合音频和视频 DTS，迟到判断也是全局的。
+- 定时器每次只 Pop 一条 packet，输入速率高于定时频率时会持续积压。
+- 时间戳计算默认按微秒，未使用 packet `time_base`。
+- Reset 会清零丢包累计，不利于 Pipeline 长期指标。
+- Reset、Push、Pop 和查询在当前 Session 多线程模型下缺少完整生命周期屏障。
+
+首期可对 FFmpeg RTSP 输入关闭该缓冲，依赖 demuxer 已有顺序；需要 AVTP/RTP 重排时，
+应改为每轨一个 JitterBufferNode，并支持一次批量弹出全部 ready packet。
+
+## 6. 生命周期与线程模型
+
+### 6.1 当前 MediaFlow 的集成阻塞项
+
+这些问题位于 MediaFlow 核心，不属于 `media` 文件，但必须与媒体节点同步解决：
+
+| 问题 | 当前行为 | 媒体风险 | 要求 |
+|---|---|---|---|
+| Node Start 顺序 | 按 AddNode 顺序 | Source 可能在 Decoder/Publisher 未启动时产生数据 | 支持拓扑逆序启动，或首期严格按 sink 到 source 添加节点 |
+| Node Stop 顺序 | 按 AddNode 顺序调用 Stop | Publisher 可能早于 Encoder flush 关闭 | 明确 source 到 sink 的 Graceful Stop 顺序 |
+| 在途任务 | Node::Stop 时任务可能仍在执行 | Decode 与 Close、Encode 与 Close 并发 | 增加 pending-task barrier，并在节点 Executor 上执行 flush/close |
+| Executor Stop | `io_context::stop()` 丢弃排队任务 | 残留 frame/packet 丢失 | Graceful 模式先 drain，再停止 Executor |
+| 共享 Executor | Graph::Stop 会停止其见到的 Executor | 一路停止可能影响其他 Graph | 拆分 Executor 所有权，M1 前不要跨 Graph 共享 |
+| 节点致命错误 | 无独立控制面停止入口 | 节点线程直接 Stop 可能自 join | 事件上报到 PipelineController，由控制线程执行停止 |
+| ExecutorDispatch | Send 先记 Accepted，目标 Dispatch 失败不可回传 | 发送方看不到实际拒绝 | 媒体主链路首期使用 QueueTransport |
+
+### 6.2 推荐启动顺序
+
+```text
+1. PipelineController 创建并 Prepare 输入会话
+2. 读取 StreamInfo，完成选轨和参数校验
+3. 准备 Decoder 和 Encoder，取得输出轨道描述
+4. 创建 PublisherConfig
+5. 打开 Edge 和节点 Dispatch
+6. 启动 Executor
+7. 启动 PublisherSinkNode
+8. 启动 EncoderNode
+9. 启动 DecoderNode
+10. 最后启动 StreamSourceNode
+```
+
+现有 `MediaStreamSession::Start()` 同时执行 Open 和启动读循环，需要拆成类似：
+
+```cpp
+bool Prepare();       // Open + GetStreamInfo，不开始 ReadPacket 循环
+bool StartReading();  // Prepared -> Running
+void Stop();          // 对所有非停止状态有效
+```
+
+原 `Start()` 可以保留为兼容入口，内部依次调用 `Prepare()` 和 `StartReading()`。
+
+### 6.3 推荐 Graceful Stop 顺序
+
+```text
+1. PipelineController 把状态切到 Stopping，拒绝新的外部操作
+2. StreamSourceNode 关闭 Emit 闸门并停止输入
+3. 等待 source -> decoder Edge 和 Decoder 在途任务排空
+4. DecoderNode Flush，Emit 残留 frame
+5. 等待 frame Edge 排空
+6. EncoderNode Flush，Emit 残留 packet
+7. 等待 publisher Edge 排空
+8. PublisherSinkNode Stop，写 trailer 并关闭连接
+9. 关闭 Edge 和节点 Dispatch
+10. 停止 Executor
+11. 按逆序 Deinit 节点
+```
+
+Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须与 Graceful Stop 使用不同
+枚举和指标，不能让调用方猜测本次停止是否保证输出完整。
+
+### 6.4 Executor 建议
+
+| Executor | 建议线程数 | 节点 | 说明 |
+|---|---:|---|---|
+| input | 每路 1 个阻塞读取任务，线程数按路数规划 | StreamSourceNode | `ReadPacket` 可能阻塞，不能占用控制线程 |
+| decode | 1 至 CPU 核数 | DecoderNode | 每个 DecoderNode Serialized，不同轨道可并行 |
+| process | 按推理/滤镜能力规划 | 后续处理节点 | 与编解码隔离 |
+| encode | 1 至 CPU 核数或硬件队列数 | EncoderNode | 同一 Encoder 实例 Serialized |
+| publish | 每个慢同步 Publisher 至少独立调度 | PublisherSinkNode | FFmpeg 写入和重连会同步阻塞 |
+| control | 1 | PipelineController | 处理事件、重建和 Stop 请求 |
+
+## 7. media 必须修改的问题
+
+### 7.1 P0：接入前必须完成
+
+| ID | 文件 | 当前问题 | 必须修改 | 验收 |
+|---|---|---|---|---|
+| M-P0-01 | `include/media/media_packet.h` | `MediaType::VIDEO` 和 `MediaType::UNKNOWN` 都为 0 | 将 `UNKNOWN=0` 放首位，其余值显式且唯一；检查持久化/FFI 依赖 | static_assert 各枚举值不同；发布轨道匹配测试通过 |
+| M-P0-02 | `include/media/media_packet.h` | PTS 注释与 `time_base` 实际语义冲突 | 明确 tick/time_base 契约、无时间戳表示和校验工具；Dump 判空 | 非微秒 time base 的解码、编码、发布测试通过 |
+| M-P0-03 | `include/media/puller/i_puller.h` 及各 Puller | bool + nullptr 不能可靠区分 NoData、EOF、可恢复错误和停止 | 增加结构化 `PullReadStatus`，Session 按状态决定继续、完成或重连 | 本地文件 EOF 不重连；网络断开按策略重连；超时不误判 EOF |
+| M-P0-04 | `src/media/puller/ffmpeg_puller.cpp` | 重复 Open 不先 Close；所有音视频 stream 都输出，但只有单个 video/audio 索引 | Open 幂等清理；增加显式选轨或完整轨道映射；事件返回结构化错误 | 多视频轨不串入同一 Decoder；Start/Stop/Start 资源稳定 |
+| M-P0-05 | `include/media/stream/stream_session.h`、`src/media/stream/stream_session.cpp` | Stop 无法中断 CONNECTING；旧 handler 可进入新一代；多线程字段有数据竞争；StreamInfo 回调未快照；Stats 实际不更新 | 增加 lifecycle generation、所有状态可停止、回调快照、线程边界和真实原子统计；拆分 Prepare/StartReading | 连接中停止、快速重启、断线重连和统计测试通过，无迟到 packet |
+| M-P0-06 | `include/media/decoder/i_decoder.h`、`src/media/decoder/ffmpeg_decoder.cpp` | Open 不清理旧 context；Close 隐式 flush；Graph 停止时可能与 Decode 并发 | 增加显式 Flush；Open 先关闭；Close 只释放或明确契约；节点 Executor 屏障后调用 | 重复 Open、flush 多帧、Stop during Decode 无崩溃和丢帧 |
+| M-P0-07 | `include/media/encoder/i_encoder.h`、`src/media/encoder/ffmpeg_encoder.cpp` | Frame 微秒 PTS 直接写入任意 codec time base；自动视频 time base 未考虑 fps_den；音频 FIFO PTS 固定按微秒累加；输出 packet 缺少 time_base 和 track | 统一重标定；修正 fps time base；按 codec time base 累加音频；补完整 packet 元数据和统一输出描述 | 删除测试中的手工 time_base/stream_index 后仍可播放且 A/V 同步 |
+| M-P0-08 | `src/media/protocol/ffmpeg_mux_protocol.cpp` | 多轨使用 `av_write_frame`，独立音视频节点到达顺序不保证 | 使用 `av_interleaved_write_frame`，或实现有界 DTS 重排；保留单轨回归 | 独立音视频 Encoder 并发输入时无非单调 DTS 错误，输出可播放 |
+| M-P0-09 | `src/media/publisher/default_publisher.cpp`、FFmpeg publish 路径 | 重连成功但等待关键帧时仍返回连接中断错误，DefaultPublisher 随即把 `started_` 置 false，后续关键帧无法恢复 | 区分 AwaitingKeyframe、RetryableFailure 和 Closed；只有 Publisher 真正关闭时清除 started | 模拟断线，先送非关键帧再送关键帧能够恢复 |
+| M-P0-10 | `src/media/protocol/rtsp_server_protocol_adapter.cpp` | 多个相同媒体类型/codec 的 track 回退时直接取第一个候选 | 与 FFmpeg adapter 一致，候选不唯一时拒绝并要求显式 track | 双 H264 或双 AAC 轨道不会静默写错 |
+| MF-P0-01 | `include/mediaflow/core/graph.h`、`executor.h` | 缺少媒体 Graceful Stop 屏障和安全启动/停止顺序 | 增加拓扑生命周期顺序、在途任务等待和 Executor 上 flush；禁止控制线程自 join | 编解码处理中停止、重复启动、启动失败回滚测试通过 |
+
+### 7.2 P1：主链路完成前建议完成
+
+| ID | 文件 | 问题与改进 |
+|---|---|---|
+| M-P1-01 | `include/media/media_frame.h` | 增加时间戳有效性；`Stride`、`PlaneOffset` 校验 index；避免 type 与 variant 不一致时直接 `std::get` 抛异常 |
+| M-P1-02 | `include/media/i_media_buffer.h` | 推进只读 Buffer 契约，增加 `ConstPacketPtr`/`ConstFramePtr`；需要写入的节点显式复制或独占 |
+| M-P1-03 | `include/media/stream/source_config.h` | 合并重复超时字段；处理或删除当前未生效的 `max_delay_ms`、`dump_packets`、headers、socket buffer 等配置 |
+| M-P1-04 | `src/media/stream/stream_source.cpp` | 若保留兼容类：回调改 weak capture、Stop 解绑回调、subscriber 支持取消、锁外调用回调、保护 StreamInfo、Stop 统计线程、packet buffer 判空 |
+| M-P1-05 | `AdaptiveJitterBuffer` | 改为每轨实例、按 time base 计算、批量 Pop、累计与当前代次指标分离；或迁移为独立 JitterBufferNode |
+| M-P1-06 | `DefaultPublisher` | 查询方法与 Start/Publish/Stop 并发不安全；增加锁或由 PublisherSinkNode 保存线程安全快照 |
+| M-P1-07 | `RtspServerProtocol` | `Write` 成功只表示已 post，内部媒体任务没有独立总上限；增加有界媒体入口和 accepted/delivered/dropped 区分 |
+| M-P1-08 | `FfmpegMuxProtocol` | 断线发生在音频 packet 时，也应根据配置中是否存在视频轨决定是否等待关键帧 |
+| M-P1-09 | `PublisherResult` | 增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态 |
+| M-P1-10 | `MultiStreamInfo` | 提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆 |
+| MF-P1-01 | MediaFlow metrics | 增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计 |
+| MF-P1-02 | Queue/Dispatch | 当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限 |
+
+### 7.3 P2：性能和扩展优化
+
+| 文件/区域 | 建议 |
+|---|---|
+| `FFmpegFrameBuffer` | 当前同时保留 AVFrame 并复制 packed buffer，内存接近双份；按消费者能力增加零拷贝 frame view，必要时再 pack |
+| `BackendHandle` | 用带类型和共享所有权的后端引用替代公开 `void*`，减少 buffer 与裸指针不一致 |
+| Encoder | 增加动态码率、请求关键帧和能力查询接口，支持拥塞恢复 |
+| Publisher | 增加主备 URL、指数退避、熔断、健康检查和有界 QueuedPublisher |
+| Transport | 增加按字节预算、按时间预算和关键帧感知的背压策略 |
+| Pipeline | 支持多个 Graph 共享受控 Executor，但 Executor 生命周期由 Manager 管理 |
+
+## 8. 文件级修改清单
+
+| 文件或目录 | 结论 | 具体动作 |
+|---|---|---|
+| `include/media/media_packet.h` | 必须修改 | 修复枚举值；明确时间基；增加安全校验和空 Buffer Dump |
+| `include/media/media_frame.h` | 建议修改 | 补时间有效性、轨道关联由消息上下文承载、访问器边界检查 |
+| `include/media/i_media_buffer.h` | 建议修改 | 建立只读共享契约，保留兼容写接口并逐步收敛 |
+| `include/media/puller/i_puller.h` | 必须修改 | 结构化 Read 结果、错误类别和 EOS |
+| `src/media/puller/ffmpeg_puller.cpp` | 必须修改 | 幂等 Open、选轨、读结果、事件和多轨信息 |
+| `src/media/puller/avtp_puller.cpp` | 小幅修改 | 适配结构化 Read 结果，保留 parser/assembler 和统计实现 |
+| `src/media/puller/ethernet_capture.cpp` | 暂无需节点化 | 继续作为 AvtpPuller 内部组件；只补充停止/超时结果映射 |
+| `include/media/stream/source_config.h` | 建议修改 | 删除未生效配置或完成下发，避免 UI/配置文件产生虚假控制感 |
+| `include/media/stream/stream_session.h` | 必须修改 | Prepared/Running 状态、generation、统计和回调解绑 |
+| `src/media/stream/stream_session.cpp` | 必须修改 | 修复并发、Stop、重连、回调快照、旧任务和统计 |
+| `stream_source.*` | 兼容性修复 | 新节点不依赖 subscriber；旧测试仍使用时必须修复引用环和锁内回调 |
+| `jitterbuffer/*` | 首期可禁用，后续修改 | 每轨化、批量出队、time base 和指标 |
+| `include/media/decoder/i_decoder.h` | 必须修改 | 增加 Flush/状态契约，输入逐步 const 化 |
+| `src/media/decoder/ffmpeg_decoder.cpp` | 必须修改 | Open 幂等、Flush 与 Close 分离、时间戳有效性 |
+| `include/media/encoder/i_encoder.h` | 必须修改 | 增加 Flush 和 EncodedTrackInfo；定义输出时间基 |
+| `src/media/encoder/ffmpeg_encoder.cpp` | 必须修改 | 修正视频/音频 PTS，填充 packet 元数据和 duration fallback |
+| `include/media/publisher/publisher_result.h` | 必须修改 | 表达 packet disposition、可恢复性和连接是否仍有效 |
+| `src/media/publisher/default_publisher.cpp` | 必须修改 | 修复等待关键帧导致永久 stopped；补线程安全快照 |
+| `src/media/protocol/ffmpeg_protocol_adapter.cpp` | 小幅修改 | 优先接收 PublisherNode 显式输出 track，兼容路径保留测试 |
+| `src/media/protocol/ffmpeg_mux_protocol.cpp` | 必须修改 | 多轨 interleave、重连状态和指标语义 |
+| `src/media/protocol/rtsp_server_protocol_adapter.cpp` | 必须修改 | 多候选唯一性、显式 track 映射 |
+| `src/media/protocol/rtsp_server_protocol.cpp` | 建议修改 | 有界媒体任务、drain/stop 语义和 delivered 指标 |
+| `media/protocol/rtsp/*` | 原则上无需重构 | 保留 connection/session/transport 边界，只补上层队列要求触发的窄接口 |
+| `media/protocol/avtp/*` | 无需迁移为节点 | 保留纯 parser/assembler/timestamp mapper，节点只包装 Puller 输出 |
+
+## 9. 需要新增的 MediaFlow 文件
+
+推荐目录：
+
+```text
+include/mediaflow/
+  messages.h
+  nodes/
+    stream_source_node.h
+    track_router_node.h
+    decoder_node.h
+    encoder_node.h
+    publisher_sink_node.h
+
+src/mediaflow/
+  nodes/
+    stream_source_node.cpp
+    track_router_node.cpp
+    decoder_node.cpp
+    encoder_node.cpp
+    publisher_sink_node.cpp
+
+test/mediaflow/
+  test_media_messages.cpp
+  test_stream_source_node.cpp
+  test_decoder_node.cpp
+  test_encoder_node.cpp
+  test_publisher_sink_node.cpp
+  test_media_pipeline.cpp
+```
+
+所有新增 C++ 类型只使用：
+
+```cpp
+namespace mediaflow {
+// ...
+}
+```
+
+当前 `video_pipeline_mediaflow` 是只包含核心头文件的 INTERFACE target。媒体适配节点
+依赖 FFmpeg 和 `media` 实现，其 `.cpp` 首期继续进入 `video_pipeline_lib`，并链接
+`video-pipeline::mediaflow`。不要让通用 MediaFlow 核心 target 反向依赖全部媒体库。
+
+## 10. 背压配置建议
+
+不能给所有 Edge 使用统一的 `capacity=64 + DropNewest`。容量应结合消息大小、帧率、
+允许延迟和 codec 依赖关系设置。
+
+| Edge | 实时链路初始建议 | 文件处理建议 | 注意事项 |
+|---|---|---|---|
+| Source -> Decoder，视频 packet | 32 至 128，优先有界 Block 或 DropNewest + 等待关键帧恢复 | Block | 任意丢压缩 packet 可能破坏当前 GOP |
+| Source -> Decoder，音频 packet | 64 至 256，Block 或有明确时限的丢弃 | Block | 音频不能简单 DropOldest 后继续假装时间连续 |
+| Decoder -> 实时预览/推理 | 2 至 4，DropOldest | Block | 低延迟场景保留最新 frame |
+| Decoder -> Encoder | 4 至 16，按业务决定 DropOldest 或 Block | Block | 丢 frame 后 Encoder 仍需连续 PTS |
+| Encoder -> Publisher，视频 | 8 至 32，关键帧感知丢弃 | Block | 当前三种通用策略都不能完整表达 GOP 恢复 |
+| Encoder -> Publisher，音频 | 32 至 128，优先 Block/限时 Block | Block | 发生丢弃时记录时间缺口 |
+| 控制消息 | 8 至 32，Block | Block | StreamInfo、EOS、错误事件不得静默丢失 |
+
+额外约束：
+
+- `EdgeOptions.capacity` 和 `NodeOptions.max_pending_tasks` 会共同形成在途上限。
+- 解码后 4K frame 很大，容量应按估算字节数复核，不能只看消息条数。
+- Source 回调若使用 Block，必须有独立输入线程，且 Transport Close 能唤醒等待。
+- FFmpeg Publisher 重连会占用 publish Executor 数秒，应观察 publish Edge 高水位。
+- RTSP Server 内部 post 队列也要有上限，否则外部 Edge 有界仍不能限制全部内存。
+
+## 11. 错误与恢复策略
+
+建议每个节点声明固定失败策略：
+
+| 场景 | 建议策略 |
+|---|---|
+| 单个坏 packet | 记录并忽略；连续达到阈值后重建 Decoder |
+| Source 暂时 NoData | 继续读取，不增加重连次数 |
+| Source 网络断开 | Session 内按退避重连；成功后递增 generation |
+| 本地文件 EOS | 发送 EOS，走 Graceful Stop，不重连 |
+| StreamInfo 未变化的重连 | 清理解码状态，从关键帧恢复 |
+| StreamInfo 变化 | 停止并重建整路 Graph，首期不在线热切换 |
+| Encoder 单帧失败 | 上报 FatalError，避免继续输出不可预测码流 |
+| Publisher 等待关键帧 | packet disposition 记为 Dropped，Publisher 保持 started |
+| Publisher 重连失败 | StopBranch 或 StopPipeline，由配置决定 |
+| RTSP 单个慢客户端 | 关闭该客户端，不停止 Publisher 和其他客户端 |
+
+PipelineEvent 至少包含：节点 ID、流 ID、输入/输出轨道、generation、错误码、原生错误、
+是否可恢复和建议动作。日志文本不能成为控制逻辑输入。
+
+## 12. 分阶段实施顺序
+
+### A0：修复公共契约
+
+改动：
+
+- 修复 `MediaType` 枚举冲突。
+- 明确 packet 时间基和无时间戳语义。
+- 增加 PullReadStatus。
+- 修复 Session generation、Stop、回调和统计。
+- 为 Decoder/Encoder 增加 Flush 与输出描述。
+
+验收：相关纯单元测试全部通过，现有 media 测试编译通过。
+
+### A1：实现 Source + Decoder 单视频链路
+
+改动：
+
+- 实现 StreamSourceNode、TrackRouterNode 和 DecoderNode。
+- 使用启动前 Prepare，保证 Decoder 先于 Source 就绪。
+- 建立 RTSP/本地文件到解码 frame 的图。
+
+验收：
+
+- 不再存在“先 Start Source，再注册 subscriber”的启动丢包窗口。
+- 本地文件 EOS 正常结束。
+- RTSP 断线重连后旧 generation 数据不会进入新 Decoder。
+
+### A2：实现 Encoder + 单视频 Publisher
+
+改动：
+
+- 实现 EncoderNode 和 PublisherSinkNode。
+- 修复 encoder PTS/time base/output track。
+- 修复 Publisher 等待关键帧的结果语义。
+- 建立 MP4/RTSP -> Decode -> Encode -> RTSP/RTMP。
+
+验收：现有测试不再手工设置 packet `stream_index`、`time_base` 和正常 duration；输出
+可由 ffplay/VLC 播放 30 分钟。
+
+### A3：音视频多轨和 Graceful Stop
+
+改动：
+
+- 音视频使用独立 DecoderNode 和 EncoderNode。
+- PublisherSinkNode 汇合多轨。
+- FFmpeg mux 使用 interleaved write。
+- 完成 Graph pending barrier 和逐级 flush。
+
+验收：A/V 同步、无非单调时间戳、停止后尾部音视频完整、无 Decode/Close 并发。
+
+### A4：分支、推理和高级背压
+
+改动：
+
+- Frame fan-out 到推理、渲染、OSD 或录像。
+- 增加关键帧感知发布队列、按字节预算和端到端延迟指标。
+- 增加多路 Pipeline 管理和受控共享 Executor。
+
+验收：慢推理或慢 Publisher 时内存有界，其他 Pipeline 不受单路故障影响。
+
+## 13. 测试指导
+
+### 13.1 media 单元测试
+
+- `MediaType` 每个值唯一，UNKNOWN 不再等于 VIDEO。
+- 任意合法 `Rational` 的时间戳往返重标定误差可控。
+- `FFmpegPuller::Open -> Close -> Open` 重复 100 次无资源增长。
+- Puller 能区分 NoData、EOS、RetryableError、FatalError 和 Stopped。
+- FFmpeg 多视频 stream 显式选轨，只输出选中 stream。
+- Session 在 CONNECTING、CONNECTED、RECONNECTING 中调用 Stop 都有限时返回。
+- Session 快速 `Start/Stop/Start` 时旧 read/timer handler 不进入新 generation。
+- Session Stats 的 bytes、packets、bitrate、reconnect 和 jitter drop 实际变化。
+- Decoder 连续 Open 两种配置不泄漏，Flush 可输出残留帧。
+- Encoder 使用 `1/25`、`1/90000`、`1/1000000` 等 time base 输出正确 PTS。
+- 音频 FIFO 使用 `1/sample_rate` 和微秒 time base 时均保持连续。
+- Encoder packet 自动带正确 track、time base、duration 和 extradata 描述。
+- Publisher 断线后非关键帧被丢弃但保持可接收下一关键帧。
+- RTSP adapter 对两个同 codec track 且缺少显式 track 的 packet 返回歧义错误。
+- FFmpeg 多轨乱序到达时正确交织并输出可播放文件。
+
+### 13.2 MediaFlow 节点测试
+
+- SourceNode Stop 后即使 session 触发迟到回调，也不再 Emit。
+- DecoderNode 收到错误 track/generation 时拒绝并计数。
+- DecoderNode FrameCallback 一次输出多 frame 时全部进入下游。
+- EncoderNode 一帧输出多 packet 时全部保序发送。
+- PublisherSinkNode 只在必需 track 信息完整后 Start。
+- PublisherSinkNode 所有 IPublisher 调用都发生在同一 Serialized 节点上下文。
+- 节点异常只上报事件，不在节点 Executor 内直接停止 Graph。
+- Graceful Stop 等待在途任务并按 Decoder -> Encoder -> Publisher 顺序 flush。
+
+### 13.3 集成测试迁移
+
+| 当前测试 | 建议处理 |
+|---|---|
+| `test/media/test_stream_decode.cpp` | 改为 SourceNode -> DecoderNode；当前先启动 Source 后注册 subscriber，会丢启动 packet |
+| `test/media/test_local_mp4_decode_rtsp_publisher.cpp` | 保留媒体素材和验证客户端，替换手工状态机为 Graph |
+| `test/media/test_rtsp_decode_encode_push_zlm.cpp` | 替换手工 Encoder/Publisher 串联，删除 packet time base 补丁 |
+| `test/media/avtp_decode_rtsp_publisher.cpp` | A3 后接入 SourceNode，多轨音频/视频分别路由 |
+| `test/media/test_rtsp_server_publisher.cpp` | 保留协议级测试；另增加 PublisherSinkNode 级测试，不把两者合并 |
+| `test/media/test_publisher_protocol.cpp` | 增加重连等待关键帧、明确 track 和多候选拒绝测试 |
+| `test/mediaflow/test_mediaflow.cpp` | 增加拓扑生命周期顺序、pending barrier 和控制线程停止测试 |
+
+### 13.4 压力与故障测试
+
+- 1080p 和 4K 连续运行 1 小时，记录 Edge/Node 高水位和进程内存。
+- Publisher 每次阻塞至 I/O timeout，验证 source/decode 不被同一线程拖住。
+- 模拟 ZLMediaKit 重启，验证重连后从关键帧恢复。
+- 输入每 5 秒断开一次，连续 100 次，检查线程、timer、socket 和 generation。
+- 在 Decode、Encode、Publish 正在执行时分别触发 Immediate/Graceful Stop。
+- 两路及以上 Pipeline 并行，一路重建不能停止另一条 Executor。
+- 音视频输入乱序和不同起始 PTS，检查 mux 输出 DTS 单调与 A/V 同步。
+
+## 14. Windows 构建与验证
+
+使用现有 Visual Studio 环境和工程当前 CMake 配置。构建示例：
+
+```powershell
+& 'C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+实施时应先运行纯本地、无外部服务依赖的测试，再运行摄像头、AVTP 和 ZLMediaKit
+集成测试。所有网络测试必须设置有限超时，避免停止回归因外部环境永久阻塞。
+
+## 15. 验收标准
+
+| 项目 | 最低标准 |
+|---|---|
+| 编译 | Windows Debug/Release 均通过，新增代码无未处理警告 |
+| 启动 | Source 最后激活，第一条 packet 前下游已经就绪 |
+| 停止 | Immediate 有限时返回；Graceful 输出 Decoder/Encoder 残留数据 |
+| 重启 | 同一 Graph 或整路 Pipeline 重启无旧 generation 数据 |
+| 时间戳 | 不需要测试手工修补；多轨无非单调 DTS，A/V 可同步播放 |
+| 背压 | 所有队列有界，满队列行为和丢弃数量可查询 |
+| 错误 | 能区分 EOS、NoData、可恢复网络错误、坏 packet 和致命配置错误 |
+| 发布恢复 | 断线后等待关键帧不会让 Publisher 永久进入未启动状态 |
+| 多轨 | 同 codec 多轨缺少显式 track 时拒绝，不静默写错 |
+| 线程安全 | 有状态媒体对象仅由所属 Serialized 节点调用；查询使用快照 |
+| 内存 | 长时间运行不随处理速度差持续增长，4K 队列内存符合预算 |
+| 可观测性 | 可查询 Pipeline、Node、Edge、Source、Decoder、Encoder、Publisher 指标 |
+
+## 16. 最终实施建议
+
+建议按以下提交边界推进，便于回归和问题定位：
+
+1. `fix(media): clarify media identity and timestamp contracts`
+2. `fix(media): harden stream session lifecycle and read results`
+3. `fix(media): add decoder and encoder flush contracts`
+4. `fix(media): complete encoder output metadata and mux interleave`
+5. `fix(media): correct publisher reconnect and track routing semantics`
+6. `feat(mediaflow): add media messages and source/decoder nodes`
+7. `feat(mediaflow): add encoder and publisher nodes`
+8. `feat(mediaflow): add graceful media pipeline shutdown`
+9. `test(mediaflow): migrate media end-to-end pipelines`
+
+第一批实现不应同时接入推理、渲染和动态拓扑。先让
+`Source -> Decode -> Encode -> Publish` 具备明确的轨道、时间、代次、背压、错误和
+停止契约，再扩展业务分支。这样 MediaFlow 才真正接管流程编排，而不是只在现有回调
+链外再包一层类。
