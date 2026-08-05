@@ -1221,3 +1221,115 @@ ReadPacket()
     避免 Source 长时间以远高于实时的速度填充下游。
 5. **按轨道指标和验收门槛**：分别记录音频/视频的 accepted、dropped、rejected、
      keyframe 等指标，并把“视频帧数大于零且 Edge 丢弃为零”纳入解码测试验收。
+
+### 21.7 其它 MediaFlow 测试检查结果
+
+#### 21.7.1 检查范围
+
+当前工程中与 MediaFlow 直接相关的测试入口如下：
+
+| 测试 | 类型 | 是否连接摄像头 | 检查结果 |
+|---|---|---:|---|
+| `test_mediaflow` | Graph、Executor、Transport、生命周期和背压单元测试 | 否 | 退出码 `0` |
+| `test_mediaflow_media_nodes` | ScriptedPuller、Router、Decoder、Encoder、Publisher 节点测试 | 否 | 退出码 `0` |
+| `test_stream_decode` | `StreamSourceNode -> TrackRouterNode -> 双 Decoder` 真实 RTSP 测试 | 是 | 短时成功；长时停止暴露问题 |
+
+没有发现第二个可以直接使用 `192.168.66.83` 摄像头地址的 MediaFlow 测试。现有
+`test_mediaflow_media_nodes` 使用模拟 Puller、模拟 Decoder 和 RecordingPublisher，
+不会额外占用摄像头 RTSP 会话；真实设备测试始终只启动一个 `test_stream_decode`
+进程，符合摄像头只支持一路 RTSP 拉流的限制。
+
+#### 21.7.2 本地 MediaFlow 测试结果
+
+`test_mediaflow` 已覆盖以下基础行为并通过：
+
+- `DropNewest`、`DropOldest`、`Close/Open` 的队列语义；
+- ExecutorDispatch 传输；
+- 节点和端口类型校验、拓扑冻结、启动失败回滚；
+- Edge 和 Node 指标；
+- 有界任务队列达到上限后的拒绝计数；
+- 同一个 Graph 连续停止并重新启动 100 次。
+
+`test_mediaflow_media_nodes` 已覆盖以下媒体节点行为并通过：
+
+- Source 第 1 代次收到音频包时由 Router 丢弃，不进入视频 Decoder；
+- RetryableError 触发重连并递增 generation；
+- 晚到的旧代次视频包不会重新进入 Decoder；
+- Encoder 一帧产生多个 packet 时全部保序发送；
+- Publisher 等待视频关键帧、多轨 EOS 汇合和 Flush 尾包。
+
+这两个测试没有发现新的失败，但它们的输入量很小，模拟 Decoder 会立即返回，
+因此不能覆盖真实摄像头的以下场景：音频先于视频的大批量突发、1080p H.264 解码
+耗时、FFmpeg 网络读取阻塞、视频元数据暂时不完整，以及长时间 Graph 停止。
+
+#### 21.7.3 摄像头单路长时观测
+
+使用 `test_stream_decode` 连接 `rtsp://192.168.66.83/live/mainstream`，配置保持
+TCP、低延迟、5 秒连接/读取超时。测试只建立一个 RTSP 会话。
+
+一次约 60 秒的观测中，连接初期成功识别到：
+
+- 视频：H.264，1920x1080，25 fps，stream index `0`；
+- 音频：G.711，16 kHz，单声道，stream index `1`；
+- 视频从第 1 帧开始正常解码，日志至少增长到视频第 `271` 帧；
+- 音频日志至少增长到第 `501` 帧；
+- 观测前段没有出现新的 Edge 丢弃日志。
+
+这说明队列扩大后的短时突发问题没有在本次连接初期再次出现。但在约前 12 秒
+之后，测试日志不再出现新的音视频帧计数；随后发送回车请求停止，进程在额外等待
+30 秒后仍未退出，只能由外部测试控制器强制终止。因此本次长时测试不能报告为
+“60 秒完整通过”，只能确认“前段 A/V 解码成功，长时停止失败或超时”。
+
+#### 21.7.4 新发现问题一：长时间运行后的停止不可靠
+
+这是当前可以确认的 MediaFlow 风险。短时运行约 5 秒时，`GracefulStop(5s)` 可以
+完成并输出统计；长时运行后，停止请求没有在 30 秒观察窗口内返回。当前可能的
+阻塞位置包括：
+
+1. `StreamSourceNode::Stop()` 调用 `FFmpegPuller::Close()` 时等待
+   `ReadPacketResult()` 释放 `io_mutex_`；
+2. `av_read_frame()` 或 `avformat_close_input()` 的网络 I/O 关闭过程没有在预期
+   时间内返回；
+3. GracefulStop 先等待 Edge/Node 排空，再逐节点 Flush，长时间突发形成的任务积压
+   使停止屏障超过预期；
+4. 当前测试只有回车停止入口，没有在停止阶段输出 Source、Edge 和 Node 的实时状态，
+   因此强制终止前无法精确区分是 Puller 关闭阻塞还是 Graph 排空阻塞。
+
+这不是摄像头“只支持一路 RTSP”本身造成的结论，因为单路限制已经遵守；但强制终止
+会让设备端会话释放变慢，后续复测必须先确认本机没有残留进程并给设备足够的会话
+释放时间，不能并行启动第二个拉流测试。
+
+#### 21.7.5 新发现问题二：视频 StreamInfo 可能暂时为 `0x0`
+
+第二次单路复测发生在上一次长时进程被强制终止之后。FFmpeg 打开同一 URL 时报告
+视频为 `0x0`，并输出：
+
+```text
+Could not find codec parameters for stream 0 (Video: h264, none): unspecified size
+```
+
+该次连接仍然读到了音频，并在极短时间内产生大量音频帧，但没有产生视频帧；停止
+请求同样未在等待窗口内返回。由于摄像头只支持一路 RTSP，且该次复测紧接着发生在
+强制终止之后，这个现象暂时分为两层：
+
+- **已确认的防御性缺口**：`FFmpegPuller::Open()` 允许视频 `width/height` 为 `0` 的
+  `MediaStreamInfo` 继续进入 MediaFlow；`DecoderNode::IsUsableStreamInfo()` 当前只
+  检查媒体类型、codec 和 time_base，没有拒绝无效视频尺寸。
+- **尚未确认的触发原因**：设备残留 RTSP 会话、FFmpeg 探测时机或摄像头端视频轨道
+  暂时未发送，仍需在设备会话完全释放后单路复测，不能直接归因于某一个组件。
+
+#### 21.7.6 需要补充的测试和改进
+
+根据这次检查，后续应补充以下验收项：
+
+| 优先级 | 项目 | 验收条件 |
+|---|---|---|
+| P0 | 长时停止阶段诊断 | 停止请求后分别输出 Puller 关闭、Source 线程、Edge 队列和 Node pending 状态；在明确期限内返回，不允许测试控制器只能强杀进程 |
+| P0 | 视频元数据防御 | 视频 `width <= 0` 或 `height <= 0` 时拒绝打开 Decoder，或等待后续完整 StreamInfo；错误必须带 stream index 和 generation |
+| P1 | 双轨突发回归 | 使用模拟 Puller 先连续注入高比例音频再注入 H.264 关键帧，验证配置队列下视频包不丢失，并验证丢弃指标可观测 |
+| P1 | 设备单路重连 | 每次测试结束后确认进程和 TCP 会话都已释放，再单路重连；分别记录首次 Open 的视频尺寸、首个视频包和首个视频帧耗时 |
+| P1 | 长时媒体连续性 | 连续运行至少 10 分钟，按固定间隔记录 A/V 帧计数、Source generation、Edge dropped/rejected 和 Decoder LastError |
+| P2 | 停止语义拆分 | 分别验证 ImmediateStop 和 GracefulStop；GracefulStop 超时后应有明确降级路径，而不是依赖外部强制终止 |
+
+在上述问题关闭前，`test_mediaflow` 和 `test_mediaflow_media_nodes` 可以作为本地回归
+测试通过，但不能代表真实摄像头 MediaFlow 链路已经完成长时稳定性验收。
