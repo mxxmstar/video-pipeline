@@ -1,3 +1,12 @@
+add_executable(test_mediaflow mediaflow/test_mediaflow.cpp)
+target_link_libraries(test_mediaflow PRIVATE video-pipeline::mediaflow)
+if(MSVC)
+    target_compile_options(test_mediaflow PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_mediaflow PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_mediaflow COMMAND test_mediaflow)
+
 add_executable(test_spdlog test_spdlog.cpp)
 target_link_libraries(test_spdlog PRIVATE video-pipeline::spdlog)
 video_pipeline_copy_runtime_dlls(test_spdlog)

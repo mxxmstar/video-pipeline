@@ -268,6 +268,32 @@ endif()
 # ============================================================
 find_package(Threads REQUIRED)
 
+# ============================================================
+# MediaFlow module
+# ============================================================
+add_library(video_pipeline_mediaflow INTERFACE)
+add_library(video-pipeline::mediaflow ALIAS video_pipeline_mediaflow)
+
+target_include_directories(video_pipeline_mediaflow
+    INTERFACE
+        "${CMAKE_SOURCE_DIR}/include"
+)
+
+target_link_libraries(video_pipeline_mediaflow
+    INTERFACE
+        video-pipeline::boost
+        Threads::Threads
+)
+
+if(WIN32)
+    target_compile_definitions(video_pipeline_mediaflow
+        INTERFACE
+            _WIN32_WINNT=0x0601
+            WIN32_LEAN_AND_MEAN
+            NOMINMAX
+    )
+endif()
+
 file(GLOB_RECURSE VIDEO_PIPELINE_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/src/*.cpp"
 )
@@ -305,6 +331,7 @@ target_link_libraries(video_pipeline_lib
     PUBLIC
         video-pipeline::boost
         video-pipeline::spdlog
+        video-pipeline::mediaflow
 )
 
 if(WIN32)
