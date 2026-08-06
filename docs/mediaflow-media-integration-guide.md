@@ -461,6 +461,39 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 | M-P1-10 | `MultiStreamInfo` | 提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆 |
 | MF-P1-01 | MediaFlow metrics | 增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计 |
 | MF-P1-02 | Queue/Dispatch | 当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限 |
+| MF-P1-03 | Source 混合音视频队列、TrackRouterNode 及下游调度 | 音频突发可能在混合入口形成积压，放大视频延迟或丢失；必须按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对 |
+
+#### MF-P1-03 详细要求：音视频队列隔离与同步
+
+音频帧数和视频帧数不能直接按数量比较。当前摄像头音频通常每帧包含约 20 ms
+数据，视频约为 40 ms 一帧，因此音频帧数约为视频帧数的两倍属于正常比例。但
+现场短测曾出现音频 4483 帧、视频 370 帧的明显差距，结合音频 PTS 和首批突发
+日志，应该按音频历史数据追赶或突发积压处理，不能仅视为编码帧率差异。
+
+当前 MediaFlow 的结构是：
+
+```text
+StreamSourceNode -> 混合 MediaPacket Edge -> TrackRouterNode
+                                      -> 音频 Edge -> Audio Decoder
+                                      -> 视频 Edge -> Video Decoder
+```
+
+音频和视频在 Router 之后已经使用独立 Edge，但 Source 到 Router 之间仍是混合
+队列。`PreferVideoKeyframes` 能在队列满时优先保护视频，不能完全隔离音频积压
+对视频延迟的影响。因此，正式封装 media 各流程前必须完成以下改进：
+
+- Source 入口按轨道隔离队列，或提供等价的轨道级调度边界，避免音频突发直接占满
+  视频共享的容量；
+- 使用统一的 PTS/DTS 调度、音频主时钟、视频迟到帧处理和重连 discontinuity；
+- 以轨道时间长度或字节数控制容量，并分别记录音频/视频队列时长、PTS 差值和
+  丢弃原因；
+- 所有包和帧保留 PTS、DTS、time base、generation；录制/发布链路按 DTS 交织
+  写入，而不是按两个队列的出队次数配对；
+- 播放链路使用统一时钟，通常以音频时钟为主，视频按 PTS 等待或丢弃迟到的非
+  关键帧，不能把两个 FIFO 的独立出队误认为已经完成音视频同步。
+
+该问题属于必须修改的 P1 架构项，当前阶段暂不实施，现阶段继续使用
+`PreferVideoKeyframes` 和现有分轨 Edge 作为有界保护策略。
 
 ### 7.3 P2：性能和扩展优化
 
@@ -1443,39 +1476,7 @@ Decoder 的 `enqueued/processed` 分别为 `370/370`、`4483/4483`，三条相�
 仍会拒绝无法替换的最新关键帧；对绝对不允许丢包的录制链路应继续使用 `Block` 并单独
 配置容量和停止超时。
 
-#### 21.7.14 音视频队列差异评估与暂缓实施
-
-本次评估确认，音频帧数和视频帧数不能直接按数量比较。当前摄像头音频通常每帧
-包含约 20 ms 数据，视频约为 40 ms 一帧，因此音频帧数约为视频帧数的两倍属于
-正常比例。但现场短测曾出现音频 4483 帧、视频 370 帧的明显差距，结合音频 PTS
-和首批突发日志，应该按音频历史数据追赶或突发积压处理，不能仅视为编码帧率差异。
-
-当前 MediaFlow 的结构是：
-
-```text
-StreamSourceNode -> 混合 MediaPacket Edge -> TrackRouterNode
-                                      -> 音频 Edge -> Audio Decoder
-                                      -> 视频 Edge -> Video Decoder
-```
-
-音频和视频在 Router 之后已经使用独立 Edge，但 Source 到 Router 之间仍是混合队列。
-此前新增的 `PreferVideoKeyframes` 只能在队列满时优先保护视频，不能完全隔离音频
-积压对视频延迟的影响。
-
-本问题本阶段暂不实施“Source 入口处按轨道拆分队列”。原因是拆分后仍必须增加统一
-的 PTS/DTS 调度、音频主时钟、视频迟到帧处理、重连 discontinuity 和按轨道时间长度
-的容量控制；如果只把两个 FIFO 分开，反而可能造成音视频时钟漂移。后续设计必须遵守：
-
-- 不以音频帧数和视频帧数一一对应作为同步条件；
-- 所有包和帧保留 PTS、DTS、time base、generation；
-- 播放链路使用统一时钟，通常以音频时钟为主，视频按 PTS 等待或丢弃迟到的非关键帧；
-- 录制/发布链路按 DTS 交织写入，而不是按两个队列的出队次数配对；
-- 队列容量以时间长度或字节数约束，并分别记录音频/视频队列时长、PTS 差值和丢弃原因。
-
-当前阶段继续使用 `PreferVideoKeyframes` 和现有分轨 Edge，先完成 21.7.8 长时停止
-诊断问题，再单独设计和实施轨道隔离队列。
-
-#### 21.7.15 第四批修复实施记录：保护 Node Dispatch 队列中的视频任务
+#### 21.7.14 第四批修复实施记录：保护 Node Dispatch 队列中的视频任务
 
 上一批修复只覆盖了 `Source -> Router` 以及 `Router -> Decoder` 的 Edge 队列。
 当 Router 的 Drain 已经成功取出消息，但 Decoder 节点自身的 Serialized
@@ -1513,6 +1514,6 @@ rejected=0`；Source -> Router、Router -> Video 和 Router -> Audio 三条相�
 Edge 的 dropped/rejected 均为 `0`。这证明 Dispatch 层保护策略已接入并未影响
 当前稳定设备流，但仍需在设备状态稳定后进行更长时间、更多音频突发强度的验证。
 
-本批修复没有改变 21.7.14 中关于队列拆分和音视频同步的结论。后续若实施轨道
-隔离，仍必须以 PTS/DTS、time base、统一时钟和时间长度为约束，不能按音频帧数
-与视频帧数配对。
+本批修复没有改变 `MF-P1-03` 中关于队列拆分和音视频同步的结论。后续若实施
+轨道隔离，仍必须以 PTS/DTS、time base、统一时钟和时间长度为约束，不能按音频
+帧数与视频帧数配对。
