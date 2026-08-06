@@ -497,7 +497,7 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-09</td><td><code>PublisherResult</code></td><td>增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
-<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：设备稳定后，使用同一双轨 RTSP 会话复测上一已提交版本</td></tr>
+<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：使用无坏包双轨媒体源完成三轮性能复测</td></tr>
 <tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18 节<br>后续：真实 Decoder 丢包关键帧恢复和统一时钟调度</td></tr>
 </tbody>
 </table>
@@ -852,7 +852,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.19 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本双轨 CPU/吞吐基线已记录，改造前对照因摄像头高温断流无效，真实 Decoder 关键帧恢复和统一时钟调度仍待实施</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.19 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本基线和本机双轨初步前后对照已记录，最终性能验收仍需无坏包媒体源三轮复测；真实 Decoder 关键帧恢复和统一时钟调度仍待实施</td></tr>
 </tbody>
 </table>
 
@@ -2127,7 +2127,7 @@ CPU/吞吐采集能力和当前版本的 66.166 双轨基线已完成，CAP-11 �
 
 为避免摄像头温度、网络和设备重启影响，可使用本机视频文件通过 FFmpeg 推送到
 本机 RTSP 服务，再让当前版本和 `fcd4a78` 基线分别拉取同一个本地 RTSP URL。
-本方法只记录为后续复测方案，本次未执行。
+本方法已完成一轮双轨 600 秒初步对照，最终验收仍需使用无坏包的稳定媒体源复测。
 
 已确认的视频目录为：
 `D:\file_mx\新建文件夹 (2)\初级go工程师训练营\17第十五周：支付服务设计与实现`。
@@ -2137,7 +2137,9 @@ CPU/吞吐采集能力和当前版本的 66.166 双轨基线已完成，CAP-11 �
 FFmpeg 位于：
 `D:\file_mx\aaaaa\learncpp\tools\win32\ffmpeg-2025-05-01-git-707c04fe06-full_build\ffmpeg.exe`。
 建议先启动本机 ZLMediaKit 的 RTSP 服务，并确认监听端口，例如 `554`；再使用
-以下命令循环、实时推送一段双轨文件，避免文件播放到尾部产生 EOS：
+以下命令循环、实时推送一段双轨文件，避免文件播放到尾部产生 EOS。由于源文件
+的 AAC 没有 RTSP muxer 所需的 global header，不能直接使用 `-c copy`；实际推流
+保留视频码流复制，仅将音频重新编码为 AAC：
 
 ```powershell
 & 'D:\file_mx\aaaaa\learncpp\tools\win32\zlmediakit\MediaServer.exe' '-c' 'D:\file_mx\aaaaa\learncpp\tools\win32\zlmediakit\config.ini'
@@ -2145,7 +2147,8 @@ FFmpeg 位于：
 & 'D:\file_mx\aaaaa\learncpp\tools\win32\ffmpeg-2025-05-01-git-707c04fe06-full_build\ffmpeg.exe' `
   '-re' '-stream_loop' '-1' `
   '-i' 'D:\file_mx\新建文件夹 (2)\初级go工程师训练营\17第十五周：支付服务设计与实现\第四十九讲：支付服务实现（二） .mp4' `
-  '-map' '0:v:0' '-map' '0:a:0' '-c' 'copy' `
+  '-map' '0:v:0' '-map' '0:a:0' '-c:v' 'copy' '-c:a' 'aac' `
+  '-ar' '44100' '-ac' '2' '-b:a' '128k' `
   '-f' 'rtsp' '-rtsp_transport' 'tcp' `
   'rtsp://127.0.0.1:554/mediaflow/benchmark'
 ```
@@ -2156,3 +2159,52 @@ FFmpeg 位于：
 验收仍要求视频和音频均被探测和解码，视频/音频 Edge 的 dropped、rejected、
 timestamp 均为 `0`，并完成 600 秒稳定吞吐和 CPU 采集；不使用视频单轨或音频
 单轨样本替代双轨结果。
+
+##### 21.7.19.2 本机双轨 600 秒初步对照结果
+
+本轮复测复用了已运行的本机 ZLMediaKit `127.0.0.1:554`，每次只建立一个拉流
+会话，推流和拉流均使用 TCP。输入文件为第四十九讲 MP4，测试 URL 为
+`rtsp://127.0.0.1:554/mediaflow/benchmark`。当前版本使用工作区提交
+`0b404bc` 构建，基线使用隔离工作树中提交 `fcd4a78` 构建；两次测试使用相同
+的 FFmpeg 推流命令并串行执行。
+
+| 指标 | 当前版本 | `fcd4a78` 基线 |
+|---|---:|---:|
+| 测试墙钟 | `600002 ms` | `600487 ms` |
+| 进程 CPU（单核等效） | `9.79%` | `9.51%` |
+| 视频解码吞吐 | `24.73 fps`，`14841` 帧 | `24.73 fps`，`14848` 帧 |
+| 音频解码吞吐 | `42.99 fps`，`25796` 帧 | `42.97 fps`，`25803` 帧 |
+| 音频启动丢弃 | `dropped_oldest=8` | `dropped_oldest=13` |
+| Decoder rejected | `0` | `0` |
+| timestamp 诊断 | `0` | `0` |
+| 当前版本停止后帧内存 | `wrappers/packed/AVBuffer=0/0/0` | 基线未采集该指标 |
+
+当前版本相对基线 CPU 增加 `0.28` 个百分点，约 `2.9%` 相对增幅，低于 CAP-11
+规定的 `5%`；视频和音频吞吐没有下降。本轮可作为性能回归的初步通过样本，但
+不能直接替代最终验收，因为 FFmpeg 在读取该训练视频的原始 AAC 音轨时报告了
+少量坏包。坏包发生在推流源侧，MediaFlow 两版均未出现 Decoder rejected 或
+timestamp 错误；完整日志如下：
+
+- 当前版本：`build-mediaflow-vs/test_stream_decode_local_current_600s.out`、
+  `build-mediaflow-vs/test_stream_decode_local_current_600s.err`；
+- 当前版本推流：`build-mediaflow-vs/ffmpeg_local_dual_current_600s.err`；
+- 基线版本：隔离目录
+  `build-mediaflow-baseline-66166/test_stream_decode_local_baseline_600s.out`、
+  `build-mediaflow-baseline-66166/test_stream_decode_local_baseline_600s.err`。
+
+##### 21.7.19.3 本轮测试问题与处理结论
+
+1. 直接使用 `-c copy` 推送失败。FFmpeg 报告 `AAC with no global headers is
+   currently not supported`，因此改为视频复制、音频 AAC 转码；这不是 MediaFlow
+   的失败。
+2. 三段训练视频的原始 AAC 在 60 秒扫描中均出现坏包，不能作为无错误音频源；本轮
+   仍保留原文件音频以保证对照输入真实一致，因此结果标记为初步样本。
+3. 尝试实时重新编码视频时，FFmpeg 推流速度接近 `1x`，推流端自身跟不上并导致
+   MediaFlow 队列丢弃持续增长；该方案会把推流端编码能力混入测试，已废弃。
+4. 尝试由 FFmpeg 生成独立音频时，未给第二个 `lavfi` 输入配置实时读取会造成音频
+   高速突发；补充 `-re` 后本机 RTSP 服务仍出现周期性接入突发，因此没有采用该
+   结果作为最终长测数据。
+
+后续正式验收应先准备一段经过完整校验的 H.264/AAC 双轨文件，继续使用视频复制、
+音频复制或无需额外实时转码的推流方式，至少串行复测三轮 600 秒；禁止改成视频
+单轨或音频单轨来规避音视频队列问题。
