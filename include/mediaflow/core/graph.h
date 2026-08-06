@@ -358,10 +358,25 @@ public:
           metrics_(std::make_shared<EdgeMetrics>()) {
         if (options_.transport == TransportKind::ExecutorDispatch) {
             auto direct = std::make_shared<ExecutorDispatchTransport<T>>();
-            direct->SetConsumer([destination = destination_, input = input_](T value) {
-                destination->Dispatch([input, value = std::move(value)]() mutable {
-                    input->Receive(std::move(value));
-                });
+            direct->SetResultConsumer(
+                [destination = destination_, input = input_](T value) {
+                // ExecutorDispatch 没有 Edge::Drain 这一层，必须在这里保留
+                // 媒体分类，否则视频任务会退化为普通 Dispatch，无法使用
+                // NodeContext 的视频优先保护策略。
+                const DispatchPriority priority{
+                    QueueItemTraits<T>::IsAudio(value),
+                    QueueItemTraits<T>::IsVideo(value),
+                    QueueItemTraits<T>::IsKeyframe(value),
+                };
+                const bool accepted = destination->Dispatch(
+                    [input, value = std::move(value)]() mutable {
+                        input->Receive(std::move(value));
+                    },
+                    priority);
+                // MailboxPushResult 没有单独的“Node 队列满”枚举；对发送方
+                // 统一表现为当前消息被丢弃，NodeMetrics 仍保留 rejected 计数。
+                return accepted ? MailboxPushResult::Accepted
+                                : MailboxPushResult::DroppedNewest;
             });
             transport_ = std::move(direct);
         } else {

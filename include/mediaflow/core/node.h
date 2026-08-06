@@ -72,8 +72,8 @@ public:
 
 protected:
     /// 向所有下游发送一条消息；Source 不负责等待或重试背压结果。
-    void Emit(T value) {
-        output_.Send(std::move(value));
+    bool Emit(T value) {
+        return output_.Send(std::move(value));
     }
 
 private:

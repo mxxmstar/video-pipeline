@@ -236,16 +236,19 @@ template <typename T>
 class ExecutorDispatchTransport final : public ITransport<T> {
 public:
     using Consumer = std::function<void(T)>;
+    using ResultConsumer = std::function<MailboxPushResult(T)>;
 
     /// 快照消费者和回调后解锁，再执行外部逻辑，避免回调重入自锁。
     MailboxPushResult Send(T value) override {
         Consumer consumer;
+        ResultConsumer result_consumer;
         typename ITransport<T>::SendResultCallback result_callback;
         bool closed = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             closed = closed_;
             consumer = consumer_;
+            result_consumer = result_consumer_;
             result_callback = send_result_callback_;
         }
 
@@ -256,13 +259,16 @@ public:
             return MailboxPushResult::Closed;
         }
 
-        if (result_callback) {
-            result_callback(MailboxPushResult::Accepted);
-        }
-        if (consumer) {
+        MailboxPushResult result = MailboxPushResult::Accepted;
+        if (result_consumer) {
+            result = result_consumer(std::move(value));
+        } else if (consumer) {
             consumer(std::move(value));
         }
-        return MailboxPushResult::Accepted;
+        if (result_callback) {
+            result_callback(result);
+        }
+        return result;
     }
 
     /// DirectTransport 没有内部队列，因此始终没有可供 Drain 取出的消息。
@@ -306,10 +312,18 @@ public:
         consumer_ = std::move(consumer);
     }
 
+    /// 设置可回传投递结果的消费者，供 Edge 把 Node Dispatch 的拒绝结果
+    /// 传回 OutputPort，避免直投路径永远报告 Accepted。
+    void SetResultConsumer(ResultConsumer consumer) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        result_consumer_ = std::move(consumer);
+    }
+
 private:
     mutable std::mutex mutex_;
     bool closed_{false};
     Consumer consumer_;
+    ResultConsumer result_consumer_;
     typename ITransport<T>::NotifyCallback notify_callback_;
     typename ITransport<T>::SendResultCallback send_result_callback_;
 };

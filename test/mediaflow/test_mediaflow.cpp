@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -210,6 +211,97 @@ private:
     bool released_{false};
 };
 
+class MediaBurstSource final : public SourceNode<MediaPacketMessage> {
+public:
+    std::string Name() const override {
+        return "media-burst-source";
+    }
+
+    /// 测试需要在首个任务阻塞后再注入突发包，因此 Source 不在 Start 中发送。
+    bool Start() override {
+        return true;
+    }
+
+    bool Send(MediaPacketMessage message) {
+        return Emit(std::move(message));
+    }
+};
+
+class BlockingMediaSink final : public SinkNode<MediaPacketMessage> {
+public:
+    std::string Name() const override {
+        return "blocking-media-sink";
+    }
+
+    bool WaitUntilEntered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return entered_;
+        });
+    }
+
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    bool WaitForCount(std::size_t count) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [this, count]() {
+                                       return messages_.size() >= count;
+                                   });
+    }
+
+    std::vector<MediaPacketMessage> Messages() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return messages_;
+    }
+
+protected:
+    void Process(MediaPacketMessage message) override {
+        bool block = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            messages_.push_back(std::move(message));
+            if (!entered_) {
+                entered_ = true;
+                block = true;
+            }
+        }
+        condition_.notify_all();
+
+        if (block) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            condition_.wait(lock, [this]() {
+                return released_;
+            });
+        }
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::vector<MediaPacketMessage> messages_;
+    bool entered_{false};
+    bool released_{false};
+};
+
+MediaPacketMessage MakePriorityMessage(MediaType type, bool keyframe) {
+    auto packet = std::make_shared<MediaPacket>();
+    packet->type = type;
+    packet->codec = type == MediaType::VIDEO ? CodecType::H264 : CodecType::AAC;
+    packet->stream_index = type == MediaType::VIDEO ? 1 : 2;
+    packet->keyframe = keyframe;
+    MediaPacketMessage message;
+    message.packet = std::move(packet);
+    message.generation = 1;
+    return message;
+}
+
 template <typename Predicate>
 bool WaitUntil(Predicate predicate,
                std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
@@ -348,6 +440,51 @@ void TestVideoPriorityDispatchQueue() {
     assert(WaitUntil([&]() { return context->PendingTasks() == 0; }));
     context->CloseDispatch();
     executor->Stop();
+}
+
+void TestVideoPriorityExecutorDispatch() {
+    auto executor = std::make_shared<AsioExecutor>("priority-direct", 1);
+    NodeOptions sink_options;
+    sink_options.max_pending_tasks = 3;
+    sink_options.prefer_video_keyframes = true;
+
+    Graph graph;
+    assert(graph.AddNode<MediaBurstSource>("source", executor, NodeOptions{}));
+    assert(graph.AddNode<BlockingMediaSink>(
+        "sink", executor, sink_options));
+
+    EdgeOptions edge_options;
+    edge_options.transport = TransportKind::ExecutorDispatch;
+    assert(graph.Connect<MediaPacketMessage>("source", "sink", edge_options));
+    assert(graph.Start());
+
+    auto source = graph.GetNode<MediaBurstSource>("source");
+    auto sink = graph.GetNode<BlockingMediaSink>("sink");
+    assert(source && sink);
+
+    // 先占住一个正在执行的音频任务，再让音频突发填满 Node Dispatch 队列。
+    assert(source->Send(MakePriorityMessage(MediaType::AUDIO, false)));
+    assert(sink->WaitUntilEntered());
+    assert(source->Send(MakePriorityMessage(MediaType::AUDIO, false)));
+    assert(source->Send(MakePriorityMessage(MediaType::AUDIO, false)));
+    // ExecutorDispatch 没有 Drain，视频分类必须在 Edge 的直接消费者中传递，
+    // 否则这个关键帧会被错误地按普通满队列任务拒绝。
+    assert(source->Send(MakePriorityMessage(MediaType::VIDEO, true)));
+    // 关键帧已经替换了一个排队音频，新的音频应当从 OutputPort 观察到拒绝。
+    assert(!source->Send(MakePriorityMessage(MediaType::AUDIO, false)));
+
+    sink->Release();
+    assert(sink->WaitForCount(3));
+    const auto messages = sink->Messages();
+    bool received_video_keyframe = false;
+    for (const auto& message : messages) {
+        if (message.packet && message.packet->type == MediaType::VIDEO &&
+            message.packet->keyframe) {
+            received_video_keyframe = true;
+        }
+    }
+    assert(received_video_keyframe);
+    graph.Stop();
 }
 
 void TestExecutorDispatchTransport() {
@@ -590,6 +727,7 @@ int main() {
     TestQueueBackpressure();
     TestVideoPriorityBackpressure();
     TestVideoPriorityDispatchQueue();
+    TestVideoPriorityExecutorDispatch();
     TestExecutorDispatchTransport();
     TestGraphValidationAndTopologyFreeze();
     TestGraphErrorRollback();

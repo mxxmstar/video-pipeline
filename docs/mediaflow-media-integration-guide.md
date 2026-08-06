@@ -370,7 +370,7 @@ publisher->Publish(routed);
 | Executor Stop | `io_context::stop()` 丢弃排队任务 | 残留 frame/packet 丢失 | Graceful 模式先 drain，再停止 Executor |
 | 共享 Executor | Graph::Stop 会停止其见到的 Executor | 一路停止可能影响其他 Graph | 拆分 Executor 所有权，M1 前不要跨 Graph 共享 |
 | 节点致命错误 | 无独立控制面停止入口 | 节点线程直接 Stop 可能自 join | 事件上报到 PipelineController，由控制线程执行停止 |
-| ExecutorDispatch | Send 先记 Accepted，目标 Dispatch 失败不可回传 | 发送方看不到实际拒绝 | 媒体主链路首期使用 QueueTransport |
+| ExecutorDispatch | 直投路径需要把消息直接交给目标 Node Dispatch；目标队列满时必须回传拒绝 | 发送方看不到实际拒绝，或媒体分类丢失导致视频保护失效 | 直投消费者传递 `DispatchPriority` 并回传 `MailboxPushResult`；媒体主链路仍优先使用 QueueTransport |
 
 ### 6.2 推荐启动顺序
 
@@ -1497,6 +1497,13 @@ Dispatch 队列被音频突发占满时，视频任务仍可能在进入节点�
    新任务再占用一个槽位，保证停止屏障和队列实际长度一致。
 5. `test_stream_decode` 的音视频 Decoder 节点启用该策略，`test_mediaflow` 新增
    Dispatch 队列满载时“视频关键帧替换音频、后续音频被拒绝”的回归测试。
+6. 修复 `ExecutorDispatch` 直投路径遗漏媒体分类的问题。该路径没有 `Edge::Drain`
+   负责分类，因此在直接消费者中显式生成 `DispatchPriority`，确保使用直接传输时
+   仍然能够保护视频关键帧。
+7. 增加 Graph 级直投回归测试：阻塞首个音频任务并填满后续音频任务，验证视频
+   关键帧仍进入节点，而新增音频不能挤掉已保留的视频任务。
+8. 为 `ExecutorDispatchTransport` 增加可回传结果的消费者接口；当目标 Node
+   Dispatch 因队列满而拒绝任务时，`OutputPort::Send` 不再错误返回成功。
 
 验证结果（VS 18 Community x64 Debug）：
 
@@ -1509,7 +1516,7 @@ test_stream_decode --duration-ms 15000  exit code 0
 
 摄像头单路 RTSP 测试仍使用 `rtsp://192.168.66.83/live/mainstream`。本次短时
 测试识别到视频 `1920x1080/25fps` 和音频 `16kHz/mono`，Decoder 指标为视频
-`enqueued=375, processed=375, rejected=0`、音频 `enqueued=745, processed=745,
+`enqueued=372, processed=372, rejected=0`、音频 `enqueued=5264, processed=5264,
 rejected=0`；Source -> Router、Router -> Video 和 Router -> Audio 三条相关
 Edge 的 dropped/rejected 均为 `0`。这证明 Dispatch 层保护策略已接入并未影响
 当前稳定设备流，但仍需在设备状态稳定后进行更长时间、更多音频突发强度的验证。
