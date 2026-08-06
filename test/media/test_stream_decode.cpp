@@ -199,19 +199,36 @@ double ProcessCpuPercent(const ProcessCpuSnapshot& begin,
 int main(int argc, char* argv[]) {
     std::cout << "=== MediaFlow RTSP Stream Decode ===\n";
 
+    constexpr const char* kDefaultUrl =
+        "rtsp://192.168.66.83/live/mainstream";
     int duration_ms = 0;
-    if (argc == 3 && std::string(argv[1]) == "--duration-ms") {
-        try {
-            duration_ms = std::max(0, std::stoi(argv[2]));
-        } catch (...) {
-            std::cerr << "Invalid --duration-ms value\n";
+    std::string stream_url = kDefaultUrl;
+    // 默认地址保留为已长期验证的摄像头；--url 只改变本次测试输入，避免为
+    // 每个设备手工修改源码后忘记还原。未知参数直接失败，防止拼写错误导致
+    // 在错误配置下采集到不可比较的性能数据。
+    for (int index = 1; index < argc; ++index) {
+        const std::string option = argv[index];
+        if (option == "--duration-ms" && index + 1 < argc) {
+            try {
+                duration_ms = std::max(0, std::stoi(argv[++index]));
+            } catch (...) {
+                std::cerr << "Invalid --duration-ms value\n";
+                return 1;
+            }
+        } else if (option == "--url" && index + 1 < argc) {
+            stream_url = argv[++index];
+            if (stream_url.empty()) {
+                std::cerr << "Invalid --url value\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "Usage: test_stream_decode [--duration-ms N] [--url URL]\n";
             return 1;
         }
     }
 
     // 连接参数仍由测试程序集中设置，SourceNode 只负责把 Puller 的读取结果
     // 转换成 MediaPacketMessage，不在业务节点中重新实现 FFmpeg I/O。
-    constexpr const char* kUrl = "rtsp://192.168.66.83/live/mainstream";
     auto puller = std::make_unique<FFmpegPuller>();
     // 当前 URL 按已有摄像头发布和渲染测试的成功配置运行：RTSP 控制与媒体
     // 使用 TCP，开启低延迟模式，避免 MediaFlow 测试与已验证链路使用不同
@@ -250,7 +267,7 @@ int main(int argc, char* argv[]) {
     // RTSP。这样第一条音频或视频包到来时，下游端口已经全部注册完成。
     if (!graph.AddNode<StreamSourceNode>(
             "source", executor, decode_node_options, "test-stream",
-            std::move(puller), kUrl, StreamSourceNodeOptions{100, -1})) {
+            std::move(puller), stream_url, StreamSourceNodeOptions{100, -1})) {
         PrintGraphError(graph, "add source");
         return 1;
     }
@@ -313,7 +330,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "Stream started through MediaFlow: " << kUrl << "\n"
+    std::cout << "Stream started through MediaFlow: " << stream_url << "\n"
               << "Press Enter to stop...\n";
 
     // 停止阶段保留一条独立观测线程。它不参与 Graph 调度，只读取公开的
