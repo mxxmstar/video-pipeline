@@ -133,6 +133,9 @@ enum class MailboxPushResult {
     Accepted,       ///< 消息已进入队列或已交给下游。
     DroppedNewest,  ///< 当前消息被丢弃，队列内容未改变。
     DroppedOldest,  ///< 旧消息被替换，当前消息已进入队列。
+    /// 当前发送曾在 Block 等待，但被 Graph 停止流程显式中断；通道仍可供
+    /// 已经入队的数据排空，不能把它误报为通道已关闭。
+    Interrupted,
     Closed,         ///< 通道已关闭，消息没有进入下游。
 };
 

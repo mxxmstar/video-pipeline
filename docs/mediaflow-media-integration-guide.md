@@ -852,7 +852,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C6 和 C7 离线回归：多维预算、控制消息保护、在途快照、诊断、实时解码接入和停止边界；摄像头长测与性能验收待实施</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C7 离线回归并完成单路 600 秒长测；队列与 A/V 输出通过，RSS 跃升问题阻断 CAP-10 最终通过，CAP-11 性能基线待建立</td></tr>
 </tbody>
 </table>
 
@@ -1784,12 +1784,13 @@ recommended_bytes = bitrate_bits_per_second / 8
 | 第 21.7.15 节入口分轨基线 | 已通过 | 15 秒单路 RTSP：视频 `375/375`、音频 `745/745`，四条相关 Edge dropped/rejected 均为 `0` |
 | CAP-01 至 CAP-02：成本与硬上限 | 通过 | `TestQueueBudgetAccounting` 与 `TestMediaQueueItemCostTraits` 已覆盖 items/bytes/span、超大包、generation、EOS 和无时间戳成本 |
 | CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 与 `TestCapacityRegressionScenarios` 验证独立预算、30 秒媒体时间的 10 倍音频突发和 25 fps 视频接收；关键帧恢复解码待补 |
-| CAP-04 至 CAP-05：实时延迟与视频恢复 | 待执行 | 仍需阻塞恢复后的低水位验证，以及关键帧后依赖窗口的解码恢复测试 |
-| CAP-06：时间戳异常 | 部分通过 | 已覆盖无时间戳、DTS/PTS 换算、跨 generation span 隔离和回退诊断计数；discontinuity 的时间窗口重建待补 |
-| CAP-07：EOS 与停止 | 部分通过 | 已验证 Queue/Dispatch 的 EOS 满载保护、`Block` 被 Close 唤醒及高水位 `GracefulStop` 排空；三类上限同时触发和 ImmediateStop 组合待补 |
+| CAP-04：实时音频延迟 | 通过（离线） | `TestRealtimeAudioLowWatermarkRecovery` 验证突发后 span 回落到低水位 |
+| CAP-05：视频恢复 | 部分通过 | `TestVideoKeyframeRecoveryWindow` 验证关键帧替换和后续依赖窗口；真实 FFmpeg 丢包后解码验收待补 |
+| CAP-06：时间戳异常 | 通过（离线） | 回退时间戳建立新 epoch，旧/新窗口不拼接；无时间戳、跨 generation 和诊断计数已有回归 |
+| CAP-07：EOS 与停止 | 通过（离线） | 三维满载 EOS、超大 Block 包、GracefulStop 中断等待和 ImmediateStop 均有回归 |
 | CAP-08：总在途可观测性 | 部分通过 | `TestMediaEdgeAndDispatchInflightMetrics` 核对 `edge_queue + node_pending` 的 items/bytes/span；C5 已补充队列诊断，跨多 Edge 汇总待上层 Pipeline 接入 |
 | CAP-09：生命周期回归 | 部分通过 | `TestGraphStartStopStart` 已连续 Start/Stop 100 次，`TestGracefulStopAtMediaHighWatermark` 覆盖高水位停止；内存增长观测待现场长测 |
-| CAP-10：摄像头长测 | 待执行 | 只使用一路 RTSP，记录至少 10 分钟的五秒采样数据和最终停止结果 |
+| CAP-10：摄像头长测 | 部分通过 | 单路 600 秒 A/V 持续输出、队列不增长且诊断全零；RSS 约 430 秒从 41.5 MB 跃升到约 95 MB，需调查 |
 | CAP-11：性能回归 | 待执行 | 记录同一机器、同一流、同一构建配置下改造前后的 CPU/吞吐对比 |
 
 每个“待执行”项完成后必须改为“通过”或“未通过”，并附测试命令、关键配置和
@@ -1941,3 +1942,66 @@ RTSP 会话。
 本批执行 VS 18 Community x64 Debug 的 `test_mediaflow.exe` 和
 `test_mediaflow_media_nodes.exe`，退出码均为 `0`。未运行 `test_stream_decode`，避免
 占用设备唯一 RTSP 会话。
+
+##### 21.7.16.11 C7 补充实施与现场验收记录
+
+本批继续完成 C7 的离线边界，并执行一次单路摄像头 10 分钟长测。容量控制的
+硬上限、时间窗口和停止语义已经落地；现场结果中发现的 RSS 跃升仍保留为后续
+问题，不能把本批整体标记为最终通过。
+
+实施内容：
+
+- `QueueTransport` 对 `Block` 策略先判断单条消息是否为 `Oversized`。超出
+  `max_bytes` 或不可拆分的 `max_span_us` 时立即返回 `DroppedNewest`，不会永久等待
+  消费者释放空间。
+- 新增 `MailboxPushResult::Interrupted` 和 `InterruptBlockedSenders()`。Graph 在
+  `GracefulStop` 请求 Source 停止生产后，只取消已经处于 Block 等待的发送者，不关闭
+  或清空 Edge，因此已进入 Graph 的尾部媒体仍可排空，后续 Flush 不受影响。
+- 同一 `generation` 内的回退时间戳建立新的 `(generation, epoch)` 时间窗口。旧窗口
+  与新窗口分别计算 span，队列条目保存所属窗口，淘汰时按窗口精确移除，避免回退、
+  重连或时间轴重置被错误计算为超长积压。
+- 新增 `TestRealtimeAudioLowWatermarkRecovery`、`TestVideoKeyframeRecoveryWindow`、
+  `TestTimestampDiscontinuityRebuildsTimeWindow` 和 `TestCapacityStopBoundaries`，
+  覆盖音频低水位恢复、关键帧恢复窗口、时间戳重建、三维满载 EOS、超大 Block 包、
+  GracefulStop 和 ImmediateStop。
+- `test_stream_decode` 的采样线程已前移到实际运行开始后，每 5 秒记录四条 Edge 的
+  items/bytes/span、帧数、pending、丢弃/拒绝/时间戳诊断和 Windows 工作集 RSS；
+  采样只读取快照，不执行队列扫描。
+
+离线验收：
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| CAP-04 实时音频延迟 | 通过 | `TestRealtimeAudioLowWatermarkRecovery` 验证突发后 span 为 `100000 us`，消费恢复后回落到 `60000 us` 并离开高水位 |
+| CAP-05 视频恢复 | 部分通过 | `TestVideoKeyframeRecoveryWindow` 验证满载时关键帧替换非关键帧、关键帧后的依赖窗口保持连续；尚未接入真实 FFmpeg 解码器做丢包后解码验收 |
+| CAP-06 时间戳异常 | 通过（离线） | `TestTimestampDiscontinuityRebuildsTimeWindow` 验证回退后新 epoch、旧窗口不与新窗口拼接、span 上限仍生效；无时间戳、跨 generation 和回退诊断已有覆盖 |
+| CAP-07 EOS 与停止 | 通过（离线） | `TestCapacityStopBoundaries` 验证 items/bytes/span 满载时 EOS 保留、超大 Block 包立即拒绝、GracefulStop 中断等待后排空、ImmediateStop 关闭并唤醒 |
+| CAP-09 生命周期回归 | 部分通过 | `test_mediaflow.exe` 和 `test_mediaflow_media_nodes.exe` 均通过；100 次 Start/Stop 无死锁，内存趋势仍需专用工具重复确认 |
+
+现场长测命令与配置：
+
+```text
+build-mediaflow-vs/bin/test_stream_decode.exe --duration-ms 600000
+URL: rtsp://192.168.66.83/live/mainstream
+RTSP transport: tcp
+```
+
+本次只建立一路摄像头会话。重定向日志为
+`build-mediaflow-vs/test_stream_decode_long.out` 和
+`build-mediaflow-vs/test_stream_decode_long.err`，最终结果为视频解码
+`15001/15001`、音频解码 `32434/32434`，四条 Edge 的最终 items/bytes/span 均为
+`0/0/0`，dropped、rejected、timestamp diagnostics 均为 `0`，Source 正常 finished，
+GracefulStop 完成。运行期间 A/V 帧持续增长，未观察到队列单调增长。
+
+现场问题与状态：
+
+| 问题 | 现象 | 状态与后续 |
+|---|---|---|
+| 初始探测告警 | FFmpeg 日志出现一次 `Could not find codec parameters ... unspecified size`，随后持续输出 1920x1080 视频和音频 | 可恢复但未消除；下一阶段检查 Puller 探测参数与告警分类，不能将告警当作完全无问题 |
+| RSS 跃升 | 约 360 秒前工作集约 `41.5 MB`，约 430 秒跃升至 `94.9 MB`，结束时约 `95.2 MB`；队列和诊断未同步增长 | 未通过，列为必须调查的问题；需要增加进程/FFmpeg buffer 分层统计并重复长测，定位是否为解码器缓存、帧引用或系统工作集行为 |
+| 瞬时 pending | 个别 5 秒采样出现 video decoder 或 audio counter pending `1`，下一采样恢复，Edge 仍为 `0/0/0` | 观察通过，不构成积压；后续性能基线中继续记录峰值 |
+
+因此当前 C7 结论为：CAP-04、CAP-06、CAP-07 的离线验收通过，CAP-05、CAP-09
+部分通过，CAP-10 部分通过且被 RSS 问题阻断最终通过，CAP-11 仍待建立改造前基线。
+下一阶段应优先调查 RSS 跃升，并补真实 Decoder 的关键帧恢复验收；在此之前不应宣称
+A/V 轨道容量控制已经完成全部现场验收。

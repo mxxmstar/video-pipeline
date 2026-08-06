@@ -13,6 +13,11 @@
 #include <thread>
 #include <utility>
 
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/puller/ffmpeg_puller.h"
 
@@ -131,6 +136,17 @@ void PrintEdgeDiagnostics(const char* name, const EdgeMetricsSnapshot& metrics) 
               << ", keyframes=" << budget.dropped_keyframes
               << ", timestamps=" << budget.timestamp_invalid << "/"
               << budget.timestamp_discontinuity << ")\n";
+}
+
+std::uint64_t CurrentProcessRssBytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters{};
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &counters,
+                             sizeof(counters)) != 0) {
+        return static_cast<std::uint64_t>(counters.WorkingSetSize);
+    }
+#endif
+    return 0;
 }
 
 } // namespace
@@ -254,23 +270,26 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Stream started through MediaFlow: " << kUrl << "\n"
               << "Press Enter to stop...\n";
-    if (duration_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
-    } else {
-        std::cin.get();
-    }
 
     // 停止阶段保留一条独立观测线程。它不参与 Graph 调度，只读取公开的
     // 原子状态和指标，便于区分 Source 读线程、Edge 排空还是节点任务回收卡住。
     std::atomic<bool> stop_observer_done{false};
-    std::atomic<bool> stop_observer_active{true};
     auto source_for_observer = graph.GetNode<StreamSourceNode>("source");
+    auto video_counter_for_observer =
+        graph.GetNode<FrameCounterSink>("video-counter");
+    auto audio_counter_for_observer =
+        graph.GetNode<FrameCounterSink>("audio-counter");
+    const auto observer_start = std::chrono::steady_clock::now();
     std::thread stop_observer([&]() {
+        auto next_sample = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(5);
         while (!stop_observer_done.load()) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (!stop_observer_active.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (stop_observer_done.load()) break;
+            if (std::chrono::steady_clock::now() < next_sample) {
                 continue;
             }
+            next_sample += std::chrono::seconds(5);
 
             NodeMetricsSnapshot observer_video_metrics;
             NodeMetricsSnapshot observer_audio_metrics;
@@ -294,7 +313,42 @@ int main(int argc, char* argv[]) {
                                  observer_video_edge);
             graph.GetEdgeMetrics("router:audio->audio-decoder:in",
                                  observer_audio_edge);
-            std::cerr << "[MediaFlow][StopObserver] source_finished="
+            const auto rss_bytes = CurrentProcessRssBytes();
+            const auto elapsed_seconds = std::chrono::duration_cast<
+                std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                      observer_start).count();
+            const auto dropped = observer_source_video_edge.dropped_newest +
+                                 observer_source_video_edge.dropped_oldest +
+                                 observer_source_audio_edge.dropped_newest +
+                                 observer_source_audio_edge.dropped_oldest +
+                                 observer_video_edge.dropped_newest +
+                                 observer_video_edge.dropped_oldest +
+                                 observer_audio_edge.dropped_newest +
+                                 observer_audio_edge.dropped_oldest;
+            const auto rejected = observer_source_video_edge.rejected +
+                                  observer_source_audio_edge.rejected +
+                                  observer_video_edge.rejected +
+                                  observer_audio_edge.rejected;
+            const auto timestamp_diagnostics =
+                observer_source_video_edge.budget.timestamp_invalid +
+                observer_source_video_edge.budget.timestamp_discontinuity +
+                observer_source_audio_edge.budget.timestamp_invalid +
+                observer_source_audio_edge.budget.timestamp_discontinuity +
+                observer_video_edge.budget.timestamp_invalid +
+                observer_video_edge.budget.timestamp_discontinuity +
+                observer_audio_edge.budget.timestamp_invalid +
+                observer_audio_edge.budget.timestamp_discontinuity;
+            std::cerr << "[MediaFlow][Sample] elapsed_s=" << elapsed_seconds
+                      << ", frames=(video="
+                      << (video_counter_for_observer
+                              ? video_counter_for_observer->Count()
+                              : 0)
+                      << ", audio="
+                      << (audio_counter_for_observer
+                              ? audio_counter_for_observer->Count()
+                              : 0)
+                      << "), rss_bytes=" << rss_bytes
+                      << ", source_finished="
                       << (source_for_observer && source_for_observer->Finished())
                       << ", source_generation="
                       << (source_for_observer ? source_for_observer->Generation() : 0)
@@ -313,15 +367,40 @@ int main(int argc, char* argv[]) {
                       << observer_source_audio_edge.queue_size
                       << ", video_decoder=" << observer_video_edge.queue_size
                       << ", audio_decoder=" << observer_audio_edge.queue_size
-                      << ")\n";
+                      << "), budget=(source_video="
+                      << observer_source_video_edge.budget.items << "/"
+                      << observer_source_video_edge.budget.bytes << "/"
+                      << observer_source_video_edge.budget.span_us
+                      << ", source_audio="
+                      << observer_source_audio_edge.budget.items << "/"
+                      << observer_source_audio_edge.budget.bytes << "/"
+                      << observer_source_audio_edge.budget.span_us
+                      << ", video_decoder="
+                      << observer_video_edge.budget.items << "/"
+                      << observer_video_edge.budget.bytes << "/"
+                      << observer_video_edge.budget.span_us
+                      << ", audio_decoder="
+                      << observer_audio_edge.budget.items << "/"
+                      << observer_audio_edge.budget.bytes << "/"
+                      << observer_audio_edge.budget.span_us
+                      << "), diagnostics=(dropped=" << dropped
+                      << ", rejected=" << rejected
+                      << ", timestamp=" << timestamp_diagnostics << ")\n";
         }
     });
+
+    // 采样线程已经在实际拉流期间运行；持续时长结束后再进入 GracefulStop，
+    // 这样日志同时覆盖稳定运行期和停止排空期。
+    if (duration_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+    } else {
+        std::cin.get();
+    }
 
     // 交互式停止使用 GracefulStop：先停止 Puller 生产，再排空已经进入 Graph
     // 的包，并让两个 Decoder 输出内部残留帧。即使网络流没有发送 EOS，也能
     // 通过图级 Flush 结束一次完整的解码生命周期。
     const bool stopped = graph.GracefulStop(std::chrono::seconds(5));
-    stop_observer_active.store(false);
     stop_observer_done.store(true);
     stop_observer.join();
     if (!stopped) {

@@ -548,6 +548,8 @@ public:
     virtual EdgeMetricsSnapshot Metrics() const = 0;
     virtual void Open() = 0;       ///< 打开并清空底层 Transport。
     virtual void Close() = 0;      ///< 关闭 Transport，拒绝新的发送。
+    /// 只中断 Block 中的生产者，不清空已入队数据，供 GracefulStop 建立排空屏障。
+    virtual void InterruptBlockedSenders() = 0;
     virtual bool Empty() const = 0;
     /// Edge 既没有排队消息，也没有正在执行的 Drain 任务时才算真正空闲。
     virtual bool IsIdle() const = 0;
@@ -630,6 +632,7 @@ public:
                 edge_metrics->dropped_newest.fetch_add(1);
                 node_metrics->dropped.fetch_add(1);
                 break;
+            case MailboxPushResult::Interrupted:
             case MailboxPushResult::Closed:
                 edge_metrics->rejected.fetch_add(1);
                 node_metrics->rejected.fetch_add(1);
@@ -690,6 +693,10 @@ public:
         transport_->Close();
         scheduled_.store(false);
         metrics_->UpdateQueueState(transport_->Metrics());
+    }
+
+    void InterruptBlockedSenders() override {
+        transport_->InterruptBlockedSenders();
     }
 
     bool Empty() const override {
@@ -1065,6 +1072,13 @@ private:
             // 只停止生产者，不能在这里让 Decoder/Encoder 拒绝已经入队的消息。
             for (const auto& id : node_order_) {
                 nodes_.at(id)->node->StopProduction();
+            }
+
+            // Source 的读取线程可能已经进入某条录制/发布 Block Edge 的 Send。
+            // 这里只取消当前等待者，队列保持打开，从而既能让生产者退出，又不丢弃
+            // 已经进入 Graph 的尾部数据和后续 Flush 输出。
+            for (const auto& edge : edges_) {
+                edge->InterruptBlockedSenders();
             }
 
             // timeout 是整次 GracefulStop 的总预算，而不是每个节点各自拥有一

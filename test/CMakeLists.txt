@@ -362,6 +362,9 @@ add_test(
 
 add_executable(test_stream_decode media/test_stream_decode.cpp)
 target_link_libraries(test_stream_decode PRIVATE video_pipeline_lib)
+if(MSVC)
+    target_link_libraries(test_stream_decode PRIVATE Psapi)
+endif()
 video_pipeline_copy_runtime_dlls(test_stream_decode)
 if(MSVC)
     target_compile_options(test_stream_decode PRIVATE /W3 /utf-8 /Zc:__cplusplus)

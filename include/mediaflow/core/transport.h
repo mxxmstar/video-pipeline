@@ -61,6 +61,9 @@ public:
     virtual void Open() = 0;
     /// 关闭通道并唤醒可能正在等待空间的生产者。
     virtual void Close() = 0;
+    /// 中断已经在 Block 策略中等待空间的发送者，但不关闭或清空队列。
+    /// Graph::GracefulStop 用它先解除上游生产线程，再继续排空已有媒体数据。
+    virtual void InterruptBlockedSenders() {}
     virtual bool Empty() const = 0;
     virtual std::size_t Size() const = 0;
     virtual QueueMetricsSnapshot Metrics() const { return {}; }
@@ -288,53 +291,77 @@ public:
         const bool is_control = QueueItemTraits<T>::IsControl(value);
         MailboxPushResult result = MailboxPushResult::Closed;
         QueueLimitReason reason = QueueLimitReason::None;
+        TimeWindowKey time_window;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (closed_) {
                 result = MailboxPushResult::Closed;
             } else {
-                RecordTimestampLocked(cost, is_control);
-            }
-            if (!closed_ && policy_ == BackpressurePolicy::Block) {
-                space_cv_.wait(lock, [this, &cost]() {
-                    return closed_ || FitsLocked(cost, nullptr);
-                });
-                if (!closed_) {
-                    AppendLocked(std::move(value), cost);
-                    result = MailboxPushResult::Accepted;
-                }
-            } else if (!closed_ && FitsLocked(cost, &reason)) {
-                AppendLocked(std::move(value), cost);
-                result = MailboxPushResult::Accepted;
-            } else if (!closed_) {
-                RecordLimitLocked(reason);
-                if (policy_ == BackpressurePolicy::DropOldest) {
-                    if (MakeRoomByDroppingOldestLocked(value, cost, reason)) {
-                        AppendLocked(std::move(value), cost);
+                time_window = ResolveTimeWindowLocked(cost, is_control);
+                if (policy_ == BackpressurePolicy::Block &&
+                    !FitsLocked(cost, time_window, &reason)) {
+                    // 超过单条消息硬上限时，等待消费者释放空间也不会改变结果。
+                    // 这里必须同步拒绝，避免录制/发布生产线程永久卡在 Send。
+                    RecordLimitLocked(reason);
+                    if (reason == QueueLimitReason::Oversized) {
+                        result = MailboxPushResult::DroppedNewest;
+                    } else if (is_control && MakeRoomByDroppingOldestLocked(
+                                                  value, cost, time_window, reason)) {
+                        // EOS 等控制边界优先于普通媒体包，不能因 Block 队列满载丢失。
+                        AppendLocked(std::move(value), cost, time_window);
                         result = MailboxPushResult::DroppedOldest;
                     } else {
-                        result = MailboxPushResult::DroppedNewest;
-                    }
-                } else if (policy_ == BackpressurePolicy::PreferVideoKeyframes) {
-                    if (MakeRoomByPriorityLocked(value, cost, reason)) {
-                        AppendLocked(std::move(value), cost);
-                        result = MailboxPushResult::DroppedOldest;
-                    } else {
-                        result = MailboxPushResult::DroppedNewest;
-                    }
-                } else if (QueueItemTraits<T>::IsControl(value)) {
-                    result = MailboxPushResult::DroppedNewest;
-                    auto victim = FindNonControlLocked();
-                    if (victim != queue_.end()) {
-                        RecordDroppedItemLocked(*victim);
-                        EraseLocked(victim);
-                        if (FitsLocked(cost, nullptr)) {
-                            AppendLocked(std::move(value), cost);
-                            result = MailboxPushResult::DroppedOldest;
+                        const auto interruption_epoch = send_interruption_epoch_;
+                        space_cv_.wait(lock, [this, &cost, &time_window,
+                                               interruption_epoch]() {
+                            return closed_ ||
+                                   send_interruption_epoch_ != interruption_epoch ||
+                                   FitsLocked(cost, time_window, nullptr);
+                        });
+                        if (closed_) {
+                            result = MailboxPushResult::Closed;
+                        } else if (send_interruption_epoch_ != interruption_epoch) {
+                            result = MailboxPushResult::Interrupted;
+                        } else {
+                            AppendLocked(std::move(value), cost, time_window);
+                            result = MailboxPushResult::Accepted;
                         }
                     }
+                } else if (FitsLocked(cost, time_window, &reason)) {
+                    AppendLocked(std::move(value), cost, time_window);
+                    result = MailboxPushResult::Accepted;
                 } else {
-                    result = MailboxPushResult::DroppedNewest;
+                    RecordLimitLocked(reason);
+                    if (policy_ == BackpressurePolicy::DropOldest) {
+                        if (MakeRoomByDroppingOldestLocked(
+                                value, cost, time_window, reason)) {
+                            AppendLocked(std::move(value), cost, time_window);
+                            result = MailboxPushResult::DroppedOldest;
+                        } else {
+                            result = MailboxPushResult::DroppedNewest;
+                        }
+                    } else if (policy_ == BackpressurePolicy::PreferVideoKeyframes) {
+                        if (MakeRoomByPriorityLocked(
+                                value, cost, time_window, reason)) {
+                            AppendLocked(std::move(value), cost, time_window);
+                            result = MailboxPushResult::DroppedOldest;
+                        } else {
+                            result = MailboxPushResult::DroppedNewest;
+                        }
+                    } else if (is_control) {
+                        result = MailboxPushResult::DroppedNewest;
+                        auto victim = FindNonControlLocked();
+                        if (victim != queue_.end()) {
+                            RecordDroppedItemLocked(*victim);
+                            EraseLocked(victim);
+                            if (FitsLocked(cost, time_window, nullptr)) {
+                                AppendLocked(std::move(value), cost, time_window);
+                                result = MailboxPushResult::DroppedOldest;
+                            }
+                        }
+                    } else {
+                        result = MailboxPushResult::DroppedNewest;
+                    }
                 }
             }
             if (result == MailboxPushResult::DroppedNewest &&
@@ -388,6 +415,16 @@ public:
         space_cv_.notify_all();
     }
 
+    void InterruptBlockedSenders() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // epoch 只影响已经捕获旧值的等待者；之后的新 Send 仍按正常策略执行，
+            // 因而不会破坏 GracefulStop 后续的 Flush 输出。
+            ++send_interruption_epoch_;
+        }
+        space_cv_.notify_all();
+    }
+
     bool Empty() const override {
         std::lock_guard<std::mutex> lock(mutex_);
         return queue_.empty();
@@ -420,9 +457,23 @@ public:
     const QueueBudget& Budget() const { return budget_; }
 
 private:
+    /// 同一 generation 内遇到回退时间戳时递增 epoch。旧窗口仍在队列中时继续
+    /// 独立参与 span 计算，但绝不与新窗口拼接，避免把重连/时间轴重置误判为积压。
+    struct TimeWindowKey {
+        std::uint64_t generation{0};
+        std::uint64_t epoch{0};
+
+        bool operator<(const TimeWindowKey& other) const {
+            return generation != other.generation
+                       ? generation < other.generation
+                       : epoch < other.epoch;
+        }
+    };
+
     struct QueueEntry {
         T value;
         QueueItemCost cost;
+        TimeWindowKey time_window;
     };
 
     struct TimeBounds {
@@ -516,13 +567,18 @@ private:
         }
     }
 
-    void RecordTimestampLocked(const QueueItemCost& cost, bool is_control) {
-        if (is_control) return;
+    TimeWindowKey ResolveTimeWindowLocked(const QueueItemCost& cost,
+                                          bool is_control) {
+        auto [epoch, inserted_epoch] = time_window_epoch_by_generation_.try_emplace(
+            cost.generation, 0);
+        (void)inserted_epoch;
+        TimeWindowKey time_window{cost.generation, epoch->second};
+        if (is_control) return time_window;
         if (cost.timestamp_us == kNoQueueTimestamp) {
             if (cost.bytes > 0 || cost.duration_us > 0) {
                 ++timestamp_invalid_;
             }
-            return;
+            return time_window;
         }
 
         auto [it, inserted] = latest_timestamp_by_generation_.try_emplace(
@@ -530,27 +586,35 @@ private:
         if (!inserted) {
             if (cost.timestamp_us < it->second) {
                 ++timestamp_discontinuity_;
+                ++epoch->second;
+                time_window.epoch = epoch->second;
+                // 新窗口从本条消息开始；旧窗口中尚未消费的消息仍按旧 epoch
+                // 独立计时，items/bytes 预算也仍持续生效。
+                it->second = cost.timestamp_us;
             } else {
                 it->second = cost.timestamp_us;
             }
         }
+        return time_window;
     }
 
-    void AddCostLocked(const QueueItemCost& cost) {
+    void AddCostLocked(const QueueItemCost& cost,
+                       const TimeWindowKey& time_window) {
         const auto max_bytes = (std::numeric_limits<std::size_t>::max)();
         bytes_ = cost.bytes > max_bytes - bytes_ ? max_bytes : bytes_ + cost.bytes;
         if (cost.timestamp_us != kNoQueueTimestamp) {
-            auto& bounds = time_bounds_[cost.generation];
+            auto& bounds = time_bounds_[time_window];
             bounds.starts.insert(cost.timestamp_us);
             bounds.ends.insert(EndTimestamp(cost));
         }
         RecomputeSpanLocked();
     }
 
-    void RemoveCostLocked(const QueueItemCost& cost) {
+    void RemoveCostLocked(const QueueItemCost& cost,
+                          const TimeWindowKey& time_window) {
         bytes_ = cost.bytes > bytes_ ? 0 : bytes_ - cost.bytes;
         if (cost.timestamp_us != kNoQueueTimestamp) {
-            auto bounds_it = time_bounds_.find(cost.generation);
+            auto bounds_it = time_bounds_.find(time_window);
             if (bounds_it != time_bounds_.end()) {
                 auto& bounds = bounds_it->second;
                 auto start = bounds.starts.find(cost.timestamp_us);
@@ -565,8 +629,8 @@ private:
 
     void RecomputeSpanLocked() {
         span_us_ = 0;
-        for (const auto& [generation, bounds] : time_bounds_) {
-            (void)generation;
+        for (const auto& [time_window, bounds] : time_bounds_) {
+            (void)time_window;
             if (!bounds.starts.empty() && !bounds.ends.empty()) {
                 span_us_ = std::max(span_us_, Difference(*bounds.starts.begin(),
                                                          *bounds.ends.rbegin()));
@@ -574,29 +638,33 @@ private:
         }
     }
 
-    std::int64_t SpanWithLocked(const QueueItemCost& cost) const {
+    std::int64_t SpanWithLocked(const QueueItemCost& cost,
+                                const TimeWindowKey& time_window) const {
         if (cost.timestamp_us == kNoQueueTimestamp) return span_us_;
 
         std::int64_t result = 0;
-        bool has_generation = false;
-        for (const auto& [generation, bounds] : time_bounds_) {
+        bool has_time_window = false;
+        for (const auto& [existing_window, bounds] : time_bounds_) {
             auto start = *bounds.starts.begin();
             auto end = *bounds.ends.rbegin();
-            if (generation == cost.generation) {
-                has_generation = true;
+            if (existing_window.generation == time_window.generation &&
+                existing_window.epoch == time_window.epoch) {
+                has_time_window = true;
                 start = std::min(start, cost.timestamp_us);
                 end = std::max(end, EndTimestamp(cost));
             }
             result = std::max(result, Difference(start, end));
         }
-        if (!has_generation) {
+        if (!has_time_window) {
             result = std::max(result, Difference(cost.timestamp_us,
                                                  EndTimestamp(cost)));
         }
         return result;
     }
 
-    bool FitsLocked(const QueueItemCost& cost, QueueLimitReason* reason) const {
+    bool FitsLocked(const QueueItemCost& cost,
+                    const TimeWindowKey& time_window,
+                    QueueLimitReason* reason) const {
         if (reason) *reason = QueueLimitReason::None;
         if (budget_.max_items > 0 && queue_.size() >= budget_.max_items) {
             if (reason) *reason = QueueLimitReason::Items;
@@ -613,7 +681,7 @@ private:
             }
         }
         if (budget_.max_span_us > 0) {
-            const auto candidate_span = SpanWithLocked(cost);
+            const auto candidate_span = SpanWithLocked(cost, time_window);
             if (candidate_span > budget_.max_span_us) {
                 const auto item_span = cost.timestamp_us == kNoQueueTimestamp
                                            ? 0
@@ -630,9 +698,10 @@ private:
         return true;
     }
 
-    void AppendLocked(T value, const QueueItemCost& cost) {
-        queue_.push_back(QueueEntry{std::move(value), cost});
-        AddCostLocked(cost);
+    void AppendLocked(T value, const QueueItemCost& cost,
+                      const TimeWindowKey& time_window) {
+        queue_.push_back(QueueEntry{std::move(value), cost, time_window});
+        AddCostLocked(cost, time_window);
         items_high_watermark_ = std::max(items_high_watermark_, queue_.size());
         bytes_high_watermark_ = std::max(bytes_high_watermark_, bytes_);
         span_high_watermark_us_ = std::max(span_high_watermark_us_, span_us_);
@@ -640,7 +709,7 @@ private:
     }
 
     void EraseLocked(typename std::deque<QueueEntry>::iterator position) {
-        RemoveCostLocked(position->cost);
+        RemoveCostLocked(position->cost, position->time_window);
         queue_.erase(position);
         UpdateWatermarkStateLocked();
     }
@@ -649,6 +718,7 @@ private:
         queue_.clear();
         time_bounds_.clear();
         latest_timestamp_by_generation_.clear();
+        time_window_epoch_by_generation_.clear();
         bytes_ = 0;
         span_us_ = 0;
         UpdateWatermarkStateLocked();
@@ -679,9 +749,10 @@ private:
 
     bool MakeRoomByDroppingOldestLocked(const T& value,
                                         const QueueItemCost& cost,
+                                        const TimeWindowKey& time_window,
                                         QueueLimitReason reason) {
         if (reason == QueueLimitReason::Oversized) return false;
-        while (!FitsLocked(cost, nullptr)) {
+        while (!FitsLocked(cost, time_window, nullptr)) {
             // 控制边界不能被普通低延迟消息淘汰；没有普通消息可换时拒绝当前消息。
             auto victim = FindNonControlLocked();
             if (victim == queue_.end()) return false;
@@ -693,12 +764,13 @@ private:
 
     bool MakeRoomByPriorityLocked(const T& value,
                                   const QueueItemCost& cost,
+                                  const TimeWindowKey& time_window,
                                   QueueLimitReason reason) {
         if (reason == QueueLimitReason::Oversized ||
             QueueItemTraits<T>::IsAudio(value)) {
             return false;
         }
-        while (!FitsLocked(cost, nullptr)) {
+        while (!FitsLocked(cost, time_window, nullptr)) {
             auto victim = queue_.end();
             if (QueueItemTraits<T>::IsControl(value)) {
                 victim = FindNonControlLocked();
@@ -737,8 +809,9 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable space_cv_;
     std::deque<QueueEntry> queue_;
-    std::map<std::uint64_t, TimeBounds> time_bounds_;
+    std::map<TimeWindowKey, TimeBounds> time_bounds_;
     std::map<std::uint64_t, std::int64_t> latest_timestamp_by_generation_;
+    std::map<std::uint64_t, std::uint64_t> time_window_epoch_by_generation_;
     std::size_t bytes_{0};
     std::int64_t span_us_{0};
     std::size_t items_high_watermark_{0};
@@ -755,6 +828,7 @@ private:
     std::uint64_t timestamp_invalid_{0};
     std::uint64_t timestamp_discontinuity_{0};
     bool closed_{false};
+    std::uint64_t send_interruption_epoch_{0};
     typename ITransport<T>::NotifyCallback notify_callback_;
     typename ITransport<T>::SendResultCallback send_result_callback_;
     typename ITransport<T>::CapacityReasonCallback capacity_reason_callback_;

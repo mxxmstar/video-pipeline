@@ -626,7 +626,9 @@ void TestCapacityRegressionScenarios() {
     assert(timestamp_queue.Send({4, 5000000, 20, 2}) ==
            MailboxPushResult::Accepted);
     const auto timestamp_snapshot = timestamp_queue.Metrics();
-    assert(timestamp_snapshot.span_us == 120);
+    // 回退时间戳会建立同 generation 的新时间窗口，不能再与旧窗口拼接成
+    // 120 us 的伪积压；不同 generation 同样保持独立。
+    assert(timestamp_snapshot.span_us == 20);
     assert(timestamp_snapshot.timestamp_discontinuity == 1);
 
     // Block 等待必须可由 Close 唤醒，停止路径不能永久滞留在生产者 Send。
@@ -643,6 +645,250 @@ void TestCapacityRegressionScenarios() {
     blocked_queue.Close();
     producer.join();
     assert(blocked_result == MailboxPushResult::Closed);
+}
+
+void TestRealtimeAudioLowWatermarkRecovery() {
+    QueueBudget audio_budget;
+    audio_budget.max_items = 32;
+    audio_budget.max_bytes = 4096;
+    audio_budget.max_span_us = 100000;
+    audio_budget.high_watermark_percent = 80;
+    audio_budget.low_watermark_percent = 60;
+    QueueTransport<MediaPacketMessage> audio_queue(
+        32, BackpressurePolicy::DropOldest, audio_budget);
+
+    // 模拟消费者被阻塞时的音频突发。DropOldest 必须让队列持续保留最近的
+    // 100 ms，而不是让最早的音频包长期占据实时链路的延迟预算。
+    for (int index = 0; index < 10; ++index) {
+        const auto result = audio_queue.Send(MakeCostedMediaMessage(
+            MediaType::AUDIO, index * 20, 20, 64));
+        assert(result == MailboxPushResult::Accepted ||
+               result == MailboxPushResult::DroppedOldest);
+    }
+    auto snapshot = audio_queue.Metrics();
+    assert(snapshot.span_us == audio_budget.max_span_us);
+    assert(snapshot.high_watermark_active);
+    assert(snapshot.high_watermark_enters == 1);
+
+    // 消费者恢复后，消费两个 20 ms 包应回落到 60% 的低水位并离开高水位状态。
+    assert(audio_queue.TryReceive().has_value());
+    assert(audio_queue.TryReceive().has_value());
+    snapshot = audio_queue.Metrics();
+    assert(snapshot.span_us == 60000);
+    assert(!snapshot.high_watermark_active);
+    assert(snapshot.high_watermark_leaves == 1);
+}
+
+void TestVideoKeyframeRecoveryWindow() {
+    QueueBudget video_budget;
+    video_budget.max_items = 4;
+    video_budget.max_bytes = 4096;
+    video_budget.max_span_us = 500000;
+    QueueTransport<MediaPacketMessage> video_queue(
+        4, BackpressurePolicy::PreferVideoKeyframes, video_budget);
+
+    // 先填满一个旧 GOP，再注入新的关键帧。新关键帧必须替换一条非关键帧，
+    // 这样下游即使因前面的丢包进入等待状态，也能在新的关键帧处重新开始解码。
+    assert(video_queue.Send(MakeCostedMediaMessage(
+               MediaType::VIDEO, 0, 40, 128)) ==
+           MailboxPushResult::Accepted);
+    for (int index = 1; index < 4; ++index) {
+        auto delta = MakeCostedMediaMessage(
+            MediaType::VIDEO, index * 40, 40, 128);
+        delta.packet->keyframe = false;
+        assert(video_queue.Send(std::move(delta)) == MailboxPushResult::Accepted);
+    }
+    auto late_delta = MakeCostedMediaMessage(MediaType::VIDEO, 160, 40, 128);
+    late_delta.packet->keyframe = false;
+    assert(video_queue.Send(std::move(late_delta)) ==
+           MailboxPushResult::DroppedNewest);
+
+    auto recovery_keyframe = MakeCostedMediaMessage(
+        MediaType::VIDEO, 200, 40, 128);
+    recovery_keyframe.packet->keyframe = true;
+    assert(video_queue.Send(std::move(recovery_keyframe)) ==
+           MailboxPushResult::DroppedOldest);
+
+    bool recovered = false;
+    while (auto message = video_queue.TryReceive()) {
+        if (message->packet && message->packet->keyframe &&
+            message->packet->pts == 200) {
+            recovered = true;
+        }
+    }
+    assert(recovered);
+
+    // 关键帧后的依赖窗口仍应能正常通过队列，不能因为保护策略把整个新 GOP
+    // 一并淘汰。这里的顺序检查对应 Decoder 从新的关键帧继续接收的最小条件。
+    for (int index = 6; index < 8; ++index) {
+        auto delta = MakeCostedMediaMessage(
+            MediaType::VIDEO, index * 40, 40, 128);
+        delta.packet->keyframe = false;
+        assert(video_queue.Send(std::move(delta)) == MailboxPushResult::Accepted);
+    }
+    auto first_dependency = video_queue.TryReceive();
+    auto second_dependency = video_queue.TryReceive();
+    assert(first_dependency && second_dependency);
+    assert(first_dependency->packet->pts == 240);
+    assert(second_dependency->packet->pts == 280);
+}
+
+void TestTimestampDiscontinuityRebuildsTimeWindow() {
+    QueueBudget timestamp_budget;
+    timestamp_budget.max_items = 16;
+    timestamp_budget.max_bytes = 4096;
+    timestamp_budget.max_span_us = 100;
+    QueueTransport<CostedMessage> timestamp_queue(
+        16, BackpressurePolicy::DropNewest, timestamp_budget);
+
+    assert(timestamp_queue.Send({64, 1000, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({64, 1040, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    // 同 generation 的回退不再只增加诊断计数：从 0 开始的新时间段使用新的
+    // epoch 计时，旧窗口与新窗口只分别参与 span 上限，绝不跨窗口相减。
+    assert(timestamp_queue.Send({64, 0, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({64, 40, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({64, 80, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    auto snapshot = timestamp_queue.Metrics();
+    assert(snapshot.timestamp_discontinuity == 1);
+    assert(snapshot.span_us == 100);
+
+    // 新窗口自身越过上限时仍然受 span 限制；不能因为旧窗口已断开就放开
+    // 时间维度的硬上限。
+    assert(timestamp_queue.Send({64, 120, 20, 1}) ==
+           MailboxPushResult::DroppedNewest);
+    snapshot = timestamp_queue.Metrics();
+    assert(snapshot.items == 5);
+    assert(snapshot.span_us == 100);
+    assert(snapshot.limit_span == 1);
+}
+
+void TestCapacityStopBoundaries() {
+    QueueBudget full_budget;
+    full_budget.max_items = 2;
+    full_budget.max_bytes = 4;
+    full_budget.max_span_us = 40000;
+    QueueTransport<MediaPacketMessage> eos_queue(
+        2, BackpressurePolicy::Block, full_budget);
+    assert(eos_queue.Send(MakeCostedMediaMessage(
+               MediaType::AUDIO, 0, 20, 2)) == MailboxPushResult::Accepted);
+    assert(eos_queue.Send(MakeCostedMediaMessage(
+               MediaType::AUDIO, 20, 20, 2)) == MailboxPushResult::Accepted);
+    auto snapshot = eos_queue.Metrics();
+    assert(snapshot.items == full_budget.max_items);
+    assert(snapshot.bytes == full_budget.max_bytes);
+    assert(snapshot.span_us == full_budget.max_span_us);
+
+    // items、bytes 和 span 都已经处于上限时，EOS 仍要替换普通媒体包并只保留
+    // 一次控制边界，避免停机时被普通数据永久阻塞。
+    assert(eos_queue.Send(MakeEosMessage()) == MailboxPushResult::DroppedOldest);
+    assert(!eos_queue.TryReceive()->eos);
+    assert(eos_queue.TryReceive()->eos);
+
+    // 超大单包不能在 Block 策略下无限等待。它没有可能通过消费者释放空间而变得
+    // 合法，因此必须同步得到可诊断的拒绝结果。
+    QueueBudget oversized_budget;
+    oversized_budget.max_bytes = 4;
+    QueueTransport<CostedMessage> oversized_block(
+        4, BackpressurePolicy::Block, oversized_budget);
+    assert(oversized_block.Send({5, 0, 0, 1}) ==
+           MailboxPushResult::DroppedNewest);
+    assert(oversized_block.Metrics().oversized == 1);
+
+    auto executor = std::make_shared<AsioExecutor>("block-stop", 1);
+    Graph graph;
+    NodeOptions sink_options;
+    sink_options.max_pending_tasks = 1;
+    assert(graph.AddNode<MediaBurstSource>("source", executor, NodeOptions{}));
+    assert(graph.AddNode<BlockingMediaSink>("sink", executor, sink_options));
+
+    EdgeOptions edge_options;
+    edge_options.backpressure = BackpressurePolicy::Block;
+    edge_options.max_batch_size = 1;
+    edge_options.track = QueueTrack::Audio;
+    edge_options.budget.max_items = 1;
+    edge_options.budget.max_bytes = 1024;
+    edge_options.budget.max_span_us = 100000;
+    assert(graph.Connect<MediaPacketMessage>("source", "sink", edge_options));
+    assert(graph.Start());
+
+    auto source = graph.GetNode<MediaBurstSource>("source");
+    auto sink = graph.GetNode<BlockingMediaSink>("sink");
+    assert(source && sink);
+    assert(source->Send(MakeCostedMediaMessage(MediaType::AUDIO, 0, 20, 64)));
+    assert(sink->WaitUntilEntered());
+    assert(source->Send(MakeCostedMediaMessage(MediaType::AUDIO, 20, 20, 64)));
+
+    std::atomic<bool> producer_started{false};
+    std::atomic<bool> producer_finished{false};
+    bool third_send_accepted = true;
+    std::thread producer([&]() {
+        producer_started.store(true);
+        third_send_accepted = source->Send(MakeCostedMediaMessage(
+            MediaType::AUDIO, 40, 20, 64));
+        producer_finished.store(true);
+    });
+    assert(WaitUntil([&]() { return producer_started.load(); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    bool graceful_result = false;
+    std::thread graceful_stopper([&]() {
+        graceful_result = graph.GracefulStop(std::chrono::seconds(2));
+    });
+    // GracefulStop 先取消 Block 中的第三次发送，随后仍等待第一条正在处理的
+    // 消息和第二条已入队消息排空，因此这里能同时验证“可中断”和“可排空”。
+    assert(WaitUntil([&]() { return producer_finished.load(); }));
+    assert(!third_send_accepted);
+    sink->Release();
+    producer.join();
+    graceful_stopper.join();
+    assert(graceful_result);
+    assert(graph.GetState() == Graph::State::Stopped);
+
+    // ImmediateStop 关闭 Edge 后也必须解除 Block；它不承诺排空，调用方释放
+    // 正在运行的 Handler 后即可完成资源回收。
+    auto immediate_executor = std::make_shared<AsioExecutor>("immediate-stop", 1);
+    Graph immediate_graph;
+    assert(immediate_graph.AddNode<MediaBurstSource>(
+        "source", immediate_executor, NodeOptions{}));
+    assert(immediate_graph.AddNode<BlockingMediaSink>(
+        "sink", immediate_executor, sink_options));
+    assert(immediate_graph.Connect<MediaPacketMessage>(
+        "source", "sink", edge_options));
+    assert(immediate_graph.Start());
+    auto immediate_source = immediate_graph.GetNode<MediaBurstSource>("source");
+    auto immediate_sink = immediate_graph.GetNode<BlockingMediaSink>("sink");
+    assert(immediate_source && immediate_sink);
+    assert(immediate_source->Send(MakeCostedMediaMessage(
+        MediaType::AUDIO, 0, 20, 64)));
+    assert(immediate_sink->WaitUntilEntered());
+    assert(immediate_source->Send(MakeCostedMediaMessage(
+        MediaType::AUDIO, 20, 20, 64)));
+
+    std::atomic<bool> immediate_producer_finished{false};
+    bool immediate_third_send_accepted = true;
+    std::thread immediate_producer([&]() {
+        immediate_third_send_accepted = immediate_source->Send(
+            MakeCostedMediaMessage(MediaType::AUDIO, 40, 20, 64));
+        immediate_producer_finished.store(true);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::atomic<bool> immediate_stop_finished{false};
+    std::thread immediate_stopper([&]() {
+        immediate_graph.Stop();
+        immediate_stop_finished.store(true);
+    });
+    assert(WaitUntil([&]() { return immediate_producer_finished.load(); }));
+    assert(!immediate_third_send_accepted);
+    immediate_sink->Release();
+    immediate_producer.join();
+    immediate_stopper.join();
+    assert(immediate_stop_finished.load());
+    assert(immediate_graph.GetState() == Graph::State::Stopped);
 }
 
 void TestVideoPriorityBackpressure() {
@@ -1157,6 +1403,10 @@ int main() {
     TestTrackBudgetIsolationAndControlRetention();
     TestQueueDiagnosticsAndBudgetFormula();
     TestCapacityRegressionScenarios();
+    TestRealtimeAudioLowWatermarkRecovery();
+    TestVideoKeyframeRecoveryWindow();
+    TestTimestampDiscontinuityRebuildsTimeWindow();
+    TestCapacityStopBoundaries();
     TestVideoPriorityBackpressure();
     TestVideoPriorityDispatchQueue();
     TestVideoPriorityExecutorDispatch();
