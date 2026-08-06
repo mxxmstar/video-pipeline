@@ -1408,3 +1408,37 @@ test_stream_decode              约 30 秒运行后停止流程返回
    轨道级背压、关键帧保护及恢复窗口，而不能只依赖一次设备观测。
 3. **完整长时媒体验收**：待设备恢复稳定视频元数据后，再执行至少 10 分钟单路
    RTSP 测试，记录首个视频包/帧延迟、generation、A/V 帧数及 Edge dropped/rejected。
+
+#### 21.7.12 第三批修复实施记录
+
+本批次开始处理第二批遗留的媒体质量问题，修改内容如下：
+
+| 问题 | 修改内容 | 验证结果 |
+|---|---|---|
+| RTSP 视频探测偶发返回 `0x0` | `FFmpegPuller` 为不完整视频轨道建立 H.264/H.265 parser；收到压缩包后在有限包数和有限时间内恢复宽高。探测未完成前暂不向 Decoder 发送视频包，超出上限后返回明确的 FatalError，避免无限等待或用无效描述打开 Decoder | 现场单路测试复现初始 `0x0` 后恢复到 `1920x1080`，产生视频帧；未触发探测上限 |
+| Source 缓存的流描述停留在初始值 | `StreamSourceNode` 在每个压缩包到达时刷新 Puller 的 `MultiStreamInfo`，使 Puller 在包级恢复的宽高能进入当前 `MediaPacketMessage` | 视频 Decoder 成功打开并输出 `1920x1080` 帧 |
+| 临时不完整描述污染 Decoder 错误状态 | `DecoderNode` 在完整 StreamInfo 成功打开后清除探测阶段临时错误 | `test_mediaflow_media_nodes` 通过 |
+| 音频突发挤占混合队列并丢视频 | 新增 `BackpressurePolicy::PreferVideoKeyframes` 和 `QueueItemTraits`；队列满时拒绝新增音频，视频优先淘汰排队音频，视频关键帧仍可淘汰视频非关键帧后进入队列。真实解码测试的 Source 混合包边改用该策略 | 新增队列回归测试通过；现场测试视频/音频 Edge 丢弃与拒绝均为 0 |
+| 现场测试依赖交互输入，无法稳定自动化 | `test_stream_decode` 增加 `--duration-ms N`，在指定时长后自动进入统一 GracefulStop，保留默认回车模式 | 15 秒单路摄像头自动测试退出码 0 |
+
+#### 21.7.13 第三批验证记录
+
+使用 VS 18 Community x64 Debug 环境执行：
+
+```text
+test_mediaflow                 退出码 0
+test_mediaflow_media_nodes     退出码 0
+test_stream_decode --duration-ms 15000 退出码 0（单路 RTSP）
+```
+
+本次测试仍只建立一个 `rtsp://192.168.66.83/live/mainstream` 会话，并保持当前
+MediaFlow 验证配置。FFmpeg 首次探测报告视频 `0x0`，随后 parser 从视频压缩包恢复
+为 `1920x1080`；视频 Decoder 输出 370 帧，音频 Decoder 输出 4483 帧。视频和音频
+Decoder 的 `enqueued/processed` 分别为 `370/370`、`4483/4483`，三条相关 Edge
+均为 0 dropped、0 rejected，停止流程正常完成。
+
+这次结果确认“视频元数据暂时为 `0x0`”已经从永久失败改为有界恢复路径；但仍需在
+设备稳定后执行至少 10 分钟长测，确认多次重连、关键帧间隔变化和更高音频突发下的
+长期统计。`PreferVideoKeyframes` 是有界队列保护策略，若队列被视频关键帧完全占满，
+仍会拒绝无法替换的最新关键帧；对绝对不允许丢包的录制链路应继续使用 `Block` 并单独
+配置容量和停止超时。

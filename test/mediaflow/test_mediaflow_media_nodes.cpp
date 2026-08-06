@@ -598,6 +598,18 @@ void TestDecoderRejectsIncompleteStreamInfo() {
         assert(decoder_state->decode_count == 0);
     }
 
+    // 探测阶段的临时 0x0 描述不应永久污染 Decoder。收到完整描述后，
+    // 节点必须恢复 Open/Decode，并清除临时错误状态。
+    message.stream_info = std::make_shared<MediaStreamInfo>(MakeVideoInfo());
+    message.packet = MakePacket(MediaType::VIDEO, 7, 40, CodecType::H264);
+    decoder.Input().Receive(std::move(message));
+    {
+        std::lock_guard<std::mutex> lock(decoder_state->mutex);
+        assert(decoder_state->open_count == 1);
+        assert(decoder_state->decode_count == 1);
+    }
+    assert(decoder.LastError().empty());
+
     decoder.Stop();
     decoder.Deinit();
 }

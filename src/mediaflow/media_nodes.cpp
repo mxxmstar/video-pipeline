@@ -144,6 +144,10 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
                     continue;
                 }
 
+                // Puller 可能在首批压缩包到达后才补齐视频宽高（例如 RTSP
+                // 探测阶段返回 0x0，parser 从 SPS/VPS 恢复尺寸）。每个包
+                // 到达时刷新一次描述，确保动态恢复的信息能进入当前消息。
+                UpdateStreamInfo(puller_->GetStreamInfo());
                 auto message = MediaPacketMessage{};
                 message.packet = result.packet;
                 message.stream_info = FindStreamInfo(result.packet);
@@ -572,6 +576,9 @@ bool DecoderNode::OpenForMessage(const MediaPacketMessage& message) {
         active_stream_info_ = info;
         decoder_open_ = true;
     }
+    // 不完整元数据可能只对应探测阶段的临时包。后续收到完整描述并成功
+    // 打开 Decoder 后清除临时错误，避免恢复后的测试仍被旧错误标记污染。
+    last_error_.clear();
     active_generation_ = message.generation;
     return true;
 }

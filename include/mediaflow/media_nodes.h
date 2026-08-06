@@ -52,6 +52,23 @@ struct MediaFrameMessage {
     }
 };
 
+/// MediaPacketMessage 的队列分类由媒体边界提供，核心 Transport 不需要依赖
+/// MediaType 的具体定义。音频包在混合队列满时可被优先丢弃，视频关键帧则尽量保留。
+template <>
+struct QueueItemTraits<MediaPacketMessage> {
+    static bool IsAudio(const MediaPacketMessage& message) {
+        return message.packet && message.packet->type == MediaType::AUDIO;
+    }
+
+    static bool IsVideo(const MediaPacketMessage& message) {
+        return message.packet && message.packet->type == MediaType::VIDEO;
+    }
+
+    static bool IsKeyframe(const MediaPacketMessage& message) {
+        return IsVideo(message) && message.packet->keyframe;
+    }
+};
+
 /// Encoder 到 PublisherSink 之间传递的编码包消息。
 struct EncodedPacketMessage {
     std::shared_ptr<MediaPacket> packet; ///< 编码后的压缩包。

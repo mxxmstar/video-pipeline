@@ -2,6 +2,7 @@
 
 #include "mediaflow/core/types.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -21,6 +22,18 @@
  * 地变成两个消费者。
  */
 namespace mediaflow {
+
+/// @brief 描述队列元素是否属于需要优先保护的媒体类别。
+///
+/// 核心队列不依赖具体媒体消息。媒体模块可以为自己的消息类型提供特化，
+/// 让 PreferVideoKeyframes 只在明确知道音频、视频和关键帧语义时生效；
+/// 其他类型仍然按 DropNewest 处理，避免核心层猜测业务字段。
+template <typename T>
+struct QueueItemTraits {
+    static bool IsAudio(const T&) { return false; }
+    static bool IsVideo(const T&) { return false; }
+    static bool IsKeyframe(const T&) { return false; }
+};
 
 /**
  * @brief Transport 的统一接口。
@@ -91,6 +104,38 @@ public:
                 queue_.pop_front();
                 queue_.push_back(std::move(value));
                 result = MailboxPushResult::DroppedOldest;
+            } else if (policy_ == BackpressurePolicy::PreferVideoKeyframes) {
+                // 音频突发不能挤掉已经排队的视频。视频到达时先淘汰音频，
+                // 仍无空间时再淘汰视频非关键帧；视频关键帧在队列全为关键帧时
+                // 宁可拒绝当前包并留下可观测的 DroppedNewest 统计。
+                const bool incoming_audio = QueueItemTraits<T>::IsAudio(value);
+                const bool incoming_video = QueueItemTraits<T>::IsVideo(value);
+                const bool incoming_keyframe = QueueItemTraits<T>::IsKeyframe(value);
+
+                if (incoming_audio) {
+                    result = MailboxPushResult::DroppedNewest;
+                } else if (incoming_video) {
+                    auto victim = std::find_if(queue_.begin(), queue_.end(),
+                        [](const T& item) {
+                            return QueueItemTraits<T>::IsAudio(item);
+                        });
+                    if (victim == queue_.end() && incoming_keyframe) {
+                        victim = std::find_if(queue_.begin(), queue_.end(),
+                            [](const T& item) {
+                                return QueueItemTraits<T>::IsVideo(item) &&
+                                       !QueueItemTraits<T>::IsKeyframe(item);
+                            });
+                    }
+                    if (victim != queue_.end()) {
+                        queue_.erase(victim);
+                        queue_.push_back(std::move(value));
+                        result = MailboxPushResult::DroppedOldest;
+                    } else {
+                        result = MailboxPushResult::DroppedNewest;
+                    }
+                } else {
+                    result = MailboxPushResult::DroppedNewest;
+                }
             } else {
                 result = MailboxPushResult::DroppedNewest;
             }

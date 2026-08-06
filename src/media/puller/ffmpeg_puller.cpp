@@ -53,6 +53,107 @@ std::string FFmpegPuller::BuildRtspTransportOption() const {
     return transport + "+tcp";
 }
 
+bool FFmpegPuller::IsVideoStreamInfoComplete(int stream_index) const {
+    std::lock_guard<std::mutex> lock(info_mutex_);
+    for (const auto& info : cached_info_.stream_infos) {
+        if (info.stream_index != stream_index ||
+            info.media_type != MediaType::VIDEO ||
+            !std::holds_alternative<VideoStreamInfo>(info.detail)) {
+            continue;
+        }
+        const auto& video = info.get_detail<VideoStreamInfo>();
+        return video.width > 0 && video.height > 0;
+    }
+    return false;
+}
+
+bool FFmpegPuller::IsVideoProbeExhausted(int stream_index) const {
+    const auto it = video_probes_.find(stream_index);
+    if (it == video_probes_.end() || !it->second) {
+        return true;
+    }
+
+    const auto& probe = *it->second;
+    const bool packet_limit = max_video_probe_packets_ > 0 &&
+                              probe.packets >= max_video_probe_packets_;
+    const bool time_limit = video_probe_timeout_ms_ > 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - probe.started).count() >=
+        video_probe_timeout_ms_;
+    return packet_limit || time_limit;
+}
+
+bool FFmpegPuller::ProbeVideoStream(int stream_index, const AVPacket* packet) {
+    auto it = video_probes_.find(stream_index);
+    if (it == video_probes_.end() || !it->second || !packet) {
+        return false;
+    }
+
+    auto& probe = *it->second;
+    ++probe.packets;
+    if (probe.parser && probe.codec && packet->data && packet->size > 0) {
+        uint8_t* parsed_data = nullptr;
+        int parsed_size = 0;
+        const int ret = av_parser_parse2(
+            probe.parser,
+            probe.codec,
+            &parsed_data,
+            &parsed_size,
+            packet->data,
+            packet->size,
+            packet->pts,
+            packet->dts,
+            packet->pos);
+        if (ret < 0) {
+            LOG_DEBUG("FFmpeg video metadata probe failed for stream {}: {}",
+                      stream_index, ret);
+        }
+
+        const int width = probe.codec->width > 0 ? probe.codec->width
+                                                  : probe.parser->width;
+        const int height = probe.codec->height > 0 ? probe.codec->height
+                                                    : probe.parser->height;
+        if (width > 0 && height > 0) {
+            UpdateVideoStreamInfo(stream_index, width, height);
+        }
+    }
+    return IsVideoStreamInfoComplete(stream_index);
+}
+
+void FFmpegPuller::UpdateVideoStreamInfo(int stream_index, int width, int height) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(info_mutex_);
+    for (auto& info : cached_info_.stream_infos) {
+        if (info.stream_index == stream_index &&
+            info.media_type == MediaType::VIDEO &&
+            std::holds_alternative<VideoStreamInfo>(info.detail)) {
+            auto& video = std::get<VideoStreamInfo>(info.detail);
+            video.width = width;
+            video.height = height;
+            return;
+        }
+    }
+}
+
+void FFmpegPuller::ResetVideoProbes() {
+    for (auto& entry : video_probes_) {
+        if (!entry.second) {
+            continue;
+        }
+        if (entry.second->parser) {
+            av_parser_close(entry.second->parser);
+            entry.second->parser = nullptr;
+        }
+        if (entry.second->codec) {
+            avcodec_free_context(&entry.second->codec);
+        }
+    }
+    video_probes_.clear();
+}
+
 // ── IPuller ─────────────────────────────────────────────────────────
 
 bool FFmpegPuller::Open(const std::string& url) {
@@ -131,6 +232,7 @@ bool FFmpegPuller::Open(const std::string& url) {
     }
 
     // 6. 遍历所有流，缓存编码参数和流信息
+    MultiStreamInfo discovered_info;
     for (unsigned i = 0; i < fmt_ctx_->nb_streams; ++i) {
         AVStream* stream = fmt_ctx_->streams[i];
         AVCodecParameters* codecpar = stream->codecpar;
@@ -154,7 +256,7 @@ bool FFmpegPuller::Open(const std::string& url) {
                     codecpar->extradata + codecpar->extradata_size);
             }
             
-            const int stream_info_idx = static_cast<int>(cached_info_.stream_infos.size());
+            const int stream_info_idx = static_cast<int>(discovered_info.stream_infos.size());
             if (codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
                 info.media_type = MediaType::VIDEO;
                 VideoStreamInfo video_info;
@@ -169,7 +271,7 @@ bool FFmpegPuller::Open(const std::string& url) {
                                      static_cast<float>(stream->r_frame_rate.den);
                 }
                 info.detail = video_info;
-                cached_info_.video_stream_idx_ = stream_info_idx;
+                discovered_info.video_stream_idx_ = stream_info_idx;
             } else if (codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
                 info.media_type = MediaType::AUDIO;
                 AudioStreamInfo audio_info;
@@ -177,15 +279,45 @@ bool FFmpegPuller::Open(const std::string& url) {
                 audio_info.channels = codecpar->ch_layout.nb_channels;
                 audio_info.channel_layout = codecpar->ch_layout.u.mask;
                 info.detail = audio_info;
-                cached_info_.audio_stream_idx_ = stream_info_idx;
+                discovered_info.audio_stream_idx_ = stream_info_idx;
             }
             
-            cached_info_.stream_infos.push_back(info);
+            discovered_info.stream_infos.push_back(info);
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(info_mutex_);
+        cached_info_ = discovered_info;
+    }
+
+    // 对探测阶段拿不到尺寸的视频建立独立 parser。后续只要收到一个包含
+    // SPS/VPS 的压缩包，就能在不打开错误 Decoder 的前提下补齐 StreamInfo。
+    for (const auto& info : discovered_info.stream_infos) {
+        if (info.media_type != MediaType::VIDEO ||
+            !std::holds_alternative<VideoStreamInfo>(info.detail)) {
+            continue;
+        }
+        const auto& video = info.get_detail<VideoStreamInfo>();
+        if (video.width > 0 && video.height > 0) {
+            continue;
+        }
+
+        auto probe = std::make_unique<VideoProbeContext>();
+        probe->started = std::chrono::steady_clock::now();
+        const auto codec_it = codecpars_.find(info.stream_index);
+        if (codec_it != codecpars_.end()) {
+            probe->parser = av_parser_init(codec_it->second->codec_id);
+            probe->codec = avcodec_alloc_context3(nullptr);
+            if (probe->codec) {
+                avcodec_parameters_to_context(probe->codec, codec_it->second);
+            }
+        }
+        video_probes_[info.stream_index] = std::move(probe);
     }
     
     // 至少需要一个视频流或音频流
-    if (!cached_info_.HasVideoStream() && !cached_info_.HasAudioStream()) {
+    if (!discovered_info.HasVideoStream() && !discovered_info.HasAudioStream()) {
         LOG_ERROR("no video or audio stream found in {}", url);
         Close();
         return false;
@@ -193,9 +325,9 @@ bool FFmpegPuller::Open(const std::string& url) {
     
     // 7. 打印流信息
     LOG_INFO("Stream count: video={}, audio={}", 
-             cached_info_.HasVideoStream() ? 1 : 0,
-             cached_info_.HasAudioStream() ? 1 : 0);
-    cached_info_.DumpStream();
+             discovered_info.HasVideoStream() ? 1 : 0,
+             discovered_info.HasAudioStream() ? 1 : 0);
+    discovered_info.DumpStream();
 
     return true;
 }
@@ -203,12 +335,16 @@ bool FFmpegPuller::Open(const std::string& url) {
 void FFmpegPuller::Close() {
     RequestStop();
     std::lock_guard<std::mutex> lock(io_mutex_);
+    ResetVideoProbes();
     if (fmt_ctx_) {
         avformat_close_input(&fmt_ctx_);
         fmt_ctx_ = nullptr;
     }
     codecpars_.clear();
-    cached_info_ = {};
+    {
+        std::lock_guard<std::mutex> info_lock(info_mutex_);
+        cached_info_ = {};
+    }
     
     // 清理对象池
     std::lock_guard<std::mutex> pool_lock(pool_mutex_);
@@ -311,6 +447,31 @@ IPuller::PullReadResult FFmpegPuller::ReadPacketResult() {
     
     AVCodecParameters* stream_codecpar = codecpars_[stream_idx];
 
+    if (stream_codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        !IsVideoStreamInfoComplete(stream_idx)) {
+        const bool recovered = ProbeVideoStream(stream_idx, pkt);
+        if (!recovered) {
+            av_packet_unref(pkt);
+            {
+                std::lock_guard<std::mutex> pool_lock(pool_mutex_);
+                packet_pool_.push_back(pkt);
+            }
+            if (IsVideoProbeExhausted(stream_idx)) {
+                LOG_ERROR("video stream {} metadata probe exhausted after {} packets",
+                          stream_idx,
+                          video_probes_.contains(stream_idx)
+                              ? video_probes_.at(stream_idx)->packets
+                              : 0);
+                return {PullReadStatus::FatalError, nullptr, AVERROR_INVALIDDATA,
+                        "video stream metadata probe exhausted"};
+            }
+            // 当前包只用于探测，尺寸未恢复前不能交给 Decoder。下一个包仍会
+            // 继续探测，音频包不会被这个视频轨道的暂缓策略阻塞。
+            return {PullReadStatus::NoData, nullptr, 0,
+                    "video stream metadata is pending"};
+        }
+    }
+
     // 4. 视频包：从池转移到 av_packet_alloc 分配的包，使 FFmpegPacketBuffer
     //    析构时 av_packet_free 能正确释放 AVPacket 结构体内存。
     AVPacket* owned = av_packet_alloc();
@@ -364,6 +525,7 @@ IPuller::PullReadResult FFmpegPuller::ReadPacketResult() {
 }
 
 MultiStreamInfo FFmpegPuller::GetStreamInfo() const {
+    std::lock_guard<std::mutex> lock(info_mutex_);
     return cached_info_;
 }
 
@@ -400,6 +562,11 @@ void FFmpegPuller::SetRtspAutoSwitchToTcp(bool enable) {
 
 void FFmpegPuller::SetRtspAutoSwitchTimeoutMs(int ms) {
     rtsp_auto_switch_timeout_ms_ = ms > 0 ? ms : 0;
+}
+
+void FFmpegPuller::SetVideoProbeLimits(int max_packets, int timeout_ms) {
+    max_video_probe_packets_ = max_packets > 0 ? max_packets : 0;
+    video_probe_timeout_ms_ = timeout_ms > 0 ? timeout_ms : 0;
 }
 
 // ── MapCodecID ──────────────────────────────────────────────────────

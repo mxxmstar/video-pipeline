@@ -19,6 +19,7 @@ enum class BackpressurePolicy {
     Block,       ///< 等待消费者释放空间，适合不能丢失的控制消息。
     DropNewest,  ///< 丢弃刚到达的消息，适合不希望旧数据被覆盖的队列。
     DropOldest,  ///< 丢弃队首旧消息，适合低延迟视频帧队列。
+    PreferVideoKeyframes, ///< 混合媒体队列满时优先保留视频，尤其是视频关键帧。
 };
 
 /// Transport::Send 的精确结果，用于业务判断和指标统计。

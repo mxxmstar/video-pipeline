@@ -254,6 +254,53 @@ void TestQueueBackpressure() {
     assert(close_transport.TryReceive().value() == 13);
 }
 
+void TestVideoPriorityBackpressure() {
+    auto make_message = [](MediaType type, bool keyframe, int64_t pts) {
+        auto packet = std::make_shared<MediaPacket>();
+        packet->type = type;
+        packet->codec = type == MediaType::VIDEO ? CodecType::H264
+                                                  : CodecType::AAC;
+        packet->stream_index = type == MediaType::VIDEO ? 1 : 2;
+        packet->pts = pts;
+        packet->dts = pts;
+        packet->keyframe = keyframe;
+        MediaPacketMessage message;
+        message.packet = std::move(packet);
+        message.generation = 1;
+        return message;
+    };
+
+    QueueTransport<MediaPacketMessage> queue(
+        3, BackpressurePolicy::PreferVideoKeyframes);
+    assert(queue.Send(make_message(MediaType::AUDIO, false, 1)) ==
+           MailboxPushResult::Accepted);
+    assert(queue.Send(make_message(MediaType::AUDIO, false, 2)) ==
+           MailboxPushResult::Accepted);
+    assert(queue.Send(make_message(MediaType::VIDEO, false, 3)) ==
+           MailboxPushResult::Accepted);
+
+    // 队列满时，视频包应淘汰音频，而不是被音频突发直接丢弃。
+    assert(queue.Send(make_message(MediaType::VIDEO, true, 4)) ==
+           MailboxPushResult::DroppedOldest);
+    // 音频突发不会继续侵占已经为视频保留的队列空间。
+    assert(queue.Send(make_message(MediaType::AUDIO, false, 5)) ==
+           MailboxPushResult::DroppedNewest);
+    assert(queue.Send(make_message(MediaType::VIDEO, true, 6)) ==
+           MailboxPushResult::DroppedOldest);
+
+    int video_count = 0;
+    int keyframe_count = 0;
+    while (auto message = queue.TryReceive()) {
+        assert(message->packet);
+        if (message->packet->type == MediaType::VIDEO) {
+            ++video_count;
+            keyframe_count += message->packet->keyframe ? 1 : 0;
+        }
+    }
+    assert(video_count == 3);
+    assert(keyframe_count == 2);
+}
+
 void TestExecutorDispatchTransport() {
     // 该 Transport 不保存中间队列，但仍由消费者回调决定下游投递方式。
     ExecutorDispatchTransport<int> dispatch;
@@ -492,6 +539,7 @@ void TestGraphStartStopStart() {
 
 int main() {
     TestQueueBackpressure();
+    TestVideoPriorityBackpressure();
     TestExecutorDispatchTransport();
     TestGraphValidationAndTopologyFreeze();
     TestGraphErrorRollback();

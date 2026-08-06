@@ -3,6 +3,7 @@
 
 #include "mediaflow/mediaflow.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -93,8 +94,18 @@ void PrintGraphError(const Graph& graph, const std::string& operation) {
 
 } // namespace
 
-int main() {
+int main(int argc, char* argv[]) {
     std::cout << "=== MediaFlow RTSP Stream Decode ===\n";
+
+    int duration_ms = 0;
+    if (argc == 3 && std::string(argv[1]) == "--duration-ms") {
+        try {
+            duration_ms = std::max(0, std::stoi(argv[2]));
+        } catch (...) {
+            std::cerr << "Invalid --duration-ms value\n";
+            return 1;
+        }
+    }
 
     // 连接参数仍由测试程序集中设置，SourceNode 只负责把 Puller 的读取结果
     // 转换成 MediaPacketMessage，不在业务节点中重新实现 FFmpeg I/O。
@@ -122,7 +133,7 @@ int main() {
     const EdgeOptions packet_edge_options{
         TransportKind::Queue,
         4096,
-        BackpressurePolicy::DropNewest,
+        BackpressurePolicy::PreferVideoKeyframes,
         64,
         0};
     const EdgeOptions frame_edge_options{
@@ -195,7 +206,11 @@ int main() {
 
     std::cout << "Stream started through MediaFlow: " << kUrl << "\n"
               << "Press Enter to stop...\n";
-    std::cin.get();
+    if (duration_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(duration_ms));
+    } else {
+        std::cin.get();
+    }
 
     // 停止阶段保留一条独立观测线程。它不参与 Graph 调度，只读取公开的
     // 原子状态和指标，便于区分 Source 读线程、Edge 排空还是节点任务回收卡住。
