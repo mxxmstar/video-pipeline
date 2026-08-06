@@ -301,6 +301,55 @@ void TestVideoPriorityBackpressure() {
     assert(keyframe_count == 2);
 }
 
+void TestVideoPriorityDispatchQueue() {
+    auto executor = std::make_shared<AsioExecutor>("priority-dispatch", 1);
+    NodeOptions options;
+    options.max_pending_tasks = 3;
+    options.prefer_video_keyframes = true;
+    auto context = std::make_shared<NodeContext>(
+        "priority-node",
+        std::make_shared<LongSink>(),
+        executor,
+        options);
+    context->OpenDispatch();
+    assert(executor->Start());
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool entered = false;
+    bool released = false;
+    assert(context->Dispatch([&]() {
+        std::unique_lock<std::mutex> lock(mutex);
+        entered = true;
+        condition.notify_all();
+        condition.wait(lock, [&]() { return released; });
+    }));
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        assert(condition.wait_for(lock, std::chrono::seconds(2), [&]() {
+            return entered;
+        }));
+    }
+
+    const DispatchPriority audio_priority{true, false, false};
+    const DispatchPriority keyframe_priority{false, true, true};
+    assert(context->Dispatch([]() {}, audio_priority));
+    assert(context->Dispatch([]() {}, audio_priority));
+    // 第三个槽位到达时，视频关键帧应替换尚未执行的音频任务。
+    assert(context->Dispatch([]() {}, keyframe_priority));
+    // 新的音频不能再挤掉队列中已经保留的视频任务。
+    assert(!context->Dispatch([]() {}, audio_priority));
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        released = true;
+    }
+    condition.notify_all();
+    assert(WaitUntil([&]() { return context->PendingTasks() == 0; }));
+    context->CloseDispatch();
+    executor->Stop();
+}
+
 void TestExecutorDispatchTransport() {
     // 该 Transport 不保存中间队列，但仍由消费者回调决定下游投递方式。
     ExecutorDispatchTransport<int> dispatch;
@@ -540,6 +589,7 @@ void TestGraphStartStopStart() {
 int main() {
     TestQueueBackpressure();
     TestVideoPriorityBackpressure();
+    TestVideoPriorityDispatchQueue();
     TestExecutorDispatchTransport();
     TestGraphValidationAndTopologyFreeze();
     TestGraphErrorRollback();

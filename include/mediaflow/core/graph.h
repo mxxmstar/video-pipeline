@@ -120,6 +120,14 @@ public:
      * 任务。调用者不应在 false 后继续假设消息会被处理。
      */
     bool Dispatch(Task task) {
+        return Dispatch(std::move(task), DispatchPriority{});
+    }
+
+    /// 将带媒体分类的任务加入节点 Dispatch 队列。
+    ///
+    /// 当节点队列已满且启用视频优先策略时，视频任务可以替换尚未执行的
+    /// 音频任务；这样 Edge Drain 不会把保护策略只停留在外层 Transport。
+    bool Dispatch(Task task, DispatchPriority priority) {
         if (!task) {
             return false;
         }
@@ -150,12 +158,46 @@ public:
         bool should_schedule = false;
         {
             std::lock_guard<std::mutex> lock(dispatch_mutex_);
-            if (dispatch_closed_ || pending_tasks_.load() >= options.max_pending_tasks) {
+            if (dispatch_closed_) {
                 metrics->rejected.fetch_add(1);
                 return false;
             }
 
-            dispatch_queue_.push_back(std::move(task));
+            if (pending_tasks_.load() >= options.max_pending_tasks) {
+                if (!options.prefer_video_keyframes || !priority.is_video) {
+                    if (options.prefer_video_keyframes && priority.is_audio) {
+                        metrics->dropped.fetch_add(1);
+                    }
+                    metrics->rejected.fetch_add(1);
+                    return false;
+                }
+
+                auto victim = std::find_if(
+                    dispatch_queue_.begin(), dispatch_queue_.end(),
+                    [](const DispatchTask& queued) {
+                        return queued.priority.is_audio;
+                    });
+                if (victim == dispatch_queue_.end() && priority.is_keyframe) {
+                    victim = std::find_if(
+                        dispatch_queue_.begin(), dispatch_queue_.end(),
+                        [](const DispatchTask& queued) {
+                            return queued.priority.is_video &&
+                                   !queued.priority.is_keyframe;
+                        });
+                }
+                if (victim == dispatch_queue_.end()) {
+                    metrics->rejected.fetch_add(1);
+                    return false;
+                }
+                dispatch_queue_.erase(victim);
+                // 被替换的任务仍占用一个 pending 槽位；先释放旧任务的计数，
+                // 再在下面为新任务增加计数，保持队列长度与 pending_tasks_ 一致。
+                pending_tasks_.fetch_sub(1);
+                metrics->dropped.fetch_add(1);
+            }
+
+            dispatch_queue_.push_back(
+                DispatchTask{std::move(task), priority});
             pending_tasks_.fetch_add(1);
             UpdateHighWatermark();
             if (!dispatch_active_) {
@@ -220,18 +262,18 @@ private:
 
     /// 取出一条任务执行，完成后按需安排下一条任务。
     void RunSerializedOne() {
-        Task task;
+        DispatchTask pending;
         {
             std::lock_guard<std::mutex> lock(dispatch_mutex_);
             if (dispatch_queue_.empty()) {
                 dispatch_active_ = false;
                 return;
             }
-            task = std::move(dispatch_queue_.front());
+            pending = std::move(dispatch_queue_.front());
             dispatch_queue_.pop_front();
         }
 
-        RunTask(std::move(task));
+        RunTask(std::move(pending.task));
 
         bool should_schedule = false;
         {
@@ -269,7 +311,12 @@ private:
     }
 
     mutable std::mutex dispatch_mutex_;  ///< 保护 deque 和 Dispatch 状态。
-    std::deque<Task> dispatch_queue_;     ///< Serialized 模式的有界任务队列。
+    struct DispatchTask {
+        Task task;
+        DispatchPriority priority;
+    };
+
+    std::deque<DispatchTask> dispatch_queue_; ///< Serialized 模式的有界任务队列。
     std::atomic<std::size_t> pending_tasks_{0};
     bool dispatch_active_{false};         ///< 是否已有泵任务在 Executor 中。
     bool dispatch_closed_{true};          ///< 初始关闭，Graph::Start 时打开。
@@ -463,9 +510,16 @@ private:
                 break;
             }
 
-            if (!destination_->Dispatch([input = input_, value = std::move(*value)]() mutable {
-                    input->Receive(std::move(value));
-                })) {
+            const DispatchPriority priority{
+                QueueItemTraits<T>::IsAudio(*value),
+                QueueItemTraits<T>::IsVideo(*value),
+                QueueItemTraits<T>::IsKeyframe(*value),
+            };
+            if (!destination_->Dispatch(
+                    [input = input_, value = std::move(*value)]() mutable {
+                        input->Receive(std::move(value));
+                    },
+                    priority)) {
                 destination_->metrics->rejected.fetch_add(1);
             }
             metrics_->drained.fetch_add(1);

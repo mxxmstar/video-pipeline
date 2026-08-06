@@ -127,9 +127,10 @@ int main(int argc, char* argv[]) {
     // 音频包先占满队列，随后视频包被 DropNewest 丢弃，无法反映旧手工
     // 测试的实际解码能力。这里为验证图保留更大的有界队列，同时仍使用
     // DropNewest 保持包的时间顺序，避免无界缓存掩盖下游处理能力问题。
-    const NodeOptions decode_node_options{
+    NodeOptions decode_node_options{
         NodeExecutionMode::Serialized,
         4096};
+    decode_node_options.prefer_video_keyframes = true;
     const EdgeOptions packet_edge_options{
         TransportKind::Queue,
         4096,

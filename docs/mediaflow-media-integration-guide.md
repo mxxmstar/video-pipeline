@@ -1474,3 +1474,45 @@ StreamSourceNode -> 混合 MediaPacket Edge -> TrackRouterNode
 
 当前阶段继续使用 `PreferVideoKeyframes` 和现有分轨 Edge，先完成 21.7.8 长时停止
 诊断问题，再单独设计和实施轨道隔离队列。
+
+#### 21.7.15 第四批修复实施记录：保护 Node Dispatch 队列中的视频任务
+
+上一批修复只覆盖了 `Source -> Router` 以及 `Router -> Decoder` 的 Edge 队列。
+当 Router 的 Drain 已经成功取出消息，但 Decoder 节点自身的 Serialized
+Dispatch 队列被音频突发占满时，视频任务仍可能在进入节点前被拒绝。因此，本批
+继续处理同一个“音频突发导致视频包丢失”问题，但不改变当前的音视频独立 Edge
+和同步模型，也不实施轨道拆分队列。
+
+本批修改如下：
+
+1. `NodeOptions` 增加 `prefer_video_keyframes`，允许节点单独启用视频保护策略。
+2. 增加 `DispatchPriority`，由 Edge Drain 为每条任务传递音频、视频和关键帧分类。
+3. Serialized Dispatch 队列改为保存任务及其分类信息。队列达到上限时：
+   - 新音频任务被拒绝，不再挤占队列中的视频任务；
+   - 新视频任务可以替换尚未执行的排队音频任务；
+   - 新视频关键帧在没有排队音频可替换时，可以替换排队中的非关键视频帧；
+   - 队列中只有关键帧或无法安全替换的任务时，仍然拒绝新任务，避免破坏视频恢复窗口。
+4. 修正任务替换后的 `pending_tasks_` 计数：被淘汰的任务先释放一个待处理槽位，
+   新任务再占用一个槽位，保证停止屏障和队列实际长度一致。
+5. `test_stream_decode` 的音视频 Decoder 节点启用该策略，`test_mediaflow` 新增
+   Dispatch 队列满载时“视频关键帧替换音频、后续音频被拒绝”的回归测试。
+
+验证结果（VS 18 Community x64 Debug）：
+
+```text
+test_mediaflow                 exit code 0
+test_mediaflow_media_nodes     exit code 0
+test_avtp_timestamp_mapper     exit code 0
+test_stream_decode --duration-ms 15000  exit code 0
+```
+
+摄像头单路 RTSP 测试仍使用 `rtsp://192.168.66.83/live/mainstream`。本次短时
+测试识别到视频 `1920x1080/25fps` 和音频 `16kHz/mono`，Decoder 指标为视频
+`enqueued=375, processed=375, rejected=0`、音频 `enqueued=745, processed=745,
+rejected=0`；Source -> Router、Router -> Video 和 Router -> Audio 三条相关
+Edge 的 dropped/rejected 均为 `0`。这证明 Dispatch 层保护策略已接入并未影响
+当前稳定设备流，但仍需在设备状态稳定后进行更长时间、更多音频突发强度的验证。
+
+本批修复没有改变 21.7.14 中关于队列拆分和音视频同步的结论。后续若实施轨道
+隔离，仍必须以 PTS/DTS、time base、统一时钟和时间长度为约束，不能按音频帧数
+与视频帧数配对。

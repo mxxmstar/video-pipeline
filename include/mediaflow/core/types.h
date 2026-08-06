@@ -56,6 +56,14 @@ struct EdgeOptions {
 struct NodeOptions {
     NodeExecutionMode execution_mode{NodeExecutionMode::Serialized};
     std::size_t max_pending_tasks{64};  ///< 有界任务数，防止慢节点无限积压。
+    bool prefer_video_keyframes{false}; ///< 节点任务队列满时优先保护视频关键帧。
+};
+
+/// @brief 节点 Dispatch 队列对媒体任务的最小分类信息。
+struct DispatchPriority {
+    bool is_audio{false};
+    bool is_video{false};
+    bool is_keyframe{false};
 };
 
 /// NodeMetrics 的线程安全快照，避免调用方直接读取原子变量。
