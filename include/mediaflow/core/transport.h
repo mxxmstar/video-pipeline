@@ -585,9 +585,8 @@ private:
                                         QueueLimitReason reason) {
         if (reason == QueueLimitReason::Oversized) return false;
         while (!FitsLocked(cost, nullptr)) {
-            auto victim = QueueItemTraits<T>::IsControl(value)
-                              ? FindNonControlLocked()
-                              : queue_.begin();
+            // 控制边界不能被普通低延迟消息淘汰；没有普通消息可换时拒绝当前消息。
+            auto victim = FindNonControlLocked();
             if (victim == queue_.end()) return false;
             EraseLocked(victim);
         }

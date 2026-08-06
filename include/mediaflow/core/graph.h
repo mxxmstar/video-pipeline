@@ -5,12 +5,16 @@
 #include "mediaflow/core/types.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <typeindex>
@@ -55,6 +59,133 @@ struct NodeMetrics {
     }
 };
 
+/// @brief 记录 Edge 或 Node Dispatch 中的媒体成本。
+///
+/// 一个 Node 可能同时接收多条 Edge，因此这里同时维护总量和按轨道的量；
+/// 时间跨度只在同一 generation 内计算，避免重连后的时间戳互相污染。
+class InFlightCostTracker final {
+public:
+    void Clear() {
+        for (auto& state : states_) {
+            state = State{};
+        }
+    }
+
+    void Add(const QueueItemCost& cost) {
+        AddToState(states_[0], cost);
+        AddToState(states_[TrackIndex(cost.track)], cost);
+    }
+
+    void Remove(const QueueItemCost& cost) {
+        RemoveFromState(states_[0], cost);
+        RemoveFromState(states_[TrackIndex(cost.track)], cost);
+    }
+
+    QueueMetricsSnapshot Total() const { return Snapshot(states_[0]); }
+
+    QueueMetricsSnapshot ForTrack(QueueTrack track) const {
+        return Snapshot(states_[TrackIndex(track)]);
+    }
+
+private:
+    struct Bounds {
+        std::multiset<std::int64_t> starts;
+        std::multiset<std::int64_t> ends;
+    };
+
+    struct State {
+        std::size_t bytes{0};
+        std::int64_t span_us{0};
+        std::size_t high_items{0};
+        std::size_t high_bytes{0};
+        std::int64_t high_span_us{0};
+        std::size_t items{0};
+        std::map<std::uint64_t, Bounds> bounds;
+    };
+
+    static std::size_t TrackIndex(QueueTrack track) {
+        switch (track) {
+        case QueueTrack::Audio: return 2;
+        case QueueTrack::Video: return 3;
+        case QueueTrack::Unknown: return 1;
+        }
+        return 1;
+    }
+
+    static std::int64_t EndTimestamp(const QueueItemCost& cost) {
+        if (cost.timestamp_us == kNoQueueTimestamp || cost.duration_us <= 0) {
+            return cost.timestamp_us;
+        }
+        const auto max_value = (std::numeric_limits<std::int64_t>::max)();
+        return cost.timestamp_us > max_value - cost.duration_us
+                   ? max_value
+                   : cost.timestamp_us + cost.duration_us;
+    }
+
+    static std::int64_t Difference(std::int64_t start, std::int64_t end) {
+        if (end <= start) return 0;
+        const long double difference = static_cast<long double>(end) -
+                                       static_cast<long double>(start);
+        const auto max_value = (std::numeric_limits<std::int64_t>::max)();
+        return difference >= static_cast<long double>(max_value)
+                   ? max_value
+                   : static_cast<std::int64_t>(difference);
+    }
+
+    static void RecomputeSpan(State& state) {
+        state.span_us = 0;
+        for (const auto& [generation, bounds] : state.bounds) {
+            (void)generation;
+            if (!bounds.starts.empty() && !bounds.ends.empty()) {
+                state.span_us = std::max(
+                    state.span_us,
+                    Difference(*bounds.starts.begin(), *bounds.ends.rbegin()));
+            }
+        }
+    }
+
+    static void AddToState(State& state, const QueueItemCost& cost) {
+        ++state.items;
+        const auto max_bytes = (std::numeric_limits<std::size_t>::max)();
+        state.bytes = cost.bytes > max_bytes - state.bytes
+                          ? max_bytes
+                          : state.bytes + cost.bytes;
+        if (cost.timestamp_us != kNoQueueTimestamp) {
+            auto& bounds = state.bounds[cost.generation];
+            bounds.starts.insert(cost.timestamp_us);
+            bounds.ends.insert(EndTimestamp(cost));
+        }
+        RecomputeSpan(state);
+        state.high_items = std::max(state.high_items, state.items);
+        state.high_bytes = std::max(state.high_bytes, state.bytes);
+        state.high_span_us = std::max(state.high_span_us, state.span_us);
+    }
+
+    static void RemoveFromState(State& state, const QueueItemCost& cost) {
+        if (state.items > 0) --state.items;
+        state.bytes = cost.bytes > state.bytes ? 0 : state.bytes - cost.bytes;
+        if (cost.timestamp_us != kNoQueueTimestamp) {
+            auto bounds_it = state.bounds.find(cost.generation);
+            if (bounds_it != state.bounds.end()) {
+                auto& bounds = bounds_it->second;
+                auto start = bounds.starts.find(cost.timestamp_us);
+                if (start != bounds.starts.end()) bounds.starts.erase(start);
+                auto end = bounds.ends.find(EndTimestamp(cost));
+                if (end != bounds.ends.end()) bounds.ends.erase(end);
+                if (bounds.starts.empty()) state.bounds.erase(bounds_it);
+            }
+        }
+        RecomputeSpan(state);
+    }
+
+    static QueueMetricsSnapshot Snapshot(const State& state) {
+        return {state.items, state.bytes, state.span_us, state.high_items,
+                state.high_bytes, state.high_span_us, 0, 0, 0, 0};
+    }
+
+    std::array<State, 4> states_;
+};
+
 /// 单条 Edge 的原子统计，统计范围独立于目标节点。
 struct EdgeMetrics {
     std::atomic<std::uint64_t> accepted{0};
@@ -66,6 +197,10 @@ struct EdgeMetrics {
     std::atomic<std::uint64_t> drained{0};
     std::atomic<std::size_t> queue_size{0};
     std::atomic<std::size_t> queue_high_watermark{0};
+    std::atomic<std::size_t> queue_bytes{0};
+    std::atomic<std::size_t> queue_bytes_high_watermark{0};
+    std::atomic<std::int64_t> queue_span_us{0};
+    std::atomic<std::int64_t> queue_span_high_watermark_us{0};
 
     /// 更新当前队列深度，并用 CAS 保留历史最高水位。
     void UpdateQueueSize(std::size_t size) {
@@ -76,8 +211,25 @@ struct EdgeMetrics {
         }
     }
 
+    void UpdateQueueState(const QueueMetricsSnapshot& state) {
+        UpdateQueueSize(state.items);
+        queue_bytes.store(state.bytes);
+        queue_span_us.store(state.span_us);
+
+        auto previous_bytes = queue_bytes_high_watermark.load();
+        while (state.bytes > previous_bytes &&
+               !queue_bytes_high_watermark.compare_exchange_weak(
+                   previous_bytes, state.bytes)) {
+        }
+        auto previous_span = queue_span_high_watermark_us.load();
+        while (state.span_us > previous_span &&
+               !queue_span_high_watermark_us.compare_exchange_weak(
+                   previous_span, state.span_us)) {
+        }
+    }
+
     EdgeMetricsSnapshot Snapshot() const {
-        return EdgeMetricsSnapshot{
+        EdgeMetricsSnapshot snapshot{
             accepted.load(),
             dropped_newest.load(),
             dropped_oldest.load(),
@@ -88,6 +240,11 @@ struct EdgeMetrics {
             queue_size.load(),
             queue_high_watermark.load(),
         };
+        snapshot.budget = QueueMetricsSnapshot{
+            queue_size.load(), queue_bytes.load(), queue_span_us.load(),
+            queue_high_watermark.load(), queue_bytes_high_watermark.load(),
+            queue_span_high_watermark_us.load(), 0, 0, 0, 0};
+        return snapshot;
     }
 };
 
@@ -120,7 +277,7 @@ public:
      * 任务。调用者不应在 false 后继续假设消息会被处理。
      */
     bool Dispatch(Task task) {
-        return Dispatch(std::move(task), DispatchPriority{});
+        return Dispatch(std::move(task), DispatchPriority{}, QueueItemCost{});
     }
 
     /// 将带媒体分类的任务加入节点 Dispatch 队列。
@@ -128,8 +285,19 @@ public:
     /// 当节点队列已满且启用视频优先策略时，视频任务可以替换尚未执行的
     /// 音频任务；这样 Edge Drain 不会把保护策略只停留在外层 Transport。
     bool Dispatch(Task task, DispatchPriority priority) {
+        return Dispatch(std::move(task), priority, QueueItemCost{});
+    }
+
+    /// 将媒体成本随任务传入 Dispatch，统计 Edge 排空后的真实在途数据。
+    bool Dispatch(Task task, DispatchPriority priority, QueueItemCost cost) {
         if (!task) {
             return false;
+        }
+        if (cost.track == QueueTrack::Unknown) {
+            cost.track = priority.is_audio ? QueueTrack::Audio
+                                           : priority.is_video
+                                                 ? QueueTrack::Video
+                                                 : QueueTrack::Unknown;
         }
 
         if (options.execution_mode == NodeExecutionMode::Concurrent) {
@@ -141,14 +309,18 @@ public:
                     return false;
                 }
                 pending_tasks_.fetch_add(1);
+                pending_costs_.Add(cost);
                 UpdateHighWatermark();
             }
 
             auto self = shared_from_this();
-            if (!executor || !executor->Post([self, task = std::move(task)]() mutable {
-                    self->RunTask(std::move(task));
+            if (!executor || !executor->Post([self, task = std::move(task),
+                                              cost]() mutable {
+                    self->RunTask(std::move(task), cost);
                 })) {
+                std::lock_guard<std::mutex> lock(dispatch_mutex_);
                 pending_tasks_.fetch_sub(1);
+                pending_costs_.Remove(cost);
                 metrics->rejected.fetch_add(1);
                 return false;
             }
@@ -164,7 +336,21 @@ public:
             }
 
             if (pending_tasks_.load() >= options.max_pending_tasks) {
-                if (!options.prefer_video_keyframes || !priority.is_video) {
+                if (priority.is_control) {
+                    auto victim = std::find_if(
+                        dispatch_queue_.begin(), dispatch_queue_.end(),
+                        [](const DispatchTask& queued) {
+                            return !queued.priority.is_control;
+                        });
+                    if (victim == dispatch_queue_.end()) {
+                        metrics->rejected.fetch_add(1);
+                        return false;
+                    }
+                    pending_costs_.Remove(victim->cost);
+                    dispatch_queue_.erase(victim);
+                    pending_tasks_.fetch_sub(1);
+                    metrics->dropped.fetch_add(1);
+                } else if (!options.prefer_video_keyframes || !priority.is_video) {
                     if (options.prefer_video_keyframes && priority.is_audio) {
                         metrics->dropped.fetch_add(1);
                     }
@@ -172,16 +358,19 @@ public:
                     return false;
                 }
 
-                auto victim = std::find_if(
-                    dispatch_queue_.begin(), dispatch_queue_.end(),
-                    [](const DispatchTask& queued) {
-                        return queued.priority.is_audio;
-                    });
+                if (!priority.is_control) {
+                    auto victim = std::find_if(
+                        dispatch_queue_.begin(), dispatch_queue_.end(),
+                        [](const DispatchTask& queued) {
+                            return queued.priority.is_audio &&
+                                   !queued.priority.is_control;
+                        });
                 if (victim == dispatch_queue_.end() && priority.is_keyframe) {
                     victim = std::find_if(
                         dispatch_queue_.begin(), dispatch_queue_.end(),
                         [](const DispatchTask& queued) {
                             return queued.priority.is_video &&
+                                   !queued.priority.is_control &&
                                    !queued.priority.is_keyframe;
                         });
                 }
@@ -189,16 +378,20 @@ public:
                     metrics->rejected.fetch_add(1);
                     return false;
                 }
+                const auto victim_cost = victim->cost;
                 dispatch_queue_.erase(victim);
                 // 被替换的任务仍占用一个 pending 槽位；先释放旧任务的计数，
                 // 再在下面为新任务增加计数，保持队列长度与 pending_tasks_ 一致。
                 pending_tasks_.fetch_sub(1);
+                pending_costs_.Remove(victim_cost);
                 metrics->dropped.fetch_add(1);
+                }
             }
 
             dispatch_queue_.push_back(
-                DispatchTask{std::move(task), priority});
+                DispatchTask{std::move(task), priority, cost});
             pending_tasks_.fetch_add(1);
+            pending_costs_.Add(cost);
             UpdateHighWatermark();
             if (!dispatch_active_) {
                 dispatch_active_ = true;
@@ -220,6 +413,7 @@ public:
         std::lock_guard<std::mutex> lock(dispatch_mutex_);
         dispatch_queue_.clear();
         pending_tasks_.store(0);
+        pending_costs_.Clear();
         dispatch_active_ = false;
         dispatch_closed_ = false;
     }
@@ -231,6 +425,9 @@ public:
             std::lock_guard<std::mutex> lock(dispatch_mutex_);
             dispatch_closed_ = true;
             discarded = dispatch_queue_.size();
+            for (const auto& task : dispatch_queue_) {
+                pending_costs_.Remove(task.cost);
+            }
             dispatch_queue_.clear();
             dispatch_active_ = false;
         }
@@ -242,6 +439,17 @@ public:
     /// 返回当前节点尚未完成的业务任务数量，供 GracefulStop 建立停止屏障。
     std::size_t PendingTasks() const {
         return pending_tasks_.load();
+    }
+
+    NodeMetricsSnapshot MetricsSnapshot() const {
+        auto snapshot = metrics->Snapshot();
+        std::lock_guard<std::mutex> lock(dispatch_mutex_);
+        snapshot.pending_tasks = pending_tasks_.load();
+        snapshot.pending = pending_costs_.Total();
+        snapshot.audio_pending = pending_costs_.ForTrack(QueueTrack::Audio);
+        snapshot.video_pending = pending_costs_.ForTrack(QueueTrack::Video);
+        snapshot.unknown_pending = pending_costs_.ForTrack(QueueTrack::Unknown);
+        return snapshot;
     }
 
     const std::string id;                         ///< Graph 内唯一节点 ID。
@@ -273,7 +481,7 @@ private:
             dispatch_queue_.pop_front();
         }
 
-        RunTask(std::move(pending.task));
+        RunTask(std::move(pending.task), pending.cost);
 
         bool should_schedule = false;
         {
@@ -291,14 +499,16 @@ private:
     }
 
     /// 统一执行任务并把异常转换成 metrics，不让一个节点异常打穿线程池。
-    void RunTask(Task task) {
+    void RunTask(Task task, const QueueItemCost& cost) {
         try {
             task();
             metrics->processed.fetch_add(1);
         } catch (...) {
             metrics->errors.fetch_add(1);
         }
+        std::lock_guard<std::mutex> lock(dispatch_mutex_);
         pending_tasks_.fetch_sub(1);
+        pending_costs_.Remove(cost);
     }
 
     /// 使用 CAS 更新 pending task 的历史最高水位。
@@ -314,10 +524,12 @@ private:
     struct DispatchTask {
         Task task;
         DispatchPriority priority;
+        QueueItemCost cost;
     };
 
     std::deque<DispatchTask> dispatch_queue_; ///< Serialized 模式的有界任务队列。
     std::atomic<std::size_t> pending_tasks_{0};
+    InFlightCostTracker pending_costs_;
     bool dispatch_active_{false};         ///< 是否已有泵任务在 Executor 中。
     bool dispatch_closed_{true};          ///< 初始关闭，Graph::Start 时打开。
 };
@@ -359,7 +571,8 @@ public:
         if (options_.transport == TransportKind::ExecutorDispatch) {
             auto direct = std::make_shared<ExecutorDispatchTransport<T>>();
             direct->SetResultConsumer(
-                [destination = destination_, input = input_](T value) {
+                [destination = destination_, input = input_,
+                 edge_track = options_.track](T value) {
                 // ExecutorDispatch 没有 Edge::Drain 这一层，必须在这里保留
                 // 媒体分类，否则视频任务会退化为普通 Dispatch，无法使用
                 // NodeContext 的视频优先保护策略。
@@ -367,12 +580,15 @@ public:
                     QueueItemTraits<T>::IsAudio(value),
                     QueueItemTraits<T>::IsVideo(value),
                     QueueItemTraits<T>::IsKeyframe(value),
+                    QueueItemTraits<T>::IsControl(value),
                 };
+                auto cost = QueueItemTraits<T>::Cost(value);
+                if (edge_track != QueueTrack::Unknown) cost.track = edge_track;
                 const bool accepted = destination->Dispatch(
                     [input, value = std::move(value)]() mutable {
                         input->Receive(std::move(value));
                     },
-                    priority);
+                    priority, cost);
                 // MailboxPushResult 没有单独的“Node 队列满”枚举；对发送方
                 // 统一表现为当前消息被丢弃，NodeMetrics 仍保留 rejected 计数。
                 return accepted ? MailboxPushResult::Accepted
@@ -414,7 +630,7 @@ public:
                 break;
             }
             if (auto transport = weak_transport.lock()) {
-                edge_metrics->UpdateQueueSize(transport->Size());
+                edge_metrics->UpdateQueueState(transport->Metrics());
             }
         });
     }
@@ -457,7 +673,7 @@ public:
         scheduled_.store(false);
         drain_cancelled_.store(false);
         transport_->Open();
-        metrics_->UpdateQueueSize(transport_->Size());
+        metrics_->UpdateQueueState(transport_->Metrics());
     }
 
     /// 关闭边并复位调度门闩。
@@ -467,7 +683,7 @@ public:
         drain_cancelled_.store(true);
         transport_->Close();
         scheduled_.store(false);
-        metrics_->UpdateQueueSize(transport_->Size());
+        metrics_->UpdateQueueState(transport_->Metrics());
     }
 
     bool Empty() const override {
@@ -530,19 +746,22 @@ private:
                 QueueItemTraits<T>::IsAudio(*value),
                 QueueItemTraits<T>::IsVideo(*value),
                 QueueItemTraits<T>::IsKeyframe(*value),
+                QueueItemTraits<T>::IsControl(*value),
             };
+            auto cost = QueueItemTraits<T>::Cost(*value);
+            if (options_.track != QueueTrack::Unknown) cost.track = options_.track;
             if (!destination_->Dispatch(
                     [input = input_, value = std::move(*value)]() mutable {
                         input->Receive(std::move(value));
                     },
-                    priority)) {
+                    priority, cost)) {
                 destination_->metrics->rejected.fetch_add(1);
             }
             metrics_->drained.fetch_add(1);
             ++count;
         }
 
-        metrics_->UpdateQueueSize(transport_->Size());
+        metrics_->UpdateQueueState(transport_->Metrics());
         scheduled_.store(false);
         if (!drain_cancelled_.load() && !transport_->Empty()) {
             Schedule();
@@ -926,7 +1145,7 @@ public:
         if (it == nodes_.end()) {
             return false;
         }
-        snapshot = it->second->metrics->Snapshot();
+        snapshot = it->second->MetricsSnapshot();
         return true;
     }
 

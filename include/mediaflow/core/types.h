@@ -21,6 +21,13 @@ namespace mediaflow {
 inline constexpr std::int64_t kNoQueueTimestamp =
     (std::numeric_limits<std::int64_t>::min)();
 
+/// @brief 消息所属的媒体轨道，用于 Edge/Dispatch 总在途统计。
+enum class QueueTrack {
+    Unknown,
+    Audio,
+    Video,
+};
+
 /// @brief 单条消息占用队列预算的成本。
 ///
 /// bytes 表示本队列对消息载荷的逻辑计费，不推断 shared_ptr 在进程中的全局引用数。
@@ -31,6 +38,7 @@ struct QueueItemCost {
     std::int64_t timestamp_us{kNoQueueTimestamp};
     std::int64_t duration_us{0};
     std::uint64_t generation{0};
+    QueueTrack track{QueueTrack::Unknown};
 };
 
 /// @brief 队列的多维硬上限及水位配置。
@@ -110,6 +118,7 @@ struct EdgeOptions {
     std::size_t max_batch_size{32};                 ///< 一次 Drain 最多提交的消息数。
     std::int64_t max_drain_time_us{0};              ///< Drain 时间预算，0 表示不限制。
     QueueBudget budget{};                            ///< 可选多维队列预算；全 0 时兼容 capacity。
+    QueueTrack track{QueueTrack::Unknown};           ///< Edge 的轨道标签，用于总在途统计。
 };
 
 /// 节点内部 Dispatch 队列的配置。
@@ -124,6 +133,7 @@ struct DispatchPriority {
     bool is_audio{false};
     bool is_video{false};
     bool is_keyframe{false};
+    bool is_control{false};
 };
 
 /// NodeMetrics 的线程安全快照，避免调用方直接读取原子变量。
@@ -135,6 +145,10 @@ struct NodeMetricsSnapshot {
     std::uint64_t errors{0};             ///< 节点任务抛出异常的次数。
     std::size_t pending_tasks{0};        ///< 当前等待执行或正在执行的任务数。
     std::size_t max_pending_tasks{0};    ///< 从打开节点以来观察到的最大任务数。
+    QueueMetricsSnapshot pending{};      ///< 当前 Node Dispatch 的总在途成本。
+    QueueMetricsSnapshot audio_pending{};
+    QueueMetricsSnapshot video_pending{};
+    QueueMetricsSnapshot unknown_pending{};
 };
 
 /// Graph 构建或启动失败的原因，保留 bool API 同时提供可诊断信息。
@@ -174,6 +188,7 @@ struct EdgeMetricsSnapshot {
     std::uint64_t drained{0};
     std::size_t queue_size{0};
     std::size_t queue_high_watermark{0};
+    QueueMetricsSnapshot budget{};       ///< Edge 队列的 items/bytes/span 快照。
 };
 
 } // namespace mediaflow

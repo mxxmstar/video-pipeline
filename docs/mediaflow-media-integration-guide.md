@@ -851,8 +851,8 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-2</td><td>音频突发与视频包丢失</td><td>记录混合队列问题、启动突发改进和后续轨道隔离计划</td><td>第 21.6.1-21.6.7 节</td><td>Edge 层启动突发已改善；轨道级入口隔离当时未实施，已于 A4-5 完成</td></tr>
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
-<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，多维容量控制已规划于 A4-6，尚未实施</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成实施与验收规划，尚未开始编码</td></tr>
+<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算的 C1-C4 已完成</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C4：多维预算、控制消息保护和 Edge/Dispatch 在途快照；C5-C7 与现场验收待实施</td></tr>
 </tbody>
 </table>
 
@@ -1776,15 +1776,18 @@ recommended_bytes = bitrate_bits_per_second / 8
 
 ##### 21.7.16.6 验收结果记录
 
-本节在每批实现完成后更新。当前只有入口分轨基线已经验证，多维容量控制尚未编码，
-因此不能把下面的“待执行”视为通过。
+本节在每批实现完成后更新。C1-C4 的代码能力和确定性单元测试已经完成，但尚未执行
+长时间突发、全部停止边界和摄像头现场验收，因此不能把“部分通过”视为最终通过。
 
 | 验收范围 | 当前结果 | 证据或待补内容 |
 |---|---|---|
 | 第 21.7.15 节入口分轨基线 | 已通过 | 15 秒单路 RTSP：视频 `375/375`、音频 `745/745`，四条相关 Edge dropped/rejected 均为 `0` |
-| CAP-01 至 CAP-02：成本与硬上限 | 待执行 | 完成 C1、C2 后填写单元测试名称、配置和统计快照 |
-| CAP-03 至 CAP-05：轨道策略 | 待执行 | 完成 C3 后填写音频 10 倍突发、关键帧恢复和音频 span 结果 |
-| CAP-06 至 CAP-08：异常、停止和总在途 | 待执行 | 完成 C4、C5 后填写 generation、EOS、Block 停止和指标一致性结果 |
+| CAP-01 至 CAP-02：成本与硬上限 | 通过 | `TestQueueBudgetAccounting` 与 `TestMediaQueueItemCostTraits` 已覆盖 items/bytes/span、超大包、generation、EOS 和无时间戳成本 |
+| CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 验证独立音频/视频预算；尚未执行 30 秒 10 倍音频突发和关键帧恢复解码 |
+| CAP-04 至 CAP-05：实时延迟与视频恢复 | 待执行 | 仍需阻塞恢复后的低水位验证，以及关键帧后依赖窗口的解码恢复测试 |
+| CAP-06：时间戳异常 | 部分通过 | 已覆盖无时间戳、DTS/PTS 换算和跨 generation span 隔离；回退时间戳与 discontinuity 测试待补 |
+| CAP-07：EOS 与停止 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 和 `TestVideoPriorityDispatchQueue` 验证 EOS 在 Queue/Dispatch 满载时替换普通媒体任务；Block 被关闭唤醒和三类上限组合停止待补 |
+| CAP-08：总在途可观测性 | 部分通过 | `TestMediaEdgeAndDispatchInflightMetrics` 核对 `edge_queue + node_pending` 的 items/bytes/span；多 Edge 聚合与诊断指标待 C5 完成 |
 | CAP-09：生命周期回归 | 待执行 | 记录 100 次 Start/Stop、现有测试集退出码和内存变化 |
 | CAP-10：摄像头长测 | 待执行 | 只使用一路 RTSP，记录至少 10 分钟的五秒采样数据和最终停止结果 |
 | CAP-11：性能回归 | 待执行 | 记录同一机器、同一流、同一构建配置下改造前后的 CPU/吞吐对比 |
@@ -1826,3 +1829,39 @@ recommended_bytes = bitrate_bits_per_second / 8
 本批构建环境为 VS 18 Community x64 Debug；执行目标为 `test_mediaflow` 和
 `test_mediaflow_media_nodes`，两个程序退出码均为 `0`。本批没有执行摄像头拉流，
 遵守设备只允许一路 RTSP 会话的约束。
+
+##### 21.7.16.8 C3+C4 第二批实施记录
+
+本批完成分轨背压的控制消息保护，以及 Edge 队列和 Node Dispatch 之间的在途成本
+衔接。容量预算仍由每条 Edge 独立配置，因此音频突发不会占用视频 Edge 的
+`items/bytes/span` 额度；A/V 同步调度不在本批范围内。
+
+实施内容：
+
+- 增加 `QueueTrack`，并由 `MediaPacketMessage`、`MediaFrameMessage` 的 traits 填入
+  音频、视频或未知轨分类；`EdgeOptions::track` 可为不含媒体类型的自定义消息显式覆盖分类。
+- `QueueTransport::DropOldest` 不再淘汰 EOS 等控制消息。队列满载时，普通媒体只能
+  替换另一条普通媒体；没有可替换项时拒绝当前消息。
+- `DispatchPriority` 增加控制消息标记。Serialized Node Dispatch 满载时，EOS 可以
+  替换一个尚未执行的普通媒体任务；视频关键帧的替换策略也跳过控制任务。
+- 增加 `InFlightCostTracker`，在 Node Dispatch 入队、替换、执行完成、关闭和重新打开时
+  维护总计、音频、视频、未知轨的 `items/bytes/span` 与高水位。Edge Drain 和
+  ExecutorDispatch 路径均把成本和轨道分类传入目标 Dispatch。
+- `EdgeMetricsSnapshot::budget` 暴露 Edge 当前 `items/bytes/span` 及高水位，
+  `NodeMetricsSnapshot` 暴露总和分轨 pending 快照，可由调用方核对
+  `total_inflight = edge_queue + node_pending`。
+
+本批验证结果：
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| C3 分轨背压与 EOS 保护 | 通过 | `TestTrackBudgetIsolationAndControlRetention` 验证音频队列满载后 EOS 保留、视频独立预算仍可接收；`TestVideoPriorityDispatchQueue` 验证 Dispatch 中 EOS 不被音频和关键帧替换策略淘汰 |
+| C4 Edge/Dispatch 在途快照 | 通过 | `TestMediaEdgeAndDispatchInflightMetrics` 在阻塞视频 Sink 时核对 Edge `2 items/7 bytes/80000 us`、Node `1 item/2 bytes/40000 us`，并在排空后确认当前值归零 |
+| CAP-03 | 部分通过 | 已具备独立预算和控制消息保护；尚缺 30 秒 10 倍音频突发和关键帧恢复解码验证 |
+| CAP-06 | 部分通过 | generation 与无时间戳基线已覆盖；回退时间戳和 discontinuity 待 C7 补测 |
+| CAP-07 | 部分通过 | Queue 与 Dispatch 的 EOS 满载保护已覆盖；Block 关闭唤醒和停止组合测试待 C7 补测 |
+| CAP-08 | 部分通过 | 单 Edge 到单 Node 的总在途核对已覆盖；多 Edge 汇总和诊断分类待 C5 补齐 |
+
+本批构建环境为 VS 18 Community x64 Debug。执行 `test_mediaflow.exe` 和
+`test_mediaflow_media_nodes.exe`，退出码均为 `0`；未连接摄像头，避免占用设备唯一的
+RTSP 会话。

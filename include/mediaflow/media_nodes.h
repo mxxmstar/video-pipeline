@@ -83,6 +83,11 @@ struct QueueItemTraits<MediaPacketMessage> {
 
         const auto& packet = *message.packet;
         cost.bytes = packet.buffer ? packet.buffer->Size() : 0;
+        cost.track = packet.type == MediaType::AUDIO
+                         ? QueueTrack::Audio
+                         : packet.type == MediaType::VIDEO
+                               ? QueueTrack::Video
+                               : QueueTrack::Unknown;
         const auto timestamp = IsValidTimestamp(packet.dts)
                                    ? packet.dts
                                    : packet.pts;
@@ -133,6 +138,11 @@ struct QueueItemTraits<MediaFrameMessage> {
             return cost;
         }
         cost.bytes = message.frame->buffer ? message.frame->buffer->Size() : 0;
+        cost.track = message.frame->type == MediaType::AUDIO
+                         ? QueueTrack::Audio
+                         : message.frame->type == MediaType::VIDEO
+                               ? QueueTrack::Video
+                               : QueueTrack::Unknown;
         cost.timestamp_us = IsValidTimestamp(message.frame->time.pts_us)
                                 ? message.frame->time.pts_us
                                 : kNoQueueTimestamp;

@@ -75,6 +75,7 @@ void TestMediaQueueItemCostTraits() {
     assert(packet_cost.timestamp_us == 20000);
     assert(packet_cost.duration_us == 2000);
     assert(packet_cost.generation == 3);
+    assert(packet_cost.track == QueueTrack::Video);
     assert(QueueItemTraits<MediaPacketMessage>::IsVideo(packet_message));
     assert(QueueItemTraits<MediaPacketMessage>::IsKeyframe(packet_message));
 
@@ -104,6 +105,7 @@ void TestMediaQueueItemCostTraits() {
     assert(frame_cost.timestamp_us == 50000);
     assert(frame_cost.duration_us == 20000);
     assert(frame_cost.generation == 4);
+    assert(frame_cost.track == QueueTrack::Audio);
     assert(QueueItemTraits<MediaFrameMessage>::IsAudio(frame_message));
 
     MediaFrameMessage eos_frame{nullptr, 4, true};

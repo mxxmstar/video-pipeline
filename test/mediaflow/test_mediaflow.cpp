@@ -1,5 +1,7 @@
 #include "mediaflow/mediaflow.h"
+#include "media/simple_buffer.h"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -326,6 +328,36 @@ MediaPacketMessage MakePriorityMessage(MediaType type, bool keyframe) {
     return message;
 }
 
+MediaPacketMessage MakeCostedMediaMessage(MediaType type,
+                                          std::int64_t pts,
+                                          std::int64_t duration,
+                                          std::size_t bytes,
+                                          std::uint64_t generation = 1) {
+    auto packet = std::make_shared<MediaPacket>();
+    packet->type = type;
+    packet->codec = type == MediaType::VIDEO ? CodecType::H264 : CodecType::AAC;
+    packet->stream_index = type == MediaType::VIDEO ? 1 : 2;
+    packet->pts = pts;
+    packet->dts = pts;
+    packet->duration = duration;
+    packet->time_base = Rational{1, 1000};
+    packet->keyframe = type == MediaType::VIDEO;
+    packet->buffer = std::make_shared<SimpleBuffer>(
+        std::vector<std::uint8_t>(bytes, 0x01));
+
+    MediaPacketMessage message;
+    message.packet = std::move(packet);
+    message.generation = generation;
+    return message;
+}
+
+MediaPacketMessage MakeEosMessage(std::uint64_t generation = 1) {
+    MediaPacketMessage message;
+    message.generation = generation;
+    message.eos = true;
+    return message;
+}
+
 template <typename Predicate>
 bool WaitUntil(Predicate predicate,
                std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
@@ -438,6 +470,43 @@ void TestQueueBudgetAccounting() {
     assert(span_queue.Send({1, 0, 10, 3}) == MailboxPushResult::Accepted);
 }
 
+void TestTrackBudgetIsolationAndControlRetention() {
+    QueueBudget budget;
+    budget.max_items = 2;
+    budget.max_bytes = 10;
+    budget.max_span_us = 100000;
+
+    QueueTransport<MediaPacketMessage> audio_queue(
+        2, BackpressurePolicy::DropOldest, budget);
+    assert(audio_queue.Send(MakeCostedMediaMessage(
+               MediaType::AUDIO, 0, 20, 4)) == MailboxPushResult::Accepted);
+    assert(audio_queue.Send(MakeEosMessage()) == MailboxPushResult::Accepted);
+
+    // DropOldest 只能淘汰普通媒体包，不能让 EOS 被音频突发挤出队列。
+    assert(audio_queue.Send(MakeCostedMediaMessage(
+               MediaType::AUDIO, 40, 20, 4)) ==
+           MailboxPushResult::DroppedOldest);
+    auto audio_snapshot = audio_queue.Metrics();
+    assert(audio_snapshot.items == 2);
+    assert(audio_snapshot.bytes == 4);
+    assert(audio_snapshot.span_us == 20000);
+    assert(audio_queue.TryReceive()->eos);
+    assert(!audio_queue.TryReceive()->eos);
+
+    // 音频队列达到上限不应消耗另一条视频 Edge 的独立预算。
+    QueueTransport<MediaPacketMessage> video_queue(
+        2, BackpressurePolicy::DropNewest, budget);
+    assert(video_queue.Send(MakeCostedMediaMessage(
+               MediaType::VIDEO, 0, 40, 4)) == MailboxPushResult::Accepted);
+    assert(video_queue.Send(MakeCostedMediaMessage(
+               MediaType::VIDEO, 40, 40, 5)) == MailboxPushResult::Accepted);
+    const auto video_snapshot = video_queue.Metrics();
+    assert(video_snapshot.items == 2);
+    assert(video_snapshot.bytes == 9);
+    assert(video_snapshot.span_us == 80000);
+    assert(audio_snapshot.items == 2);
+}
+
 void TestVideoPriorityBackpressure() {
     auto make_message = [](MediaType type, bool keyframe, int64_t pts) {
         auto packet = std::make_shared<MediaPacket>();
@@ -502,12 +571,15 @@ void TestVideoPriorityDispatchQueue() {
     std::condition_variable condition;
     bool entered = false;
     bool released = false;
+    const QueueItemCost running_cost{9, 0, 40, 1, QueueTrack::Video};
+    const QueueItemCost audio_cost{4, 100, 20, 1, QueueTrack::Audio};
+    const QueueItemCost keyframe_cost{8, 200, 40, 1, QueueTrack::Video};
     assert(context->Dispatch([&]() {
         std::unique_lock<std::mutex> lock(mutex);
         entered = true;
         condition.notify_all();
         condition.wait(lock, [&]() { return released; });
-    }));
+    }, DispatchPriority{false, true, false}, running_cost));
     {
         std::unique_lock<std::mutex> lock(mutex);
         assert(condition.wait_for(lock, std::chrono::seconds(2), [&]() {
@@ -517,12 +589,25 @@ void TestVideoPriorityDispatchQueue() {
 
     const DispatchPriority audio_priority{true, false, false};
     const DispatchPriority keyframe_priority{false, true, true};
-    assert(context->Dispatch([]() {}, audio_priority));
-    assert(context->Dispatch([]() {}, audio_priority));
+    assert(context->Dispatch([]() {}, audio_priority, audio_cost));
+    assert(context->Dispatch([]() {}, audio_priority, audio_cost));
+    std::atomic<bool> eos_processed{false};
+    const DispatchPriority eos_priority{false, false, false, true};
+    assert(context->Dispatch(
+        [&eos_processed]() { eos_processed.store(true); }, eos_priority,
+        QueueItemCost{0, kNoQueueTimestamp, 0, 1, QueueTrack::Unknown}));
     // 第三个槽位到达时，视频关键帧应替换尚未执行的音频任务。
-    assert(context->Dispatch([]() {}, keyframe_priority));
+    assert(context->Dispatch([]() {}, keyframe_priority, keyframe_cost));
     // 新的音频不能再挤掉队列中已经保留的视频任务。
-    assert(!context->Dispatch([]() {}, audio_priority));
+    assert(!context->Dispatch([]() {}, audio_priority, audio_cost));
+
+    NodeMetricsSnapshot pending_snapshot = context->MetricsSnapshot();
+    assert(pending_snapshot.pending_tasks == 3);
+    assert(pending_snapshot.pending.items == 3);
+    assert(pending_snapshot.pending.bytes == 17);
+    assert(pending_snapshot.audio_pending.items == 0);
+    assert(pending_snapshot.video_pending.items == 2);
+    assert(pending_snapshot.unknown_pending.items == 1);
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -530,6 +615,10 @@ void TestVideoPriorityDispatchQueue() {
     }
     condition.notify_all();
     assert(WaitUntil([&]() { return context->PendingTasks() == 0; }));
+    pending_snapshot = context->MetricsSnapshot();
+    assert(pending_snapshot.pending.items == 0);
+    assert(pending_snapshot.pending.items_high_watermark == 3);
+    assert(eos_processed.load());
     context->CloseDispatch();
     executor->Stop();
 }
@@ -779,6 +868,71 @@ void TestEdgeMetricsAndBoundedDispatch() {
     bounded_graph.Stop();
 }
 
+void TestMediaEdgeAndDispatchInflightMetrics() {
+    auto executor = std::make_shared<AsioExecutor>("media-inflight", 1);
+    Graph graph;
+    NodeOptions sink_options;
+    sink_options.max_pending_tasks = 1;
+    assert(graph.AddNode<MediaBurstSource>("source", executor, NodeOptions{}));
+    assert(graph.AddNode<BlockingMediaSink>("sink", executor, sink_options));
+
+    EdgeOptions edge_options;
+    edge_options.max_batch_size = 1;
+    edge_options.backpressure = BackpressurePolicy::DropNewest;
+    edge_options.track = QueueTrack::Video;
+    edge_options.budget.max_items = 2;
+    edge_options.budget.max_bytes = 10;
+    edge_options.budget.max_span_us = 100000;
+    assert(graph.Connect<MediaPacketMessage>("source", "sink", edge_options));
+    assert(graph.Start());
+
+    auto source = graph.GetNode<MediaBurstSource>("source");
+    auto sink = graph.GetNode<BlockingMediaSink>("sink");
+    assert(source && sink);
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 0, 40, 2)));
+    assert(sink->WaitUntilEntered());
+
+    // Sink 的首包仍在执行时，后续两个包应停留在 Edge 队列；第三个包触发
+    // DropNewest。这样可以同时核对 Edge 缓存和 Node Dispatch 在途成本。
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 40, 40, 3)));
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 80, 40, 4)));
+    assert(!source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 120, 40, 4)));
+
+    EdgeMetricsSnapshot edge_snapshot;
+    NodeMetricsSnapshot node_snapshot;
+    assert(graph.GetEdgeMetrics("source:out->sink:in", edge_snapshot));
+    assert(graph.GetMetrics("sink", node_snapshot));
+    assert(edge_snapshot.budget.items == 2);
+    assert(edge_snapshot.budget.bytes == 7);
+    assert(edge_snapshot.budget.span_us == 80000);
+    assert(edge_snapshot.budget.items_high_watermark == 2);
+    assert(edge_snapshot.dropped_newest == 1);
+    assert(node_snapshot.pending.items == 1);
+    assert(node_snapshot.pending.bytes == 2);
+    assert(node_snapshot.pending.span_us == 40000);
+    assert(node_snapshot.audio_pending.items == 0);
+    assert(node_snapshot.video_pending.items == 1);
+    assert(node_snapshot.video_pending.bytes == 2);
+    assert(edge_snapshot.budget.items + node_snapshot.pending.items == 3);
+    assert(edge_snapshot.budget.bytes + node_snapshot.pending.bytes == 9);
+
+    sink->Release();
+    assert(sink->WaitForCount(3));
+    assert(WaitUntil([&]() {
+        EdgeMetricsSnapshot current_edge;
+        NodeMetricsSnapshot current_node;
+        return graph.GetEdgeMetrics("source:out->sink:in", current_edge) &&
+               graph.GetMetrics("sink", current_node) &&
+               current_edge.budget.items == 0 &&
+               current_node.pending.items == 0;
+    }));
+    graph.Stop();
+}
+
 void TestGraphStartStopStart() {
     // 多节点共享一个两线程执行器，验证 Graph 的执行器去重启动逻辑。
     auto executor = std::make_shared<AsioExecutor>("test", 2);
@@ -818,6 +972,7 @@ void TestGraphStartStopStart() {
 int main() {
     TestQueueBackpressure();
     TestQueueBudgetAccounting();
+    TestTrackBudgetIsolationAndControlRetention();
     TestVideoPriorityBackpressure();
     TestVideoPriorityDispatchQueue();
     TestVideoPriorityExecutorDispatch();
@@ -825,6 +980,7 @@ int main() {
     TestGraphValidationAndTopologyFreeze();
     TestGraphErrorRollback();
     TestEdgeMetricsAndBoundedDispatch();
+    TestMediaEdgeAndDispatchInflightMetrics();
     TestGraphStartStopStart();
     return 0;
 }
