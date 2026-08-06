@@ -497,8 +497,8 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-09</td><td><code>PublisherResult</code></td><td>增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
-<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5<br>详情：第 21.7.12、21.7.14、21.7.15 节<br>计划：A4-6 / 第 21.7.16 节</td></tr>
-<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15 节<br>计划：A4-6 / 第 21.7.16 节</td></tr>
+<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18 节<br>后续：上一已提交版本的同配置性能对照</td></tr>
+<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18 节<br>后续：真实 Decoder 丢包关键帧恢复和统一时钟调度</td></tr>
 </tbody>
 </table>
 
@@ -852,7 +852,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C7 离线回归并完成单路 600 秒长测；队列与 A/V 输出通过，RSS 跃升问题阻断 CAP-10 最终通过，CAP-11 性能基线待建立</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.18 节</td><td>容量边界、队列和活跃帧引用已通过两轮单路 600 秒复验；当前版本 CPU/吞吐基线已记录，改造前对照、真实 Decoder 关键帧恢复和统一时钟调度仍待实施</td></tr>
 </tbody>
 </table>
 
@@ -2005,3 +2005,94 @@ GracefulStop 完成。运行期间 A/V 帧持续增长，未观察到队列单�
 部分通过，CAP-10 部分通过且被 RSS 问题阻断最终通过，CAP-11 仍待建立改造前基线。
 下一阶段应优先调查 RSS 跃升，并补真实 Decoder 的关键帧恢复验收；在此之前不应宣称
 A/V 轨道容量控制已经完成全部现场验收。
+
+#### 21.7.17 下一阶段：FFmpeg 解码帧内存诊断与 CAP-10 复验
+
+本阶段先处理上一阶段长测发现的 RSS 跃升问题，目标是把“仍有媒体帧被引用”与
+“对象已经释放但 Windows 工作集或 FFmpeg 内部缓存仍保留”区分开，再决定是否
+需要零拷贝或延迟 pack 改造。当前不直接改变 `FFmpegFrameBuffer` 的数据所有权，
+避免在没有泄漏证据时扩大解码链路风险。
+
+##### 21.7.17.1 已实施修改
+
+- `FFmpegFrameBuffer` 增加线程安全的分层内存快照：活跃 wrapper 数量、packed
+  数据字节数、AVFrame 引用的 FFmpeg `AVBuffer` payload 字节数，以及三项峰值。
+- 统计在 wrapper 构造成功后登记，在析构前扣除；按 FFmpeg 的固定 buffer 引用和
+  `extended_buf` 额外引用累加，不创建临时容器。统计读取只使用原子快照，不扫描队列。
+- `test_stream_decode` 每 5 秒同时记录 RSS 和帧缓冲快照，并在 `GracefulStop`
+  后检查活跃帧缓冲回到零。
+- `test_ffmpeg_decoder_raw_packet` 增加解码器关闭后的资源基线回归，确认 raw
+  packet 路径没有遗留 `FFmpegFrameBuffer`。
+
+##### 21.7.17.2 验证结果
+
+以下回归测试通过：
+
+- `test_mediaflow.exe`；
+- `test_mediaflow_media_nodes.exe`；
+- `test_ffmpeg_decoder_raw_packet.exe`，输出单帧峰值约为 packed `3110400`
+  字节、FFmpeg payload `3139437` 字节，关闭后存活统计回到基线。
+- 摄像头 `192.168.66.83` 单路 RTSP TCP 长测 600 秒，退出码 `0`。第二轮使用
+  cmd 原始重定向保存完整日志：`build-mediaflow-vs/test_stream_decode_memory_cmd.out`
+  和 `.err`。
+- 第二轮长测视频 Decoder `14993/14993`、音频 Decoder `33417/33417`，四条
+  Edge 最终 `items/bytes/span=0/0/0`，dropped/rejected/timestamp diagnostics
+  均为 `0`，`GracefulStop` 完成。
+- 长测采样中活跃 frame wrapper 通常为 `0`，偶发在处理瞬间为 `1`；峰值
+  wrapper `12`、packed `3111040` 字节、AVBuffer `3140077` 字节。RSS 最高约
+  `45.1 MB`，后段回落，未与帧数、Edge 或活跃 frame bytes 单调同步增长。
+
+##### 21.7.17.3 阶段结论与后续
+
+本阶段未发现 `MediaFrame`/`FFmpegFrameBuffer` 存活对象持续增长，原有 RSS 跃升
+不能归因于当前帧 wrapper 泄漏，CAP-10 的队列和帧引用边界已通过本轮复验。RSS
+仍可能来自 FFmpeg 解码上下文、网络/格式探测缓存或 Windows 工作集保留，后续应
+使用专用堆分析工具或增加解码上下文级基线后再继续定位。
+
+CAP-11 性能回归尚未完成：下一阶段建立同一机器、同一 URL、同一 Debug/Release
+构建配置下的 CPU、解码吞吐、采样开销基线，并补真实 FFmpeg 丢包后的关键帧恢复
+验收。零拷贝和延迟 pack 暂列 P2，待性能基线确认双份数据确实构成可接受的主要
+成本后再实施。
+
+#### 21.7.18 CAP-11 当前版本 CPU 与吞吐基线
+
+本阶段为性能回归增加统一采集口径。测试只统计稳定运行区间：在进入
+`GracefulStop` 前记录墙钟和进程 CPU 时间，并使用此刻已完成的 A/V 帧数计算吞吐，
+不把停止阶段的 Decoder Flush 尾帧混入性能数据。采样线程仍只读取原子指标快照，
+不执行队列遍历。
+
+##### 21.7.18.1 已实施修改
+
+- `test_stream_decode` 增加 Windows `GetProcessTimes` 进程 CPU 时间采集，输出
+  kernel/user 合计的 100 ns 时间和单核等效 CPU 百分比。
+- 增加稳定运行墙钟、采样次数、停止前视频/音频帧率输出；CPU 和吞吐采用同一
+  时间边界，便于后续与改造前构建比较。
+- 采集失败或墙钟为零时 CPU 百分比输出 `-1`，不会伪造可比较数据。
+
+##### 21.7.18.2 当前版本采集结果
+
+使用当前工作区构建的 `test_stream_decode --duration-ms 600000`，只建立一路
+`rtsp://192.168.66.83/live/mainstream` RTSP TCP 会话，结果如下：
+
+| 指标 | 当前版本结果 |
+|---|---:|
+| 稳定运行墙钟 | `600015 ms` |
+| 进程 CPU（单核等效） | `14.28%` |
+| 视频吞吐 | `24.95 fps`，停止前 `14973` 帧 |
+| 音频吞吐 | `52.22 fps`，停止前 `31335` 帧 |
+| 指标采样次数 | `119` |
+| 活跃帧峰值 | `4 wrappers / 3111040 packed bytes / 3140077 AVBuffer bytes` |
+| 最终活跃帧 | `0 / 0 / 0` |
+| 最终 Edge 诊断 | dropped/rejected/timestamp `0` |
+
+完整日志：`build-mediaflow-vs/test_stream_decode_perf_current.out` 和
+`build-mediaflow-vs/test_stream_decode_perf_current.err`。本次运行 RSS 峰值约
+`43.7 MB`，结束前约 `39.8 MB`，没有与活跃帧或 Edge 队列同步单调增长。
+
+##### 21.7.18.3 验收状态与后续
+
+CPU/吞吐采集能力和当前版本基线已完成，CAP-11 仍不能标记为最终通过，因为本轮
+没有在相同 URL、相同构建配置和相同设备状态下采集改造前对照值。下一步应从上一
+个已提交版本构建独立对照程序，至少各运行三轮，再按中位数比较 CPU 增量和 A/V
+吞吐；若差异超过 5%，再用采样开关或专用 profiler 分解内存统计、队列诊断和
+FFmpeg 帧 pack 的具体成本。

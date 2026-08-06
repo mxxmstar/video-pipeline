@@ -1,4 +1,5 @@
 #include "media/decoder/ffmpeg_decoder.h"
+#include "media/ffmpeg_frame_buffer.h"
 #include "media/puller/ffmpeg_puller.h"
 #include "media/simple_buffer.h"
 
@@ -32,6 +33,12 @@ std::shared_ptr<MediaPacket> MakeRawPacketCopy(const std::shared_ptr<MediaPacket
 int main() {
     constexpr int kMaxPacketsToRead = 500;
     constexpr int kMinDecodedFrames = 1;
+
+    // 该回归不仅验证 raw packet 解码成功，也验证回调返回且 Decoder 关闭后，
+    // FFmpegFrameBuffer 不再持有本次解码产生的 AVFrame 或 packed 缓冲区。
+    // 使用基线而不是硬编码为零，可以避免未来测试进程增加其他独立解码器时
+    // 产生无关的误报。
+    const auto memory_before = FFmpegFrameBuffer::GetMemoryStats();
 
     FFmpegPuller puller;
     puller.SetLowLatency(false);
@@ -90,6 +97,20 @@ int main() {
     decoder.Close();
     puller.Close();
 
+    const auto memory_after = FFmpegFrameBuffer::GetMemoryStats();
+    if (memory_after.live_wrappers != memory_before.live_wrappers ||
+        memory_after.live_packed_bytes != memory_before.live_packed_bytes ||
+        memory_after.live_av_buffer_bytes != memory_before.live_av_buffer_bytes) {
+        std::cerr << "decoded frame buffers were retained: before=("
+                  << memory_before.live_wrappers << ","
+                  << memory_before.live_packed_bytes << ","
+                  << memory_before.live_av_buffer_bytes << "), after=("
+                  << memory_after.live_wrappers << ","
+                  << memory_after.live_packed_bytes << ","
+                  << memory_after.live_av_buffer_bytes << ")" << std::endl;
+        return 1;
+    }
+
     if (decoded_frames < kMinDecodedFrames) {
         std::cerr << "raw packet path produced no frame, raw_packets_sent="
                   << raw_packets_sent << std::endl;
@@ -97,6 +118,10 @@ int main() {
     }
 
     std::cout << "raw packet decode ok, packets=" << raw_packets_sent
-              << ", frames=" << decoded_frames << std::endl;
+              << ", frames=" << decoded_frames
+              << ", frame_memory_peak=(wrappers=" << memory_after.peak_wrappers
+              << ", packed_bytes=" << memory_after.peak_packed_bytes
+              << ", av_buffer_bytes=" << memory_after.peak_av_buffer_bytes
+              << ")" << std::endl;
     return 0;
 }

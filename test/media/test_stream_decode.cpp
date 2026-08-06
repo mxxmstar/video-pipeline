@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -19,6 +20,7 @@
 #endif
 
 #include "media/decoder/ffmpeg_decoder.h"
+#include "media/ffmpeg_frame_buffer.h"
 #include "media/puller/ffmpeg_puller.h"
 
 namespace {
@@ -149,6 +151,49 @@ std::uint64_t CurrentProcessRssBytes() {
     return 0;
 }
 
+struct ProcessCpuSnapshot {
+    std::uint64_t total_100ns{0};
+    bool valid{false};
+};
+
+ProcessCpuSnapshot CurrentProcessCpuTime() {
+#if defined(_WIN32)
+    FILETIME creation_time{};
+    FILETIME exit_time{};
+    FILETIME kernel_time{};
+    FILETIME user_time{};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation_time, &exit_time,
+                         &kernel_time, &user_time)) {
+        return {};
+    }
+
+    ULARGE_INTEGER kernel_ticks{};
+    ULARGE_INTEGER user_ticks{};
+    kernel_ticks.LowPart = kernel_time.dwLowDateTime;
+    kernel_ticks.HighPart = kernel_time.dwHighDateTime;
+    user_ticks.LowPart = user_time.dwLowDateTime;
+    user_ticks.HighPart = user_time.dwHighDateTime;
+    return {kernel_ticks.QuadPart + user_ticks.QuadPart, true};
+#else
+    return {};
+#endif
+}
+
+double ProcessCpuPercent(const ProcessCpuSnapshot& begin,
+                         const ProcessCpuSnapshot& end,
+                         std::uint64_t wall_ms) {
+    if (!begin.valid || !end.valid || end.total_100ns < begin.total_100ns ||
+        wall_ms == 0) {
+        return -1.0;
+    }
+
+    // FILETIME 的单位为 100 ns；结果表示“单核等效 CPU 百分比”，多线程进程
+    // 可以超过 100%，便于在相同机器和相同构建配置下比较 CPU 增量。
+    const auto cpu_100ns = end.total_100ns - begin.total_100ns;
+    const double wall_100ns = static_cast<double>(wall_ms) * 10000.0;
+    return static_cast<double>(cpu_100ns) / wall_100ns * 100.0;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -274,6 +319,7 @@ int main(int argc, char* argv[]) {
     // 停止阶段保留一条独立观测线程。它不参与 Graph 调度，只读取公开的
     // 原子状态和指标，便于区分 Source 读线程、Edge 排空还是节点任务回收卡住。
     std::atomic<bool> stop_observer_done{false};
+    std::atomic<std::uint64_t> observer_sample_count{0};
     auto source_for_observer = graph.GetNode<StreamSourceNode>("source");
     auto video_counter_for_observer =
         graph.GetNode<FrameCounterSink>("video-counter");
@@ -314,6 +360,10 @@ int main(int argc, char* argv[]) {
             graph.GetEdgeMetrics("router:audio->audio-decoder:in",
                                  observer_audio_edge);
             const auto rss_bytes = CurrentProcessRssBytes();
+            // FFmpegFrameBuffer 的存活统计和 RSS 分开输出：前者只反映仍被
+            // MediaFrame 持有的解码帧，后者还会受到 Windows 堆和 FFmpeg 内部
+            // 缓存的工作集保留影响。二者走势不同可缩小 RSS 跃升的排查范围。
+            const auto frame_memory = FFmpegFrameBuffer::GetMemoryStats();
             const auto elapsed_seconds = std::chrono::duration_cast<
                 std::chrono::seconds>(std::chrono::steady_clock::now() -
                                       observer_start).count();
@@ -338,6 +388,7 @@ int main(int argc, char* argv[]) {
                 observer_video_edge.budget.timestamp_discontinuity +
                 observer_audio_edge.budget.timestamp_invalid +
                 observer_audio_edge.budget.timestamp_discontinuity;
+            observer_sample_count.fetch_add(1, std::memory_order_relaxed);
             std::cerr << "[MediaFlow][Sample] elapsed_s=" << elapsed_seconds
                       << ", frames=(video="
                       << (video_counter_for_observer
@@ -348,6 +399,16 @@ int main(int argc, char* argv[]) {
                               ? audio_counter_for_observer->Count()
                               : 0)
                       << "), rss_bytes=" << rss_bytes
+                      << ", frame_memory=(wrappers="
+                      << frame_memory.live_wrappers
+                      << ", packed_bytes=" << frame_memory.live_packed_bytes
+                      << ", av_buffer_bytes="
+                      << frame_memory.live_av_buffer_bytes
+                      << ", peak_wrappers=" << frame_memory.peak_wrappers
+                      << ", peak_packed_bytes="
+                      << frame_memory.peak_packed_bytes
+                      << ", peak_av_buffer_bytes="
+                      << frame_memory.peak_av_buffer_bytes << ")"
                       << ", source_finished="
                       << (source_for_observer && source_for_observer->Finished())
                       << ", source_generation="
@@ -389,6 +450,9 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    const auto run_start = observer_start;
+    const auto cpu_start = CurrentProcessCpuTime();
+
     // 采样线程已经在实际拉流期间运行；持续时长结束后再进入 GracefulStop，
     // 这样日志同时覆盖稳定运行期和停止排空期。
     if (duration_ms > 0) {
@@ -396,6 +460,17 @@ int main(int argc, char* argv[]) {
     } else {
         std::cin.get();
     }
+
+    // 在进入停止屏障前记录稳定运行期的边界。吞吐只使用此刻已经处理完成的帧，
+    // 避免把 GracefulStop 的 Flush 尾帧混入持续运行性能数据。
+    const auto run_end = std::chrono::steady_clock::now();
+    const auto cpu_end = CurrentProcessCpuTime();
+    const auto pre_stop_video_frames = video_counter_for_observer
+        ? static_cast<std::uint64_t>(video_counter_for_observer->Count())
+        : 0;
+    const auto pre_stop_audio_frames = audio_counter_for_observer
+        ? static_cast<std::uint64_t>(audio_counter_for_observer->Count())
+        : 0;
 
     // 交互式停止使用 GracefulStop：先停止 Puller 生产，再排空已经进入 Graph
     // 的包，并让两个 Decoder 输出内部残留帧。即使网络流没有发送 EOS，也能
@@ -406,6 +481,20 @@ int main(int argc, char* argv[]) {
     if (!stopped) {
         std::cerr << "MediaFlow graceful stop timed out or flush failed\n";
     }
+
+    // GracefulStop 返回后，所有 Edge 和 Node pending task 都应已释放其消息引用。
+    // 这里专门检查 FFmpegFrameBuffer 的存活统计，避免仅凭队列 items=0 就误判
+    // 解码帧已经释放；RSS 是否下降则另由 Windows 工作集采样和专用工具判断。
+    const auto frame_memory_after_stop = FFmpegFrameBuffer::GetMemoryStats();
+    const bool frame_buffers_released =
+        frame_memory_after_stop.live_wrappers == 0 &&
+        frame_memory_after_stop.live_packed_bytes == 0 &&
+        frame_memory_after_stop.live_av_buffer_bytes == 0;
+    std::cout << "Frame buffer memory after stop: wrappers="
+              << frame_memory_after_stop.live_wrappers
+              << ", packed_bytes=" << frame_memory_after_stop.live_packed_bytes
+              << ", av_buffer_bytes="
+              << frame_memory_after_stop.live_av_buffer_bytes << "\n";
 
     auto video_counter = graph.GetNode<FrameCounterSink>("video-counter");
     auto audio_counter = graph.GetNode<FrameCounterSink>("audio-counter");
@@ -463,6 +552,30 @@ int main(int argc, char* argv[]) {
               << (audio_counter ? audio_counter->Count() : 0)
               << " frames\n";
 
+    const auto run_wall_ms = static_cast<std::uint64_t>(std::chrono::duration_cast<
+        std::chrono::milliseconds>(run_end - run_start).count());
+    const double cpu_percent = ProcessCpuPercent(cpu_start, cpu_end, run_wall_ms);
+    const double run_seconds = static_cast<double>(run_wall_ms) / 1000.0;
+    std::cout << std::fixed << std::setprecision(2)
+              << "Performance metrics: run_wall_ms=" << run_wall_ms
+              << ", process_cpu_100ns="
+              << (cpu_end.valid && cpu_start.valid &&
+                          cpu_end.total_100ns >= cpu_start.total_100ns
+                      ? cpu_end.total_100ns - cpu_start.total_100ns
+                      : 0)
+              << ", cpu_percent_one_core=" << cpu_percent
+              << ", observer_samples="
+              << observer_sample_count.load(std::memory_order_relaxed)
+              << ", throughput_fps=(video="
+              << (run_seconds > 0.0
+                      ? static_cast<double>(pre_stop_video_frames) / run_seconds
+                      : 0.0)
+              << ", audio="
+              << (run_seconds > 0.0
+                      ? static_cast<double>(pre_stop_audio_frames) / run_seconds
+                      : 0.0)
+              << ")\n";
+
     // 该程序验证的是音视频双轨解码，不应只因为停止屏障成功就把“设备没有
     // 发送媒体包”报告为通过。这样现场设备故障会被 CI/人工测试明确识别。
     const bool decoded_both_tracks =
@@ -472,5 +585,5 @@ int main(int argc, char* argv[]) {
         std::cerr << "MediaFlow stream decode did not receive both audio and video "
                      "frames\n";
     }
-    return stopped && decoded_both_tracks ? 0 : 1;
+    return stopped && decoded_both_tracks && frame_buffers_released ? 0 : 1;
 }
