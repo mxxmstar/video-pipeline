@@ -565,6 +565,86 @@ void TestQueueDiagnosticsAndBudgetFormula() {
     assert(snapshot.dropped_keyframes == 1);
 }
 
+void TestCapacityRegressionScenarios() {
+    QueueBudget audio_budget;
+    audio_budget.max_items = 16;
+    audio_budget.max_bytes = 1024;
+    audio_budget.max_span_us = 500000;
+    QueueTransport<MediaPacketMessage> audio_queue(
+        16, BackpressurePolicy::DropOldest, audio_budget);
+
+    QueueBudget video_budget;
+    video_budget.max_items = 64;
+    video_budget.max_bytes = 8192;
+    video_budget.max_span_us = 1500000;
+    QueueTransport<MediaPacketMessage> video_queue(
+        64, BackpressurePolicy::PreferVideoKeyframes, video_budget);
+
+    // 模拟 30 秒内 10 倍速的音频突发和稳定 25 fps 视频。两条独立 Edge
+    // 使用各自预算，变码率音频的淘汰不能影响视频队列的接收能力。
+    std::size_t video_packets = 0;
+    for (std::int64_t index = 0; index < 1500; ++index) {
+        const auto audio_result = audio_queue.Send(MakeCostedMediaMessage(
+            MediaType::AUDIO, index * 20, 20,
+            static_cast<std::size_t>(24 + index % 96)));
+        assert(audio_result == MailboxPushResult::Accepted ||
+               audio_result == MailboxPushResult::DroppedOldest);
+        if (index % 2 == 0) {
+            auto video_message = MakeCostedMediaMessage(
+                MediaType::VIDEO, index * 20, 40,
+                static_cast<std::size_t>(200 + index % 400));
+            video_message.packet->keyframe = index % 50 == 0;
+            assert(video_queue.Send(std::move(video_message)) ==
+                   MailboxPushResult::Accepted);
+            assert(video_queue.TryReceive().has_value());
+            ++video_packets;
+        }
+    }
+    const auto audio_snapshot = audio_queue.Metrics();
+    const auto video_snapshot = video_queue.Metrics();
+    assert(audio_snapshot.items <= audio_budget.max_items);
+    assert(audio_snapshot.bytes <= audio_budget.max_bytes);
+    assert(audio_snapshot.span_us <= audio_budget.max_span_us);
+    assert(audio_snapshot.limit_items > 0 || audio_snapshot.limit_bytes > 0 ||
+           audio_snapshot.limit_span > 0);
+    assert(video_packets == 750);
+    assert(video_snapshot.items == 0);
+    assert(video_snapshot.bytes <= video_budget.max_bytes);
+    assert(video_snapshot.span_us <= video_budget.max_span_us);
+
+    // 回退时间戳不产生负 span，也不能与新 generation 的时间轴拼接成巨大的
+    // 跨度。诊断计数保留回退信息，容量限制继续可用。
+    QueueBudget timestamp_budget;
+    timestamp_budget.max_items = 8;
+    timestamp_budget.max_span_us = 1000;
+    QueueTransport<CostedMessage> timestamp_queue(
+        8, BackpressurePolicy::DropNewest, timestamp_budget);
+    assert(timestamp_queue.Send({4, 1000, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({4, 900, 20, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({4, 5000000, 20, 2}) ==
+           MailboxPushResult::Accepted);
+    const auto timestamp_snapshot = timestamp_queue.Metrics();
+    assert(timestamp_snapshot.span_us == 120);
+    assert(timestamp_snapshot.timestamp_discontinuity == 1);
+
+    // Block 等待必须可由 Close 唤醒，停止路径不能永久滞留在生产者 Send。
+    QueueTransport<int> blocked_queue(1, BackpressurePolicy::Block);
+    assert(blocked_queue.Send(1) == MailboxPushResult::Accepted);
+    MailboxPushResult blocked_result = MailboxPushResult::Accepted;
+    std::atomic<bool> producer_started{false};
+    std::thread producer([&]() {
+        producer_started.store(true);
+        blocked_result = blocked_queue.Send(2);
+    });
+    assert(WaitUntil([&]() { return producer_started.load(); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    blocked_queue.Close();
+    producer.join();
+    assert(blocked_result == MailboxPushResult::Closed);
+}
+
 void TestVideoPriorityBackpressure() {
     auto make_message = [](MediaType type, bool keyframe, int64_t pts) {
         auto packet = std::make_shared<MediaPacket>();
@@ -993,6 +1073,48 @@ void TestMediaEdgeAndDispatchInflightMetrics() {
     graph.Stop();
 }
 
+void TestGracefulStopAtMediaHighWatermark() {
+    auto executor = std::make_shared<AsioExecutor>("media-graceful-stop", 1);
+    Graph graph;
+    NodeOptions sink_options;
+    sink_options.max_pending_tasks = 1;
+    assert(graph.AddNode<MediaBurstSource>("source", executor, NodeOptions{}));
+    assert(graph.AddNode<BlockingMediaSink>("sink", executor, sink_options));
+
+    EdgeOptions edge_options;
+    edge_options.max_batch_size = 1;
+    edge_options.backpressure = BackpressurePolicy::DropOldest;
+    edge_options.track = QueueTrack::Video;
+    edge_options.budget.max_items = 2;
+    edge_options.budget.max_bytes = 10;
+    edge_options.budget.max_span_us = 100000;
+    assert(graph.Connect<MediaPacketMessage>("source", "sink", edge_options));
+    assert(graph.Start());
+
+    auto source = graph.GetNode<MediaBurstSource>("source");
+    auto sink = graph.GetNode<BlockingMediaSink>("sink");
+    assert(source && sink);
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 0, 40, 2)));
+    assert(sink->WaitUntilEntered());
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 40, 40, 3)));
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 80, 40, 4)));
+    assert(source->Send(MakeCostedMediaMessage(
+        MediaType::VIDEO, 120, 40, 7)));
+
+    bool graceful_result = false;
+    std::thread stopper([&]() {
+        graceful_result = graph.GracefulStop(std::chrono::seconds(2));
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    sink->Release();
+    stopper.join();
+    assert(graceful_result);
+    assert(graph.GetState() == Graph::State::Stopped);
+}
+
 void TestGraphStartStopStart() {
     // 多节点共享一个两线程执行器，验证 Graph 的执行器去重启动逻辑。
     auto executor = std::make_shared<AsioExecutor>("test", 2);
@@ -1034,6 +1156,7 @@ int main() {
     TestQueueBudgetAccounting();
     TestTrackBudgetIsolationAndControlRetention();
     TestQueueDiagnosticsAndBudgetFormula();
+    TestCapacityRegressionScenarios();
     TestVideoPriorityBackpressure();
     TestVideoPriorityDispatchQueue();
     TestVideoPriorityExecutorDispatch();
@@ -1042,6 +1165,7 @@ int main() {
     TestGraphErrorRollback();
     TestEdgeMetricsAndBoundedDispatch();
     TestMediaEdgeAndDispatchInflightMetrics();
+    TestGracefulStopAtMediaHighWatermark();
     TestGraphStartStopStart();
     return 0;
 }

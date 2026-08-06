@@ -851,8 +851,8 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-2</td><td>音频突发与视频包丢失</td><td>记录混合队列问题、启动突发改进和后续轨道隔离计划</td><td>第 21.6.1-21.6.7 节</td><td>Edge 层启动突发已改善；轨道级入口隔离当时未实施，已于 A4-5 完成</td></tr>
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
-<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算的 C1-C4 已完成</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C6：多维预算、控制消息保护、在途快照、队列诊断和实时解码接入；C7 与现场验收待实施</td></tr>
+<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C6 和 C7 离线回归：多维预算、控制消息保护、在途快照、诊断、实时解码接入和停止边界；摄像头长测与性能验收待实施</td></tr>
 </tbody>
 </table>
 
@@ -1783,12 +1783,12 @@ recommended_bytes = bitrate_bits_per_second / 8
 |---|---|---|
 | 第 21.7.15 节入口分轨基线 | 已通过 | 15 秒单路 RTSP：视频 `375/375`、音频 `745/745`，四条相关 Edge dropped/rejected 均为 `0` |
 | CAP-01 至 CAP-02：成本与硬上限 | 通过 | `TestQueueBudgetAccounting` 与 `TestMediaQueueItemCostTraits` 已覆盖 items/bytes/span、超大包、generation、EOS 和无时间戳成本 |
-| CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 验证独立音频/视频预算；尚未执行 30 秒 10 倍音频突发和关键帧恢复解码 |
+| CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 与 `TestCapacityRegressionScenarios` 验证独立预算、30 秒媒体时间的 10 倍音频突发和 25 fps 视频接收；关键帧恢复解码待补 |
 | CAP-04 至 CAP-05：实时延迟与视频恢复 | 待执行 | 仍需阻塞恢复后的低水位验证，以及关键帧后依赖窗口的解码恢复测试 |
 | CAP-06：时间戳异常 | 部分通过 | 已覆盖无时间戳、DTS/PTS 换算、跨 generation span 隔离和回退诊断计数；discontinuity 的时间窗口重建待补 |
-| CAP-07：EOS 与停止 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 和 `TestVideoPriorityDispatchQueue` 验证 EOS 在 Queue/Dispatch 满载时替换普通媒体任务；Block 被关闭唤醒和三类上限组合停止待补 |
+| CAP-07：EOS 与停止 | 部分通过 | 已验证 Queue/Dispatch 的 EOS 满载保护、`Block` 被 Close 唤醒及高水位 `GracefulStop` 排空；三类上限同时触发和 ImmediateStop 组合待补 |
 | CAP-08：总在途可观测性 | 部分通过 | `TestMediaEdgeAndDispatchInflightMetrics` 核对 `edge_queue + node_pending` 的 items/bytes/span；C5 已补充队列诊断，跨多 Edge 汇总待上层 Pipeline 接入 |
-| CAP-09：生命周期回归 | 待执行 | 记录 100 次 Start/Stop、现有测试集退出码和内存变化 |
+| CAP-09：生命周期回归 | 部分通过 | `TestGraphStartStopStart` 已连续 Start/Stop 100 次，`TestGracefulStopAtMediaHighWatermark` 覆盖高水位停止；内存增长观测待现场长测 |
 | CAP-10：摄像头长测 | 待执行 | 只使用一路 RTSP，记录至少 10 分钟的五秒采样数据和最终停止结果 |
 | CAP-11：性能回归 | 待执行 | 记录同一机器、同一流、同一构建配置下改造前后的 CPU/吞吐对比 |
 
@@ -1907,3 +1907,37 @@ RTSP 会话。
 本批构建环境为 VS 18 Community x64 Debug。已构建 `test_mediaflow`、
 `test_mediaflow_media_nodes` 和 `test_stream_decode`；前两个测试程序退出码均为 `0`。
 `test_stream_decode` 未运行，未产生摄像头会话。
+
+##### 21.7.16.10 C7 第四批实施记录
+
+本批完成不依赖设备的确定性容量回归。测试中的“30 秒”是媒体时间轴长度，音频以
+10 倍速注入，因此能在毫秒级完成、不会额外创建摄像头 RTSP 会话。现场长测仍需在
+设备可用且只建立一路会话时单独执行。
+
+实施内容：
+
+- 增加 `TestCapacityRegressionScenarios`：连续注入 1500 个 20 ms、变字节数的音频包，
+  同时按 25 fps 注入并立即消费 750 个视频包。验证音频 Edge 的 items/bytes/span 始终
+  不超过独立预算，音频淘汰不影响视频全部接收。
+- 同一测试注入回退时间戳和新 generation，验证 span 为非负且仅取单个 generation 的
+  最大窗口，并检查 `timestamp_discontinuity`。
+- 增加满载 `BackpressurePolicy::Block` 的生产者线程测试，`Close()` 后等待中的
+  `Send()` 返回 `Closed`，证明停止可中断阻塞生产者。
+- 增加 `TestGracefulStopAtMediaHighWatermark`：阻塞首个视频处理任务，填满并触发
+  `DropOldest`，随后释放消费者；`Graph::GracefulStop(2s)` 成功排空并进入 `Stopped`。
+- 保留已有 `TestGraphStartStopStart` 的 100 次 Start/Stop 回归，和本批高水位停止测试
+  共同覆盖生命周期的主要离线边界。
+
+本批验证结果：
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| CAP-03 音视频隔离 | 部分通过 | 30 秒媒体时间、10 倍音频突发和 25 fps 视频的独立队列回归通过；尚未验证真实 Decoder 在丢包后从下一关键帧恢复 |
+| CAP-06 时间戳异常 | 部分通过 | 回退时间戳诊断和跨 generation 非拼接 span 通过；discontinuity 后重新建立时间窗口待实现 |
+| CAP-07 EOS 与停止 | 部分通过 | EOS 满载保护、Block Close 唤醒和高水位 GracefulStop 通过；ImmediateStop 与三类上限同时触发待补 |
+| CAP-09 生命周期回归 | 部分通过 | 100 次 Start/Stop 与高水位停止通过；无持续内存增长需要现场长测或专用内存工具确认 |
+| CAP-10 至 CAP-11 | 待执行 | 本批没有连接 `192.168.66.83`，未执行单路 10 分钟长测和性能对比 |
+
+本批执行 VS 18 Community x64 Debug 的 `test_mediaflow.exe` 和
+`test_mediaflow_media_nodes.exe`，退出码均为 `0`。未运行 `test_stream_decode`，避免
+占用设备唯一 RTSP 会话。
