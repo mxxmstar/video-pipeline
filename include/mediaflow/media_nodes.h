@@ -67,6 +67,10 @@ struct QueueItemTraits<MediaPacketMessage> {
     static bool IsKeyframe(const MediaPacketMessage& message) {
         return IsVideo(message) && message.packet->keyframe;
     }
+
+    static bool IsControl(const MediaPacketMessage& message) {
+        return message.eos;
+    }
 };
 
 /// Encoder 到 PublisherSink 之间传递的编码包消息。
@@ -130,6 +134,8 @@ public:
     StreamSourceNode(const StreamSourceNode&) = delete;
     StreamSourceNode& operator=(const StreamSourceNode&) = delete;
 
+    /// 注册兼容的混合 out 端口，以及按媒体类型隔离的 video/audio 端口。
+    bool RegisterPorts(PortRegistry& registry) override;
     bool Init() override;
     bool Start() override;
     void StopProduction() override;
@@ -140,6 +146,12 @@ public:
 
     /// 获取最近一次成功打开连接得到的流描述。
     MultiStreamInfo StreamInfo() const;
+
+    /// 获取视频专用输出端口。正式媒体图应优先连接该端口。
+    OutputPort<MediaPacketMessage>& VideoOutput();
+
+    /// 获取音频专用输出端口。正式媒体图应优先连接该端口。
+    OutputPort<MediaPacketMessage>& AudioOutput();
 
     /// 获取当前连接代次，便于监控和测试。
     std::uint64_t Generation() const;
@@ -152,6 +164,7 @@ private:
     void RequestProductionStop();
     bool OpenGeneration(std::uint64_t generation);
     bool WaitBeforeReconnect();
+    bool EmitTrackPacket(const MediaPacketMessage& message);
     std::shared_ptr<const MediaStreamInfo> FindStreamInfo(
         const std::shared_ptr<MediaPacket>& packet) const;
     void UpdateStreamInfo(const MultiStreamInfo& info);
@@ -163,6 +176,8 @@ private:
 
     mutable std::mutex info_mutex_;
     MultiStreamInfo stream_info_;
+    OutputPort<MediaPacketMessage> video_output_;
+    OutputPort<MediaPacketMessage> audio_output_;
 
     std::atomic<bool> stop_requested_{true};
     std::atomic<bool> finished_{false};
@@ -189,14 +204,28 @@ public:
     /// 输入端口，接收 Source 的全部压缩包。
     InputPort<MediaPacketMessage>& Input();
 
+    /// 视频专用输入端口，与 Source 的 video 输出组成独立队列边界。
+    InputPort<MediaPacketMessage>& VideoInput();
+
+    /// 音频专用输入端口，与 Source 的 audio 输出组成独立队列边界。
+    InputPort<MediaPacketMessage>& AudioInput();
+
     /// 视频输出端口，连接到 DecoderNode。
     OutputPort<MediaPacketMessage>& VideoOutput();
     OutputPort<MediaPacketMessage>& AudioOutput();
 
 private:
-    void Process(MediaPacketMessage message);
+    enum class InputTrack {
+        Mixed,
+        Video,
+        Audio,
+    };
+
+    void Process(MediaPacketMessage message, InputTrack input_track);
 
     InputPort<MediaPacketMessage> input_;
+    InputPort<MediaPacketMessage> video_input_;
+    InputPort<MediaPacketMessage> audio_input_;
     OutputPort<MediaPacketMessage> video_output_;
     OutputPort<MediaPacketMessage> audio_output_;
     TrackSelection video_selection_;

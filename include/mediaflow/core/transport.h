@@ -33,6 +33,7 @@ struct QueueItemTraits {
     static bool IsAudio(const T&) { return false; }
     static bool IsVideo(const T&) { return false; }
     static bool IsKeyframe(const T&) { return false; }
+    static bool IsControl(const T&) { return false; }
 };
 
 /**
@@ -111,8 +112,23 @@ public:
                 const bool incoming_audio = QueueItemTraits<T>::IsAudio(value);
                 const bool incoming_video = QueueItemTraits<T>::IsVideo(value);
                 const bool incoming_keyframe = QueueItemTraits<T>::IsKeyframe(value);
+                const bool incoming_control = QueueItemTraits<T>::IsControl(value);
 
-                if (incoming_audio) {
+                if (incoming_control) {
+                    // EOS、FlushDone 等控制消息不能被普通媒体包永久挡住。
+                    // 优先淘汰非控制消息，保留队列中已经存在的控制边界。
+                    auto victim = std::find_if(queue_.begin(), queue_.end(),
+                        [](const T& item) {
+                            return !QueueItemTraits<T>::IsControl(item);
+                        });
+                    if (victim != queue_.end()) {
+                        queue_.erase(victim);
+                        queue_.push_back(std::move(value));
+                        result = MailboxPushResult::DroppedOldest;
+                    } else {
+                        result = MailboxPushResult::DroppedNewest;
+                    }
+                } else if (incoming_audio) {
                     result = MailboxPushResult::DroppedNewest;
                 } else if (incoming_video) {
                     auto victim = std::find_if(queue_.begin(), queue_.end(),
@@ -137,7 +153,25 @@ public:
                     result = MailboxPushResult::DroppedNewest;
                 }
             } else {
-                result = MailboxPushResult::DroppedNewest;
+                // DropNewest 仍然保持普通媒体包的原有语义，但媒体边界可以
+                // 将 EOS 等控制消息声明为 IsControl，从而避免满载时丢失
+                // 生命周期边界。控制消息替换一条普通媒体消息并保留 FIFO
+                // 中其余内容，发送方会收到 DroppedOldest 结果。
+                if (QueueItemTraits<T>::IsControl(value)) {
+                    auto victim = std::find_if(queue_.begin(), queue_.end(),
+                        [](const T& item) {
+                            return !QueueItemTraits<T>::IsControl(item);
+                        });
+                    if (victim != queue_.end()) {
+                        queue_.erase(victim);
+                        queue_.push_back(std::move(value));
+                        result = MailboxPushResult::DroppedOldest;
+                    } else {
+                        result = MailboxPushResult::DroppedNewest;
+                    }
+                } else {
+                    result = MailboxPushResult::DroppedNewest;
+                }
             }
         }
 

@@ -123,19 +123,24 @@ int main(int argc, char* argv[]) {
     auto executor = std::make_shared<AsioExecutor>("stream-decode", 2);
 
     // 真实 RTSP 拉流器可能一次性读出网络接收缓冲区中的一段历史数据，
-    // 因此 Source 在启动初期会短暂快于 Decoder。默认的 64 条队列会让
-    // 音频包先占满队列，随后视频包被 DropNewest 丢弃，无法反映旧手工
-    // 测试的实际解码能力。这里为验证图保留更大的有界队列，同时仍使用
-    // DropNewest 保持包的时间顺序，避免无界缓存掩盖下游处理能力问题。
+    // 因此 Source 在启动初期会短暂快于 Decoder。音频和视频入口现在使用
+    // 两条独立的有界队列：音频突发只能消耗 audio 边的容量，不能再占用
+    // video 边的槽位；视频边仍使用关键帧保护策略，避免启动突发破坏恢复窗口。
     NodeOptions decode_node_options{
         NodeExecutionMode::Serialized,
         4096};
     decode_node_options.prefer_video_keyframes = true;
-    const EdgeOptions packet_edge_options{
+    const EdgeOptions video_packet_edge_options{
         TransportKind::Queue,
-        4096,
+        2048,
         BackpressurePolicy::PreferVideoKeyframes,
         64,
+        0};
+    const EdgeOptions audio_packet_edge_options{
+        TransportKind::Queue,
+        8192,
+        BackpressurePolicy::DropNewest,
+        128,
         0};
     const EdgeOptions frame_edge_options{
         TransportKind::Queue,
@@ -184,14 +189,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Router 的两个输出端口分别对应两类媒体。每一路 Decoder 只接收自身
-    // 类型的压缩包，避免旧测试中按 packet type 在 subscriber 回调里分流。
+    // Source 的 video/audio 输出和 Router 的 video-in/audio-in 分别形成两条
+    // 独立入口边。Router 的两个输出端口继续对应两类媒体，每一路 Decoder
+    // 只接收自身类型的压缩包，避免音频突发重新回到共享入口队列。
     if (!graph.Connect<MediaPacketMessage>(
-            "source", "router", packet_edge_options) ||
+            "source", "video", "router", "video-in",
+            video_packet_edge_options) ||
         !graph.Connect<MediaPacketMessage>(
-            "router", "video", "video-decoder", "in", packet_edge_options) ||
+            "source", "audio", "router", "audio-in",
+            audio_packet_edge_options) ||
         !graph.Connect<MediaPacketMessage>(
-            "router", "audio", "audio-decoder", "in", packet_edge_options) ||
+            "router", "video", "video-decoder", "in",
+            video_packet_edge_options) ||
+        !graph.Connect<MediaPacketMessage>(
+            "router", "audio", "audio-decoder", "in",
+            audio_packet_edge_options) ||
         !graph.Connect<MediaFrameMessage>(
             "video-decoder", "video-counter", frame_edge_options) ||
         !graph.Connect<MediaFrameMessage>(
@@ -230,7 +242,8 @@ int main(int argc, char* argv[]) {
             NodeMetricsSnapshot observer_router_metrics;
             NodeMetricsSnapshot observer_video_counter_metrics;
             NodeMetricsSnapshot observer_audio_counter_metrics;
-            EdgeMetricsSnapshot observer_source_edge;
+            EdgeMetricsSnapshot observer_source_video_edge;
+            EdgeMetricsSnapshot observer_source_audio_edge;
             EdgeMetricsSnapshot observer_video_edge;
             EdgeMetricsSnapshot observer_audio_edge;
             graph.GetMetrics("video-decoder", observer_video_metrics);
@@ -238,7 +251,10 @@ int main(int argc, char* argv[]) {
             graph.GetMetrics("router", observer_router_metrics);
             graph.GetMetrics("video-counter", observer_video_counter_metrics);
             graph.GetMetrics("audio-counter", observer_audio_counter_metrics);
-            graph.GetEdgeMetrics("source:out->router:in", observer_source_edge);
+            graph.GetEdgeMetrics("source:video->router:video-in",
+                                 observer_source_video_edge);
+            graph.GetEdgeMetrics("source:audio->router:audio-in",
+                                 observer_source_audio_edge);
             graph.GetEdgeMetrics("router:video->video-decoder:in",
                                  observer_video_edge);
             graph.GetEdgeMetrics("router:audio->audio-decoder:in",
@@ -256,10 +272,13 @@ int main(int argc, char* argv[]) {
                       << observer_video_counter_metrics.pending_tasks
                       << ", audio_counter="
                       << observer_audio_counter_metrics.pending_tasks << ")"
-                      << ", edge_queue=("
-                      << observer_source_edge.queue_size << ","
-                      << observer_video_edge.queue_size << ","
-                      << observer_audio_edge.queue_size << ")\n";
+                      << ", edge_queue=(source_video="
+                      << observer_source_video_edge.queue_size
+                      << ", source_audio="
+                      << observer_source_audio_edge.queue_size
+                      << ", video_decoder=" << observer_video_edge.queue_size
+                      << ", audio_decoder=" << observer_audio_edge.queue_size
+                      << ")\n";
         }
     });
 
@@ -287,10 +306,14 @@ int main(int argc, char* argv[]) {
     graph.GetMetrics("audio-decoder", audio_metrics);
     graph.GetMetrics("source", source_metrics);
     graph.GetMetrics("router", router_metrics);
-    EdgeMetricsSnapshot source_edge_metrics;
+    EdgeMetricsSnapshot source_video_edge_metrics;
+    EdgeMetricsSnapshot source_audio_edge_metrics;
     EdgeMetricsSnapshot video_edge_metrics;
     EdgeMetricsSnapshot audio_edge_metrics;
-    graph.GetEdgeMetrics("source:out->router:in", source_edge_metrics);
+    graph.GetEdgeMetrics("source:video->router:video-in",
+                         source_video_edge_metrics);
+    graph.GetEdgeMetrics("source:audio->router:audio-in",
+                         source_audio_edge_metrics);
     graph.GetEdgeMetrics("router:video->video-decoder:in", video_edge_metrics);
     graph.GetEdgeMetrics("router:audio->audio-decoder:in", audio_edge_metrics);
     // 现场设备验证不仅要看最终帧数，还要保留 Decoder 的输入处理量和错误，
@@ -305,8 +328,10 @@ int main(int argc, char* argv[]) {
               << ", rejected=" << source_metrics.rejected
               << "), router(processed=" << router_metrics.processed
               << ", rejected=" << router_metrics.rejected
-              << "), edges(source=" << source_edge_metrics.accepted
-              << "/" << source_edge_metrics.dropped_newest
+              << "), edges(source_video=" << source_video_edge_metrics.accepted
+              << "/" << source_video_edge_metrics.dropped_newest
+              << ", source_audio=" << source_audio_edge_metrics.accepted
+              << "/" << source_audio_edge_metrics.dropped_newest
               << ", video=" << video_edge_metrics.accepted
               << "/" << video_edge_metrics.dropped_newest
               << ", audio=" << audio_edge_metrics.accepted

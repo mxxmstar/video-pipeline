@@ -33,6 +33,16 @@ MediaStreamInfo MakeVideoInfo() {
     return info;
 }
 
+MediaStreamInfo MakeAudioInfo() {
+    MediaStreamInfo info;
+    info.media_type = MediaType::AUDIO;
+    info.codec_type = CodecType::AAC;
+    info.stream_index = 8;
+    info.time_base = Rational{1, 48000};
+    info.detail = AudioStreamInfo{48000, 2, 0, SampleFormat::S16};
+    return info;
+}
+
 std::shared_ptr<MediaPacket> MakePacket(MediaType type,
                                         int stream_index,
                                         int64_t pts,
@@ -117,6 +127,74 @@ private:
     int open_count_{0};
     int read_index_{0};
     bool closed_{true};
+    EventCallback event_callback_;
+};
+
+/// 先制造音频突发，再发送视频关键帧，用于验证 Source 入口的轨道隔离。
+class BurstTrackPuller final : public IPuller {
+public:
+    bool Open(const std::string&) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        index_ = 0;
+        closed_ = false;
+        stop_requested_ = false;
+        return true;
+    }
+
+    void RequestStop() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_requested_ = true;
+    }
+
+    void Close() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closed_ = true;
+        stop_requested_ = true;
+    }
+
+    bool ReadPacket(std::shared_ptr<MediaPacket>& packet) override {
+        const auto result = ReadPacketResult();
+        packet = result.packet;
+        return result.status == PullReadStatus::Packet;
+    }
+
+    PullReadResult ReadPacketResult() override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (closed_ || stop_requested_) {
+            return {PullReadStatus::Stopped, nullptr, 0, "stop requested"};
+        }
+
+        if (index_ < 8) {
+            return PullReadResult::PacketResult(
+                MakePacket(MediaType::AUDIO, 8, index_++ * 960,
+                           CodecType::AAC));
+        }
+        if (index_++ == 8) {
+            auto packet = MakePacket(MediaType::VIDEO, 7, 40, CodecType::H264);
+            packet->keyframe = true;
+            return PullReadResult::PacketResult(std::move(packet));
+        }
+        return {PullReadStatus::EOS, nullptr, 0, "eos"};
+    }
+
+    MultiStreamInfo GetStreamInfo() const override {
+        MultiStreamInfo info;
+        info.stream_infos.push_back(MakeVideoInfo());
+        info.stream_infos.push_back(MakeAudioInfo());
+        info.video_stream_idx_ = 0;
+        info.audio_stream_idx_ = 1;
+        return info;
+    }
+
+    void SetEventCallback(EventCallback cb) override {
+        event_callback_ = std::move(cb);
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::size_t index_{0};
+    bool closed_{true};
+    bool stop_requested_{false};
     EventCallback event_callback_;
 };
 
@@ -293,6 +371,85 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable condition_;
     std::vector<std::uint64_t> generations_;
+};
+
+class BlockingPacketSink final : public SinkNode<MediaPacketMessage> {
+public:
+    explicit BlockingPacketSink(MediaType expected_type, bool block_first)
+        : expected_type_(expected_type), block_first_(block_first) {}
+
+    std::string Name() const override {
+        return expected_type_ == MediaType::AUDIO ? "audio-packet-sink"
+                                                   : "video-packet-sink";
+    }
+
+    bool WaitUntilEntered() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return entered_;
+        });
+    }
+
+    bool WaitForPackets(std::size_t count) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this, count]() {
+            return packet_count_ >= count;
+        });
+    }
+
+    bool WaitForEos() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return eos_count_ >= 1;
+        });
+    }
+
+    void Release() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            released_ = true;
+        }
+        condition_.notify_all();
+    }
+
+    int EosCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return eos_count_;
+    }
+
+protected:
+    void Process(MediaPacketMessage message) override {
+        if (message.eos) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ++eos_count_;
+            condition_.notify_all();
+            return;
+        }
+        assert(message.packet);
+        assert(message.packet->type == expected_type_);
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ++packet_count_;
+            if (block_first_ && !entered_) {
+                entered_ = true;
+                condition_.notify_all();
+                condition_.wait(lock, [this]() {
+                    return released_;
+                });
+            }
+        }
+        condition_.notify_all();
+    }
+
+private:
+    const MediaType expected_type_;
+    const bool block_first_;
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    std::size_t packet_count_{0};
+    int eos_count_{0};
+    bool entered_{false};
+    bool released_{false};
 };
 
 struct EncoderState {
@@ -570,6 +727,70 @@ void TestSingleVideoChainAndReconnectGeneration() {
     graph.Stop();
 }
 
+void TestSourceTrackQueuesAreIndependent() {
+    auto source_executor = std::make_shared<AsioExecutor>("track-source", 1);
+    auto audio_executor = std::make_shared<AsioExecutor>("track-audio", 1);
+    auto video_executor = std::make_shared<AsioExecutor>("track-video", 1);
+
+    Graph graph;
+    assert(graph.AddNode<StreamSourceNode>(
+        "source", source_executor, NodeOptions{}, "burst",
+        std::make_unique<BurstTrackPuller>(), "scripted://burst"));
+    assert(graph.AddNode<BlockingPacketSink>(
+        "audio-sink", audio_executor, NodeOptions{}, MediaType::AUDIO, true));
+    assert(graph.AddNode<BlockingPacketSink>(
+        "video-sink", video_executor, NodeOptions{}, MediaType::VIDEO, false));
+
+    EdgeOptions audio_edge;
+    audio_edge.capacity = 2;
+    audio_edge.backpressure = BackpressurePolicy::DropNewest;
+    audio_edge.max_batch_size = 1;
+    EdgeOptions video_edge;
+    video_edge.capacity = 2;
+    video_edge.backpressure = BackpressurePolicy::PreferVideoKeyframes;
+    video_edge.max_batch_size = 1;
+
+    // Source 的两个轨道端口必须对应两条不同的 Edge。音频消费者被阻塞时，
+    // 音频包只能填满 audio 边；视频关键帧仍应进入独立的 video 边。
+    assert(graph.Connect<MediaPacketMessage>(
+        "source", "audio", "audio-sink", "in", audio_edge));
+    assert(graph.Connect<MediaPacketMessage>(
+        "source", "video", "video-sink", "in", video_edge));
+    assert(graph.Start());
+
+    auto source = graph.GetNode<StreamSourceNode>("source");
+    auto audio_sink = graph.GetNode<BlockingPacketSink>("audio-sink");
+    auto video_sink = graph.GetNode<BlockingPacketSink>("video-sink");
+    assert(source && audio_sink && video_sink);
+    assert(audio_sink->WaitUntilEntered());
+    assert(video_sink->WaitForPackets(1));
+
+    const auto source_finished_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!source->Finished() &&
+           std::chrono::steady_clock::now() < source_finished_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(source->Finished());
+
+    EdgeMetricsSnapshot audio_metrics;
+    EdgeMetricsSnapshot video_metrics;
+    assert(graph.GetEdgeMetrics("source:audio->audio-sink:in", audio_metrics));
+    assert(graph.GetEdgeMetrics("source:video->video-sink:in", video_metrics));
+    assert(audio_metrics.dropped_newest > 0);
+    assert(video_metrics.accepted >= 1);
+    assert(video_metrics.dropped_newest == 0);
+
+    // EOS 是控制消息，即使音频边已满也必须替换普通音频包进入队列；释放
+    // 阻塞消费者后，两条独立轨道各收到一次 EOS，验证 Flush 边界没有丢失。
+    audio_sink->Release();
+    assert(audio_sink->WaitForEos());
+    assert(video_sink->WaitForEos());
+    assert(audio_sink->EosCount() == 1);
+    assert(video_sink->EosCount() == 1);
+    graph.Stop();
+}
+
 void TestDecoderRejectsIncompleteStreamInfo() {
     auto decoder_state = std::make_shared<DecoderState>();
     DecoderNode decoder(std::make_unique<RecordingDecoder>(decoder_state));
@@ -826,6 +1047,7 @@ void TestMultiTrackPublisherAndGracefulEos() {
 
 int main() {
     TestSingleVideoChainAndReconnectGeneration();
+    TestSourceTrackQueuesAreIndependent();
     TestDecoderRejectsIncompleteStreamInfo();
     TestSourceStopRequestIsNonBlocking();
     TestEncoderAndPublisherChain();

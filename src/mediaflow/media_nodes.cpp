@@ -42,6 +42,14 @@ StreamSourceNode::~StreamSourceNode() {
     Stop();
 }
 
+bool StreamSourceNode::RegisterPorts(PortRegistry& registry) {
+    // 保留 SourceNode 的混合 out 端口，兼容尚未迁移的旧图；新的媒体图应
+    // 连接下面两个按轨道拆分的端口，避免音频突发和视频包共享同一条入口边。
+    return SourceNode<MediaPacketMessage>::RegisterPorts(registry) &&
+           registry.Output("video", video_output_) &&
+           registry.Output("audio", audio_output_);
+}
+
 bool StreamSourceNode::Init() {
     // Init 只做静态校验，不打开网络。真正的 Open 放在 Source 最后启动时，
     // 此时 Graph 已经完成所有下游节点的 Init/Start。
@@ -118,6 +126,14 @@ MultiStreamInfo StreamSourceNode::StreamInfo() const {
     return stream_info_;
 }
 
+OutputPort<MediaPacketMessage>& StreamSourceNode::VideoOutput() {
+    return video_output_;
+}
+
+OutputPort<MediaPacketMessage>& StreamSourceNode::AudioOutput() {
+    return audio_output_;
+}
+
 std::uint64_t StreamSourceNode::Generation() const {
     return generation_.load();
 }
@@ -152,7 +168,10 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
                 message.packet = result.packet;
                 message.stream_info = FindStreamInfo(result.packet);
                 message.generation = current_generation;
-                Emit(std::move(message));
+                // 先向兼容的混合 out 发送，再向对应轨道端口发送。未连接的
+                // 端口不会创建队列；迁移后的正式图只连接 video/audio，因此
+                // 音频和视频在 Source 边界使用完全独立的容量和背压策略。
+                EmitTrackPacket(message);
                 reconnect_count = 0;
                 break;
             }
@@ -195,7 +214,7 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
             case IPuller::PullReadStatus::EOS:
                 // 正常 EOF 必须沿媒体链路传播，后续 Decoder/Encoder 才能显式
                 // Flush，并把编码器中尚未输出的尾部 packet 交给 Publisher。
-                Emit(MediaPacketMessage{
+                EmitTrackPacket(MediaPacketMessage{
                     nullptr,
                     nullptr,
                     current_generation,
@@ -210,6 +229,28 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
     }
 
     finished_.store(true);
+}
+
+bool StreamSourceNode::EmitTrackPacket(const MediaPacketMessage& message) {
+    // 混合 out 是旧图的兼容出口。MediaPacketMessage 只持有 shared_ptr，按
+    // 三个出口复制消息对象不会复制实际媒体载荷；每个出口内部仍各自拥有
+    // 独立的 Transport 队列。
+    bool accepted = Emit(message);
+    if (message.eos) {
+        accepted = audio_output_.Send(message) && accepted;
+        accepted = video_output_.Send(message) && accepted;
+        return accepted;
+    }
+
+    if (!message.packet) {
+        return accepted;
+    }
+    if (message.packet->type == MediaType::VIDEO) {
+        accepted = video_output_.Send(message) && accepted;
+    } else if (message.packet->type == MediaType::AUDIO) {
+        accepted = audio_output_.Send(message) && accepted;
+    }
+    return accepted;
 }
 
 bool StreamSourceNode::OpenGeneration(std::uint64_t generation) {
@@ -273,12 +314,20 @@ TrackRouterNode::TrackRouterNode(TrackSelection video_selection,
     : video_selection_(video_selection),
       audio_selection_(audio_selection) {
     input_.SetHandler([this](MediaPacketMessage message) {
-        Process(std::move(message));
+        Process(std::move(message), InputTrack::Mixed);
+    });
+    video_input_.SetHandler([this](MediaPacketMessage message) {
+        Process(std::move(message), InputTrack::Video);
+    });
+    audio_input_.SetHandler([this](MediaPacketMessage message) {
+        Process(std::move(message), InputTrack::Audio);
     });
 }
 
 bool TrackRouterNode::RegisterPorts(PortRegistry& registry) {
     return registry.Input("in", input_) &&
+           registry.Input("video-in", video_input_) &&
+           registry.Input("audio-in", audio_input_) &&
            registry.Output("video", video_output_) &&
            registry.Output("audio", audio_output_);
 }
@@ -304,6 +353,14 @@ InputPort<MediaPacketMessage>& TrackRouterNode::Input() {
     return input_;
 }
 
+InputPort<MediaPacketMessage>& TrackRouterNode::VideoInput() {
+    return video_input_;
+}
+
+InputPort<MediaPacketMessage>& TrackRouterNode::AudioInput() {
+    return audio_input_;
+}
+
 OutputPort<MediaPacketMessage>& TrackRouterNode::VideoOutput() {
     return video_output_;
 }
@@ -312,21 +369,37 @@ OutputPort<MediaPacketMessage>& TrackRouterNode::AudioOutput() {
     return audio_output_;
 }
 
-void TrackRouterNode::Process(MediaPacketMessage message) {
+void TrackRouterNode::Process(MediaPacketMessage message,
+                              InputTrack input_track) {
     if (!accepting_.load() || !message.Valid()) {
         return;
     }
 
     if (message.eos) {
-        // EOS 不携带 packet，无法再根据媒体类型选择出口。向两个出口各发一
-        // 次，由下游各自根据是否存在真实输入决定如何结束自己的轨道。
-        video_output_.Send(message);
-        audio_output_.Send(std::move(message));
+        // 混合兼容输入无法判断 EOS 属于哪条轨道，因此广播一次；拆分输入
+        // 则只传播到对应输出，避免每个 Decoder 收到两次结束消息。
+        if (input_track == InputTrack::Video) {
+            video_output_.Send(std::move(message));
+        } else if (input_track == InputTrack::Audio) {
+            audio_output_.Send(std::move(message));
+        } else {
+            video_output_.Send(message);
+            audio_output_.Send(std::move(message));
+        }
         return;
     }
 
     if (!message.packet ||
         (message.packet->type != MediaType::VIDEO &&
+         message.packet->type != MediaType::AUDIO)) {
+        return;
+    }
+
+    // 独立输入边已经完成了媒体类型隔离；这里再次校验是为了保护兼容
+    // 调用方，防止错误地把音频包接到 video-in 后进入错误 Decoder。
+    if ((input_track == InputTrack::Video &&
+         message.packet->type != MediaType::VIDEO) ||
+        (input_track == InputTrack::Audio &&
          message.packet->type != MediaType::AUDIO)) {
         return;
     }

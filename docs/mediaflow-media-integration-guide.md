@@ -362,15 +362,30 @@ publisher->Publish(routed);
 
 这些问题位于 MediaFlow 核心，不属于 `media` 文件，但必须与媒体节点同步解决：
 
-| 问题 | 当前行为 | 媒体风险 | 要求 |
-|---|---|---|---|
-| Node Start 顺序 | 按 AddNode 顺序 | Source 可能在 Decoder/Publisher 未启动时产生数据 | 支持拓扑逆序启动，或首期严格按 sink 到 source 添加节点 |
-| Node Stop 顺序 | 按 AddNode 顺序调用 Stop | Publisher 可能早于 Encoder flush 关闭 | 明确 source 到 sink 的 Graceful Stop 顺序 |
-| 在途任务 | Node::Stop 时任务可能仍在执行 | Decode 与 Close、Encode 与 Close 并发 | 增加 pending-task barrier，并在节点 Executor 上执行 flush/close |
-| Executor Stop | `io_context::stop()` 丢弃排队任务 | 残留 frame/packet 丢失 | Graceful 模式先 drain，再停止 Executor |
-| 共享 Executor | Graph::Stop 会停止其见到的 Executor | 一路停止可能影响其他 Graph | 拆分 Executor 所有权，M1 前不要跨 Graph 共享 |
-| 节点致命错误 | 无独立控制面停止入口 | 节点线程直接 Stop 可能自 join | 事件上报到 PipelineController，由控制线程执行停止 |
-| ExecutorDispatch | 直投路径需要把消息直接交给目标 Node Dispatch；目标队列满时必须回传拒绝 | 发送方看不到实际拒绝，或媒体分类丢失导致视频保护失效 | 直投消费者传递 `DispatchPriority` 并回传 `MailboxPushResult`；媒体主链路仍优先使用 QueueTransport |
+状态列中的目录编号对应第 16.1 节的实施情况目录；“待实施”表示当前还没有对应的
+代码落地和实施记录。
+
+<table style="width:100%; table-layout:fixed; word-break:break-word; overflow-wrap:anywhere;">
+<colgroup>
+<col style="width:11%;">
+<col style="width:15%;">
+<col style="width:22%;">
+<col style="width:34%;">
+<col style="width:18%;">
+</colgroup>
+<thead>
+<tr><th>问题</th><th>当前行为</th><th>媒体风险</th><th>要求</th><th>实施状态</th></tr>
+</thead>
+<tbody>
+<tr><td>Node Start 顺序</td><td>按 AddNode 顺序</td><td>Source 可能在 Decoder/Publisher 未启动时产生数据</td><td>支持拓扑逆序启动，或首期严格按 sink 到 source 添加节点</td><td>已完成<br>目录：A1<br>详情：第 18.1 节</td></tr>
+<tr><td>Node Stop 顺序</td><td>按 AddNode 顺序调用 Stop</td><td>Publisher 可能早于 Encoder flush 关闭</td><td>明确 source 到 sink 的 Graceful Stop 顺序</td><td>已完成<br>目录：A3、A4-3<br>详情：第 20.3、21.7.9 节</td></tr>
+<tr><td>在途任务</td><td>Node::Stop 时任务可能仍在执行</td><td>Decode 与 Close、Encode 与 Close 并发</td><td>增加 pending-task barrier，并在节点 Executor 上执行 flush/close</td><td>已完成<br>目录：A3、A4-3<br>详情：第 20.3、21.7.9 节</td></tr>
+<tr><td>Executor Stop</td><td><code>io_context::stop()</code> 丢弃排队任务</td><td>残留 frame/packet 丢失</td><td>Graceful 模式先 drain，再停止 Executor</td><td>已完成<br>目录：A3<br>详情：第 20.3 节</td></tr>
+<tr><td>共享 Executor</td><td>Graph::Stop 会停止其见到的 Executor</td><td>一路停止可能影响其他 Graph</td><td>拆分 Executor 所有权，M1 前不要跨 Graph 共享</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>节点致命错误</td><td>无独立控制面停止入口</td><td>节点线程直接 Stop 可能自 join</td><td>事件上报到 PipelineController，由控制线程执行停止</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>ExecutorDispatch</td><td>直投路径需要把消息直接交给目标 Node Dispatch；目标队列满时必须回传拒绝</td><td>发送方看不到实际拒绝，或媒体分类丢失导致视频保护失效</td><td>直投消费者传递 <code>DispatchPriority</code> 并回传 <code>MailboxPushResult</code>；媒体主链路仍优先使用 QueueTransport</td><td>已完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
+</tbody>
+</table>
 
 ### 6.2 推荐启动顺序
 
@@ -431,37 +446,61 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 
 ### 7.1 P0：接入前必须完成
 
-| ID | 文件 | 当前问题 | 必须修改 | 验收 |
-|---|---|---|---|---|
-| M-P0-01 | `include/media/media_packet.h` | `MediaType::VIDEO` 和 `MediaType::UNKNOWN` 都为 0 | 将 `UNKNOWN=0` 放首位，其余值显式且唯一；检查持久化/FFI 依赖 | static_assert 各枚举值不同；发布轨道匹配测试通过 |
-| M-P0-02 | `include/media/media_packet.h` | PTS 注释与 `time_base` 实际语义冲突 | 明确 tick/time_base 契约、无时间戳表示和校验工具；Dump 判空 | 非微秒 time base 的解码、编码、发布测试通过 |
-| M-P0-03 | `include/media/puller/i_puller.h` 及各 Puller | bool + nullptr 不能可靠区分 NoData、EOF、可恢复错误和停止 | 增加结构化 `PullReadStatus`，Session 按状态决定继续、完成或重连 | 本地文件 EOF 不重连；网络断开按策略重连；超时不误判 EOF |
-| M-P0-04 | `src/media/puller/ffmpeg_puller.cpp` | 重复 Open 不先 Close；所有音视频 stream 都输出，但只有单个 video/audio 索引 | Open 幂等清理；增加显式选轨或完整轨道映射；事件返回结构化错误 | 多视频轨不串入同一 Decoder；Start/Stop/Start 资源稳定 |
-| M-P0-05 | `include/media/stream/stream_session.h`、`src/media/stream/stream_session.cpp` | Stop 无法中断 CONNECTING；旧 handler 可进入新一代；多线程字段有数据竞争；StreamInfo 回调未快照；Stats 实际不更新 | 增加 lifecycle generation、所有状态可停止、回调快照、线程边界和真实原子统计；拆分 Prepare/StartReading | 连接中停止、快速重启、断线重连和统计测试通过，无迟到 packet |
-| M-P0-06 | `include/media/decoder/i_decoder.h`、`src/media/decoder/ffmpeg_decoder.cpp` | Open 不清理旧 context；Close 隐式 flush；Graph 停止时可能与 Decode 并发 | 增加显式 Flush；Open 先关闭；Close 只释放或明确契约；节点 Executor 屏障后调用 | 重复 Open、flush 多帧、Stop during Decode 无崩溃和丢帧 |
-| M-P0-07 | `include/media/encoder/i_encoder.h`、`src/media/encoder/ffmpeg_encoder.cpp` | Frame 微秒 PTS 直接写入任意 codec time base；自动视频 time base 未考虑 fps_den；音频 FIFO PTS 固定按微秒累加；输出 packet 缺少 time_base 和 track | 统一重标定；修正 fps time base；按 codec time base 累加音频；补完整 packet 元数据和统一输出描述 | 删除测试中的手工 time_base/stream_index 后仍可播放且 A/V 同步 |
-| M-P0-08 | `src/media/protocol/ffmpeg_mux_protocol.cpp` | 多轨使用 `av_write_frame`，独立音视频节点到达顺序不保证 | 使用 `av_interleaved_write_frame`，或实现有界 DTS 重排；保留单轨回归 | 独立音视频 Encoder 并发输入时无非单调 DTS 错误，输出可播放 |
-| M-P0-09 | `src/media/publisher/default_publisher.cpp`、FFmpeg publish 路径 | 重连成功但等待关键帧时仍返回连接中断错误，DefaultPublisher 随即把 `started_` 置 false，后续关键帧无法恢复 | 区分 AwaitingKeyframe、RetryableFailure 和 Closed；只有 Publisher 真正关闭时清除 started | 模拟断线，先送非关键帧再送关键帧能够恢复 |
-| M-P0-10 | `src/media/protocol/rtsp_server_protocol_adapter.cpp` | 多个相同媒体类型/codec 的 track 回退时直接取第一个候选 | 与 FFmpeg adapter 一致，候选不唯一时拒绝并要求显式 track | 双 H264 或双 AAC 轨道不会静默写错 |
-| MF-P0-01 | `include/mediaflow/core/graph.h`、`executor.h` | 缺少媒体 Graceful Stop 屏障和安全启动/停止顺序 | 增加拓扑生命周期顺序、在途任务等待和 Executor 上 flush；禁止控制线程自 join | 编解码处理中停止、重复启动、启动失败回滚测试通过 |
+<table style="width:100%; table-layout:fixed; word-break:break-word; overflow-wrap:anywhere;">
+<colgroup>
+<col style="width:8%;">
+<col style="width:17%;">
+<col style="width:19%;">
+<col style="width:24%;">
+<col style="width:18%;">
+<col style="width:14%;">
+</colgroup>
+<thead>
+<tr><th>ID</th><th>文件</th><th>当前问题</th><th>必须修改</th><th>验收</th><th>实施状态</th></tr>
+</thead>
+<tbody>
+<tr><td>M-P0-01</td><td><code>include/media/media_packet.h</code></td><td><code>MediaType::VIDEO</code> 和 <code>MediaType::UNKNOWN</code> 都为 0</td><td>将 <code>UNKNOWN=0</code> 放首位，其余值显式且唯一；检查持久化/FFI 依赖</td><td>static_assert 各枚举值不同；发布轨道匹配测试通过</td><td>已完成<br>目录：A0<br>详情：第 17.1 节</td></tr>
+<tr><td>M-P0-02</td><td><code>include/media/media_packet.h</code></td><td>PTS 注释与 <code>time_base</code> 实际语义冲突</td><td>明确 tick/time_base 契约、无时间戳表示和校验工具；Dump 判空</td><td>非微秒 time base 的解码、编码、发布测试通过</td><td>已完成<br>目录：A0<br>详情：第 17.1 节</td></tr>
+<tr><td>M-P0-03</td><td><code>include/media/puller/i_puller.h</code> 及各 Puller</td><td>bool + nullptr 不能可靠区分 NoData、EOF、可恢复错误和停止</td><td>增加结构化 <code>PullReadStatus</code>，Session 按状态决定继续、完成或重连</td><td>本地文件 EOF 不重连；网络断开按策略重连；超时不误判 EOF</td><td>已完成<br>目录：A0<br>详情：第 17.1 节</td></tr>
+<tr><td>M-P0-04</td><td><code>src/media/puller/ffmpeg_puller.cpp</code></td><td>重复 Open 不先 Close；所有音视频 stream 都输出，但只有单个 video/audio 索引</td><td>Open 幂等清理；增加显式选轨或完整轨道映射；事件返回结构化错误</td><td>多视频轨不串入同一 Decoder；Start/Stop/Start 资源稳定</td><td>部分完成<br>目录：A0、A1<br>详情：第 17.1、18.1 节</td></tr>
+<tr><td>M-P0-05</td><td><code>include/media/stream/stream_session.h</code>、<code>src/media/stream/stream_session.cpp</code></td><td>Stop 无法中断 CONNECTING；旧 handler 可进入新一代；多线程字段有数据竞争；StreamInfo 回调未快照；Stats 实际不更新</td><td>增加 lifecycle generation、所有状态可停止、回调快照、线程边界和真实原子统计；拆分 Prepare/StartReading</td><td>连接中停止、快速重启、断线重连和统计测试通过，无迟到 packet</td><td>部分完成<br>目录：A0、A1<br>详情：第 17.1、18.1 节</td></tr>
+<tr><td>M-P0-06</td><td><code>include/media/decoder/i_decoder.h</code>、<code>src/media/decoder/ffmpeg_decoder.cpp</code></td><td>Open 不清理旧 context；Close 隐式 flush；Graph 停止时可能与 Decode 并发</td><td>增加显式 Flush；Open 先关闭；Close 只释放或明确契约；节点 Executor 屏障后调用</td><td>重复 Open、flush 多帧、Stop during Decode 无崩溃和丢帧</td><td>已完成<br>目录：A0、A1<br>详情：第 17.1、18.1 节</td></tr>
+<tr><td>M-P0-07</td><td><code>include/media/encoder/i_encoder.h</code>、<code>src/media/encoder/ffmpeg_encoder.cpp</code></td><td>Frame 微秒 PTS 直接写入任意 codec time base；自动视频 time base 未考虑 fps_den；音频 FIFO PTS 固定按微秒累加；输出 packet 缺少 time_base 和 track</td><td>统一重标定；修正 fps time base；按 codec time base 累加音频；补完整 packet 元数据和统一输出描述</td><td>删除测试中的手工 time_base/stream_index 后仍可播放且 A/V 同步</td><td>部分完成<br>目录：A0、A2<br>详情：第 17.1、19.1 节</td></tr>
+<tr><td>M-P0-08</td><td><code>src/media/protocol/ffmpeg_mux_protocol.cpp</code></td><td>多轨使用 <code>av_write_frame</code>，独立音视频节点到达顺序不保证</td><td>使用 <code>av_interleaved_write_frame</code>，或实现有界 DTS 重排；保留单轨回归</td><td>独立音视频 Encoder 并发输入时无非单调 DTS 错误，输出可播放</td><td>已完成<br>目录：A3<br>详情：第 20.4 节</td></tr>
+<tr><td>M-P0-09</td><td><code>src/media/publisher/default_publisher.cpp</code>、FFmpeg publish 路径</td><td>重连成功但等待关键帧时仍返回连接中断错误，DefaultPublisher 随即把 <code>started_</code> 置 false，后续关键帧无法恢复</td><td>区分 AwaitingKeyframe、RetryableFailure 和 Closed；只有 Publisher 真正关闭时清除 started</td><td>模拟断线，先送非关键帧再送关键帧能够恢复</td><td>已完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
+<tr><td>M-P0-10</td><td><code>src/media/protocol/rtsp_server_protocol_adapter.cpp</code></td><td>多个相同媒体类型/codec 的 track 回退时直接取第一个候选</td><td>与 FFmpeg adapter 一致，候选不唯一时拒绝并要求显式 track</td><td>双 H264 或双 AAC 轨道不会静默写错</td><td>部分完成<br>目录：A0、A3<br>详情：第 17.3、20.6 节</td></tr>
+<tr><td>MF-P0-01</td><td><code>include/mediaflow/core/graph.h</code>、<code>executor.h</code></td><td>缺少媒体 Graceful Stop 屏障和安全启动/停止顺序</td><td>增加拓扑生命周期顺序、在途任务等待和 Executor 上 flush；禁止控制线程自 join</td><td>编解码处理中停止、重复启动、启动失败回滚测试通过</td><td>已完成<br>目录：A3、A4-3<br>详情：第 20.3、21.7.9 节</td></tr>
+</tbody>
+</table>
 
 ### 7.2 P1：主链路完成前建议完成
 
-| ID | 文件 | 问题与改进 |
-|---|---|---|
-| M-P1-01 | `include/media/media_frame.h` | 增加时间戳有效性；`Stride`、`PlaneOffset` 校验 index；避免 type 与 variant 不一致时直接 `std::get` 抛异常 |
-| M-P1-02 | `include/media/i_media_buffer.h` | 推进只读 Buffer 契约，增加 `ConstPacketPtr`/`ConstFramePtr`；需要写入的节点显式复制或独占 |
-| M-P1-03 | `include/media/stream/source_config.h` | 合并重复超时字段；处理或删除当前未生效的 `max_delay_ms`、`dump_packets`、headers、socket buffer 等配置 |
-| M-P1-04 | `src/media/stream/stream_source.cpp` | 若保留兼容类：回调改 weak capture、Stop 解绑回调、subscriber 支持取消、锁外调用回调、保护 StreamInfo、Stop 统计线程、packet buffer 判空 |
-| M-P1-05 | `AdaptiveJitterBuffer` | 改为每轨实例、按 time base 计算、批量 Pop、累计与当前代次指标分离；或迁移为独立 JitterBufferNode |
-| M-P1-06 | `DefaultPublisher` | 查询方法与 Start/Publish/Stop 并发不安全；增加锁或由 PublisherSinkNode 保存线程安全快照 |
-| M-P1-07 | `RtspServerProtocol` | `Write` 成功只表示已 post，内部媒体任务没有独立总上限；增加有界媒体入口和 accepted/delivered/dropped 区分 |
-| M-P1-08 | `FfmpegMuxProtocol` | 断线发生在音频 packet 时，也应根据配置中是否存在视频轨决定是否等待关键帧 |
-| M-P1-09 | `PublisherResult` | 增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态 |
-| M-P1-10 | `MultiStreamInfo` | 提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆 |
-| MF-P1-01 | MediaFlow metrics | 增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计 |
-| MF-P1-02 | Queue/Dispatch | 当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限 |
-| MF-P1-03 | Source 混合音视频队列、TrackRouterNode 及下游调度 | 音频突发可能在混合入口形成积压，放大视频延迟或丢失；必须按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对 |
+<table style="width:100%; table-layout:fixed; word-break:break-word; overflow-wrap:anywhere;">
+<colgroup>
+<col style="width:10%;">
+<col style="width:20%;">
+<col style="width:50%;">
+<col style="width:20%;">
+</colgroup>
+<thead>
+<tr><th>ID</th><th>文件</th><th>问题与改进</th><th>实施状态</th></tr>
+</thead>
+<tbody>
+<tr><td>M-P1-01</td><td><code>include/media/media_frame.h</code></td><td>增加时间戳有效性；<code>Stride</code>、<code>PlaneOffset</code> 校验 index；避免 type 与 variant 不一致时直接 <code>std::get</code> 抛异常</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>M-P1-02</td><td><code>include/media/i_media_buffer.h</code></td><td>推进只读 Buffer 契约，增加 <code>ConstPacketPtr</code>/<code>ConstFramePtr</code>；需要写入的节点显式复制或独占</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>M-P1-03</td><td><code>include/media/stream/source_config.h</code></td><td>合并重复超时字段；处理或删除当前未生效的 <code>max_delay_ms</code>、<code>dump_packets</code>、headers、socket buffer 等配置</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>M-P1-04</td><td><code>src/media/stream/stream_source.cpp</code></td><td>若保留兼容类：回调改 weak capture、Stop 解绑回调、subscriber 支持取消、锁外调用回调、保护 StreamInfo、Stop 统计线程、packet buffer 判空</td><td>部分完成<br>目录：A1<br>详情：第 18.1 节</td></tr>
+<tr><td>M-P1-05</td><td><code>AdaptiveJitterBuffer</code></td><td>改为每轨实例、按 time base 计算、批量 Pop、累计与当前代次指标分离；或迁移为独立 JitterBufferNode</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>M-P1-06</td><td><code>DefaultPublisher</code></td><td>查询方法与 Start/Publish/Stop 并发不安全；增加锁或由 PublisherSinkNode 保存线程安全快照</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
+<tr><td>M-P1-07</td><td><code>RtspServerProtocol</code></td><td><code>Write</code> 成功只表示已 post，内部媒体任务没有独立总上限；增加有界媒体入口和 accepted/delivered/dropped 区分</td><td>未开始<br>目录：待实施</td></tr>
+<tr><td>M-P1-08</td><td><code>FfmpegMuxProtocol</code></td><td>断线发生在音频 packet 时，也应根据配置中是否存在视频轨决定是否等待关键帧</td><td>部分完成<br>目录：A2、A3<br>详情：第 19.1、20.4 节</td></tr>
+<tr><td>M-P1-09</td><td><code>PublisherResult</code></td><td>增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
+<tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
+<tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
+<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5<br>详情：第 21.7.12、21.7.14、21.7.15 节</td></tr>
+<tr><td>MF-P1-03</td><td>Source 混合音视频队列、TrackRouterNode 及下游调度</td><td>音频突发可能在混合入口形成积压，放大视频延迟或丢失；必须按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15 节</td></tr>
+</tbody>
+</table>
 
 #### MF-P1-03 详细要求：音视频队列隔离与同步
 
@@ -782,6 +821,35 @@ ctest --test-dir build -C Debug --output-on-failure
 `Source -> Decode -> Encode -> Publish` 具备明确的轨道、时间、代次、背压、错误和
 停止契约，再扩展业务分支。这样 MediaFlow 才真正接管流程编排，而不是只在现有回调
 链外再包一层类。
+
+### 16.1 实施情况目录
+
+问题表中的“实施状态”统一使用下面的目录编号。状态单元格先给出当前完成度，
+再给出目录编号和详细章节；同一问题如果跨多个阶段实施，列出全部相关目录。
+
+<table style="width:100%; table-layout:fixed; word-break:break-word; overflow-wrap:anywhere;">
+<colgroup>
+<col style="width:9%;">
+<col style="width:15%;">
+<col style="width:39%;">
+<col style="width:17%;">
+<col style="width:20%;">
+</colgroup>
+<thead>
+<tr><th>目录编号</th><th>实施阶段</th><th>实施内容</th><th>详细记录</th><th>当前结论</th></tr>
+</thead>
+<tbody>
+<tr><td>A0</td><td>公共契约</td><td>媒体类型、时间戳、Puller 读结果、Session 生命周期、Decoder/Encoder 基础契约</td><td>第 17.1-17.4 节</td><td>已完成首轮公共契约改造，部分多轨和发布问题留待后续阶段</td></tr>
+<tr><td>A1</td><td>Source + Decoder</td><td>Source、TrackRouter、Decoder 单视频节点链路及其启动/接入约束</td><td>第 18.1-18.5 节</td><td>单视频本地图已完成，真实多轨和完整 EOS 仍需后续接入</td></tr>
+<tr><td>A2</td><td>Encoder + Publisher</td><td>Encoder、PublisherSink、关键帧启动和发布结果语义</td><td>第 19.1-19.5 节</td><td>单视频编码发布链路已完成，真实网络长测和多轨汇合仍需验证</td></tr>
+<tr><td>A3</td><td>多轨汇合与有序停止</td><td>音视频汇合、FFmpeg 交织写入、GracefulStop 和节点停止顺序</td><td>第 20.1-20.6 节</td><td>本地多轨收尾和有序停止已完成，部分协议细节仍待补齐</td></tr>
+<tr><td>A4-1</td><td>RTSP 解码迁移</td><td>将 <code>test_stream_decode</code> 迁移为 Source -&gt; Router -&gt; 双 Decoder 图</td><td>第 21.1-21.5 节</td><td>单路摄像头迁移已完成，当前按 TCP URL 验证</td></tr>
+<tr><td>A4-2</td><td>音频突发与视频包丢失</td><td>记录混合队列问题、启动突发改进和后续轨道隔离计划</td><td>第 21.6.1-21.6.7 节</td><td>Edge 层启动突发已改善，轨道级队列隔离仍未实施</td></tr>
+<tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
+<tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
+<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离，统一时钟和 A/V 同步仍需后续实施</td></tr>
+</tbody>
+</table>
 
 ## 17. A0 实施记录
 
@@ -1521,6 +1589,67 @@ rejected=0`；Source -> Router、Router -> Video 和 Router -> Audio 三条相�
 Edge 的 dropped/rejected 均为 `0`。这证明 Dispatch 层保护策略已接入并未影响
 当前稳定设备流，但仍需在设备状态稳定后进行更长时间、更多音频突发强度的验证。
 
-本批修复没有改变 `MF-P1-03` 中关于队列拆分和音视频同步的结论。后续若实施
-轨道隔离，仍必须以 PTS/DTS、time base、统一时钟和时间长度为约束，不能按音频
-帧数与视频帧数配对。
+本批修复没有改变 `MF-P1-03` 中关于音视频同步的结论。轨道入口隔离已在第
+21.7.15 节实施，但后续同步设计仍必须以 PTS/DTS、time base、统一时钟和时间
+长度为约束，不能按音频帧数与视频帧数配对。
+
+#### 21.7.15 第五批修复实施记录：拆分音频和视频入口队列
+
+本批继续处理 `MF-P1-03` 的入口队列问题。目标是消除
+`StreamSourceNode -> TrackRouterNode` 的混合 MediaPacket Edge，使音频突发只
+影响音频入口的容量和指标，不再与视频包共享同一组队列槽位。本批只完成轨道级
+队列隔离，不把两个独立 FIFO 的出队过程当作音视频同步，也没有改变后续 PTS/DTS
+交织和统一时钟的实施要求。
+
+本批修改如下：
+
+1. `StreamSourceNode` 保留兼容的 `out` 混合端口，同时增加 `video` 和 `audio`
+   两个专用输出端口。Source 根据 `MediaPacket::type` 将包发送到对应队列，
+   未连接的兼容端口不会创建实际队列。
+2. `TrackRouterNode` 保留兼容的 `in` 输入，同时增加 `video-in` 和 `audio-in`
+   两个专用输入端口。拆分输入再次校验媒体类型，并只向对应轨道的输出发送，
+   防止错误连线把音频包交给视频 Decoder。
+3. Source 和 Router 的 EOS 在拆分路径上按轨道各发送一次；混合兼容路径仍广播
+   到两个输出。这样两个 Decoder 都能获得自己的 Flush 边界，且不会收到重复 EOS。
+4. 为 `MediaPacketMessage::eos` 增加控制消息分类。队列满载时，EOS 可以替换
+   一条普通媒体消息进入队列，避免音频突发把生命周期结束信号一起丢弃。
+5. `test_stream_decode` 改为连接四条压缩包边：
+   `source:video -> router:video-in`、`source:audio -> router:audio-in`、
+   `router:video -> video-decoder` 和 `router:audio -> audio-decoder`。入口视频
+   队列容量为 `2048` 并使用 `PreferVideoKeyframes`，入口音频队列容量为 `8192`
+   并使用 `DropNewest`；两类入口和下游边分别输出 Edge 指标。
+6. 增加 `TestSourceTrackQueuesAreIndependent()`：阻塞音频消费者并制造音频突发，
+   验证音频边发生丢弃时视频关键帧仍进入独立视频边，并验证两条边各收到一次 EOS。
+
+验证结果（VS 18 Community x64 Debug）：
+
+```text
+test_mediaflow                 退出码 0
+test_mediaflow_media_nodes     退出码 0
+```
+
+现场单路测试仍只建立一个
+`rtsp://192.168.66.83/live/mainstream` RTSP 会话，运行
+`test_stream_decode --duration-ms 15000`，结果如下：
+
+| 指标 | 结果 |
+|---|---:|
+| 视频 Decoder enqueued/processed/rejected | `375 / 375 / 0` |
+| 音频 Decoder enqueued/processed/rejected | `745 / 745 / 0` |
+| Source 视频入口 accepted/dropped | `375 / 0` |
+| Source 音频入口 accepted/dropped | `745 / 0` |
+| Router 到视频 Decoder accepted/dropped | `375 / 0` |
+| Router 到音频 Decoder accepted/dropped | `745 / 0` |
+| 解码帧 | 视频 `353`，音频 `745` |
+| Source generation / finished | `4 / 1` |
+| 进程退出 | 正常，退出码 `0` |
+
+本批已关闭“Source 到 Router 混合队列会被音频突发占满”的结构性问题，但仍有
+以下边界：
+
+- 当前容量仍按消息条数配置，尚未按字节数或时间长度动态预算；
+- Router 节点自身仍是一个 Serialized Dispatch 队列，入口隔离主要保护 Source
+  到 Router 以及 Router 到 Decoder 的 Edge；
+- 音视频同步仍必须依据 PTS/DTS、time base、generation 和统一时钟处理，不能
+  按音频帧数与视频帧数配对；
+- 现场验证为 15 秒短测，仍需设备稳定后执行至少 10 分钟单路长测。
