@@ -497,8 +497,8 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-09</td><td><code>PublisherResult</code></td><td>增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
-<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5<br>详情：第 21.7.12、21.7.14、21.7.15 节</td></tr>
-<tr><td>MF-P1-03</td><td>Source 混合音视频队列、TrackRouterNode 及下游调度</td><td>音频突发可能在混合入口形成积压，放大视频延迟或丢失；必须按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15 节</td></tr>
+<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5<br>详情：第 21.7.12、21.7.14、21.7.15 节<br>计划：A4-6 / 第 21.7.16 节</td></tr>
+<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15 节<br>计划：A4-6 / 第 21.7.16 节</td></tr>
 </tbody>
 </table>
 
@@ -509,20 +509,23 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 现场短测曾出现音频 4483 帧、视频 370 帧的明显差距，结合音频 PTS 和首批突发
 日志，应该按音频历史数据追赶或突发积压处理，不能仅视为编码帧率差异。
 
-当前 MediaFlow 的结构是：
+第 21.7.15 节完成入口分轨后，当前 MediaFlow 的结构是：
 
 ```text
-StreamSourceNode -> 混合 MediaPacket Edge -> TrackRouterNode
-                                      -> 音频 Edge -> Audio Decoder
-                                      -> 视频 Edge -> Video Decoder
+StreamSourceNode:video -> 视频入口 Edge -> TrackRouterNode:video-in
+                                          -> 视频 Edge -> Video Decoder
+StreamSourceNode:audio -> 音频入口 Edge -> TrackRouterNode:audio-in
+                                          -> 音频 Edge -> Audio Decoder
 ```
 
-音频和视频在 Router 之后已经使用独立 Edge，但 Source 到 Router 之间仍是混合
-队列。`PreferVideoKeyframes` 能在队列满时优先保护视频，不能完全隔离音频积压
-对视频延迟的影响。因此，正式封装 media 各流程前必须完成以下改进：
+音频和视频已经在 Source 入口及 Router 下游使用独立 Edge，音频突发不会再直接
+占用视频 Edge 的队列槽位；`PreferVideoKeyframes` 继续保护视频恢复窗口。当前
+仍未解决的是“队列容量如何按媒体成本计算”和“两个轨道如何在统一时间轴上调度”：
 
-- Source 入口按轨道隔离队列，或提供等价的轨道级调度边界，避免音频突发直接占满
-  视频共享的容量；
+- 当前容量仅按消息条数配置，不能表达 4K 视频包、低码率音频包之间的内存差异；
+- 尚未限制队列覆盖的媒体时间长度，历史音频仍可能形成较大播放延迟；
+- Router 的 Serialized Dispatch 仍是共享任务队列，需要把各轨道 Edge 和节点
+  pending task 一并纳入总在途预算；
 - 使用统一的 PTS/DTS 调度、音频主时钟、视频迟到帧处理和重连 discontinuity；
 - 以轨道时间长度或字节数控制容量，并分别记录音频/视频队列时长、PTS 差值和
   丢弃原因；
@@ -531,8 +534,9 @@ StreamSourceNode -> 混合 MediaPacket Edge -> TrackRouterNode
 - 播放链路使用统一时钟，通常以音频时钟为主，视频按 PTS 等待或丢弃迟到的非
   关键帧，不能把两个 FIFO 的独立出队误认为已经完成音视频同步。
 
-该问题属于必须修改的 P1 架构项，当前阶段暂不实施，现阶段继续使用
-`PreferVideoKeyframes` 和现有分轨 Edge 作为有界保护策略。
+该问题属于必须修改的 P1 架构项。入口隔离已经完成，按字节/时间长度的容量控制
+及其验收计划见第 21.7.16 节；在该计划完成前，当前消息数上限只能作为硬安全阀，
+不能作为媒体延迟或内存预算已经达标的证明。
 
 ### 7.3 P2：性能和扩展优化
 
@@ -844,10 +848,11 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A2</td><td>Encoder + Publisher</td><td>Encoder、PublisherSink、关键帧启动和发布结果语义</td><td>第 19.1-19.5 节</td><td>单视频编码发布链路已完成，真实网络长测和多轨汇合仍需验证</td></tr>
 <tr><td>A3</td><td>多轨汇合与有序停止</td><td>音视频汇合、FFmpeg 交织写入、GracefulStop 和节点停止顺序</td><td>第 20.1-20.6 节</td><td>本地多轨收尾和有序停止已完成，部分协议细节仍待补齐</td></tr>
 <tr><td>A4-1</td><td>RTSP 解码迁移</td><td>将 <code>test_stream_decode</code> 迁移为 Source -&gt; Router -&gt; 双 Decoder 图</td><td>第 21.1-21.5 节</td><td>单路摄像头迁移已完成，当前按 TCP URL 验证</td></tr>
-<tr><td>A4-2</td><td>音频突发与视频包丢失</td><td>记录混合队列问题、启动突发改进和后续轨道隔离计划</td><td>第 21.6.1-21.6.7 节</td><td>Edge 层启动突发已改善，轨道级队列隔离仍未实施</td></tr>
+<tr><td>A4-2</td><td>音频突发与视频包丢失</td><td>记录混合队列问题、启动突发改进和后续轨道隔离计划</td><td>第 21.6.1-21.6.7 节</td><td>Edge 层启动突发已改善；轨道级入口隔离当时未实施，已于 A4-5 完成</td></tr>
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
-<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离，统一时钟和 A/V 同步仍需后续实施</td></tr>
+<tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，多维容量控制已规划于 A4-6，尚未实施</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成实施与验收规划，尚未开始编码</td></tr>
 </tbody>
 </table>
 
@@ -1653,3 +1658,136 @@ test_mediaflow_media_nodes     退出码 0
 - 音视频同步仍必须依据 PTS/DTS、time base、generation 和统一时钟处理，不能
   按音频帧数与视频帧数配对；
 - 现场验证为 15 秒短测，仍需设备稳定后执行至少 10 分钟单路长测。
+
+#### 21.7.16 A/V 轨道容量控制实施与验收计划
+
+##### 21.7.16.1 目标与边界
+
+本计划承接第 21.7.15 节的轨道入口隔离，解决“每条轨道应该允许积压多少数据”
+的问题。目标不是简单地把 `capacity=2048/8192` 换成另一组固定数字，而是让每条
+轨道同时受消息数、载荷字节数和媒体时间长度约束，并能够解释每一次限流和丢弃。
+
+本阶段包含：
+
+- 音频和视频独立容量配置；
+- Edge 队列与 Node pending task 的总在途预算；
+- 按轨道统计当前字节数、时间跨度、水位和丢弃原因；
+- 视频关键帧恢复窗口、音频低延迟淘汰和 EOS 控制消息保护；
+- generation 变化、时间戳缺失和时间戳回退时的容量状态复位；
+- 模拟突发、生命周期和单路摄像头长时验收。
+
+本阶段不直接实现完整播放同步。容量控制只保证队列有界、时间戳不被破坏，并提供
+A/V 时间差指标；音频主时钟、视频等待/迟到丢帧和渲染节拍仍属于后续同步阶段。
+
+##### 21.7.16.2 目标数据模型
+
+建议在 MediaFlow 核心增加与消息类型无关的预算结构，由媒体消息 traits 提供成本：
+
+```cpp
+namespace mediaflow {
+
+struct QueueBudget {
+    std::size_t max_items{0};
+    std::size_t max_bytes{0};
+    std::int64_t max_span_us{0};
+    std::uint32_t high_watermark_percent{80};
+    std::uint32_t low_watermark_percent{60};
+};
+
+struct QueueItemCost {
+    std::size_t bytes{0};
+    std::int64_t timestamp_us{kNoTimestamp};
+    std::int64_t duration_us{0};
+    std::uint64_t generation{0};
+};
+
+} // namespace mediaflow
+```
+
+字段语义：
+
+| 字段 | 约束 |
+|---|---|
+| `max_items` | 最后的硬安全阀，防止缺少 Buffer 或时间戳时退化为无界队列；`0` 表示该维度不启用 |
+| `max_bytes` | 统计消息直接持有的媒体载荷；同一共享 Buffer 在同一队列中只按每条消息的逻辑载荷计费，不尝试推断进程全局引用数 |
+| `max_span_us` | 同一 `(track, generation)` 队列中最早与最晚有效时间戳覆盖的媒体时长；压缩包优先使用 DTS，显示/渲染帧使用 PTS |
+| 高/低水位 | 高水位触发告警或主动降载，低水位用于解除告警，避免在阈值附近反复抖动 |
+| `generation` | 变化时清空上一代的时间跨度基准，不允许跨重连代次计算队列时长或 A/V 差值 |
+
+时间戳无效或发生明显回退时，队列不能伪造时间跨度。此时继续使用消息数和字节数
+限制，并增加 `timestamp_invalid` 或 `timestamp_discontinuity` 指标；只有新 generation
+或明确的 discontinuity 处理完成后才重新建立时间窗口。
+
+##### 21.7.16.3 分阶段实施步骤
+
+| 阶段 | 实施内容 | 主要文件 | 完成标志 |
+|---|---|---|---|
+| C1：预算与成本契约 | 增加 `QueueBudget`、`QueueItemCost`、容量触发原因和配置校验；为普通类型提供零成本默认 traits，为 `MediaPacketMessage`/`MediaFrameMessage` 提供字节、时间戳、duration、generation 分类 | `include/mediaflow/core/types.h`、`transport.h`、`media_nodes.h` | 独立单元测试能从音频、视频、EOS 和无时间戳消息得到稳定成本 |
+| C2：多维队列记账 | `QueueTransport` 在 Push、Pop、Drop、Open、Close 时维护 items/bytes/span；任一启用维度达到上限都执行配置策略；超大单包明确返回 oversized，不允许突破硬上限 | `include/mediaflow/core/transport.h` | 任意入队/淘汰序列后，快照与队列实际内容一致，三种上限均不被静默突破 |
+| C3：分轨背压策略 | 视频优先淘汰非关键帧并保留可解码恢复窗口；实时音频优先淘汰最旧完整包以限制延迟；录制/发布链路使用可中断 `Block`；EOS 始终优先于普通媒体消息 | `transport.h`、`graph.h`、`media_nodes.cpp` | 音频突发不会导致视频关键帧因共享容量丢失，停止可以解除所有 Block 等待 |
+| C4：总在途预算 | 将 Edge 队列与目标 Node Dispatch 的 pending items/bytes 合并为轨道快照；为 Dispatch 任务传递媒体成本和轨道分类，避免 Edge 已排空但 Node 中仍隐藏大量媒体数据 | `types.h`、`graph.h` | 可查询每轨 Edge、Dispatch 和总在途 items/bytes/span，三者关系可核对 |
+| C5：指标与诊断 | 增加当前值、历史最高水位、进入/离开高水位次数，以及 count/bytes/span/oversized/keyframe/timestamp 各类丢弃原因；Pipeline 汇总时按轨道保留明细 | `types.h`、`graph.h`、测试日志 | 每一次未接收消息都能归因，不能只看到笼统的 `dropped_newest` |
+| C6：配置接入 | 为视频、音频分别配置预算；保留 `max_items` 兜底。实时解码初始值通过码率和目标延迟计算，不把现场测试中的 `2048/8192` 固化为所有场景默认值 | `test_stream_decode.cpp`、后续 PipelineBuilder | 同一图可以为实时播放、录制和发布选择不同配置，不需要修改 Transport 代码 |
+| C7：回归与现场验收 | 增加确定性突发、变码率、时间戳异常、generation 和停止测试；最后执行单路摄像头长测并填写第 21.7.16.6 节结果 | `test_mediaflow.cpp`、`test_mediaflow_media_nodes.cpp`、`test_stream_decode.cpp` | 第 21.7.16.5 节全部必选项达到通过标准 |
+
+建议按 `C1+C2`、`C3+C4`、`C5+C6`、`C7` 四批提交。每批都应保持旧的仅消息数
+配置可用，避免容量控制改造要求所有现有 Graph 一次性迁移。
+
+##### 21.7.16.4 初始配置原则
+
+初始预算应由“允许积压的媒体时间”反推，而不是直接根据当前帧数比例决定：
+
+```text
+recommended_bytes = bitrate_bits_per_second / 8
+                    * max_span_seconds
+                    * burst_safety_factor
+```
+
+建议第一轮现场调参使用以下起点，最终值必须由长测指标确认：
+
+| 场景 | 视频 max span | 音频 max span | 字节安全系数 | 溢出策略 |
+|---|---:|---:|---:|---|
+| 实时解码/预览 | `1000 ms` | `500 ms` | `2.0` | 视频保护关键帧与恢复窗口；音频丢最旧完整包 |
+| 实时转码发布 | `1500 ms` | `1000 ms` | `2.0` | 优先降载或请求关键帧；超过恢复窗口时重建发布入口 |
+| 录像/文件转封装 | 不以低延迟值直接限流 | 不以低延迟值直接限流 | 按磁盘吞吐预算 | 使用可中断 `Block`，不得静默丢包 |
+
+无可靠码率时，先使用保守 `max_bytes` 加 `max_items`；收集稳定码率后再计算目标值。
+任何场景都必须设置至少一个硬上限，不能同时关闭 items、bytes 和 span 三个维度。
+
+##### 21.7.16.5 验收标准
+
+| ID | 验收项 | 验收方式 | 通过条件 |
+|---|---|---|---|
+| CAP-01 | 多维记账正确性 | 对 Push/Pop/DropOldest/DropNewest/Open/Close 和中间元素淘汰做确定性单元测试 | items、bytes、span 与队列实际内容逐步一致；Open/Close 后当前值归零，累计指标按契约保留 |
+| CAP-02 | 硬上限 | 注入大小变化的音频包、普通视频包和超大关键帧 | `max_items`、`max_bytes` 不被突破；`max_span_us` 最多允许一个不可拆分包的 duration 误差；超大单包有独立原因 |
+| CAP-03 | 音视频隔离 | 音频按正常速率的 10 倍连续突发 30 秒，同时按 25 fps 注入视频和周期关键帧 | 音频达到上限不会消耗视频预算；视频关键帧不因音频容量被拒绝；两轨指标可独立查询 |
+| CAP-04 | 实时音频延迟 | 阻塞音频消费者后恢复，检查队列最老/最新 PTS | 音频队列 span 回落到配置低水位；不会持续保留超出 `max_span_us` 的最旧音频 |
+| CAP-05 | 视频恢复 | 在队列满载、关键帧到达、非关键帧突发和下一关键帧恢复场景下解码 | 丢弃后最迟从下一关键帧恢复输出；不把关键帧后的依赖窗口全部淘汰；丢弃原因可定位 |
+| CAP-06 | 时间戳异常 | 注入 `kNoTimestamp`、回退时间戳、跨 generation 消息和 discontinuity | 不跨 generation 计算 span；异常时退回 items/bytes 限制；没有负 span、整数溢出或无界增长 |
+| CAP-07 | EOS 与停止 | 在三种上限均已触发以及生产者正在 Block 时执行 EOS、GracefulStop 和 ImmediateStop | 每轨 EOS 最多处理一次且不被普通媒体包丢弃；Block 可被关闭唤醒；GracefulStop 在 `5 s` 预算内返回 |
+| CAP-08 | 总在途可观测性 | 同时填充 Edge 和 Node Dispatch，读取轨道快照 | `total_inflight = edge_queue + node_pending` 的 items/bytes 可核对；高水位和丢弃原因不串轨 |
+| CAP-09 | 生命周期回归 | 同一 Graph 连续 Start/Stop 100 次，并在高水位时停止 | 无死锁、计数下溢、旧 generation 数据和累计内存增长；现有 MediaFlow 测试全部通过 |
+| CAP-10 | 单路摄像头长测 | 仅建立一路 `192.168.66.83` RTSP，连续运行至少 10 分钟，每 5 秒采样一次指标 | A/V 持续输出；队列 items/bytes/span 不呈单调增长；无未分类丢弃；停止正常；进程 RSS 在预热后无持续增长趋势 |
+| CAP-11 | 性能回归 | 相同输入和构建配置下，对比改造前后 10 分钟 CPU 与吞吐 | 平均 CPU 增量不超过 5%；视频/音频处理吞吐不降低；指标采集不在媒体热路径执行全队列扫描 |
+
+容量控制阶段只要求记录 A/V PTS 差值并确认没有随运行时间单调发散，不把“达到
+某个固定毫秒同步误差”列为本阶段通过条件；固定同步误差应在统一时钟和渲染/发布
+调度实施后单独验收。
+
+##### 21.7.16.6 验收结果记录
+
+本节在每批实现完成后更新。当前只有入口分轨基线已经验证，多维容量控制尚未编码，
+因此不能把下面的“待执行”视为通过。
+
+| 验收范围 | 当前结果 | 证据或待补内容 |
+|---|---|---|
+| 第 21.7.15 节入口分轨基线 | 已通过 | 15 秒单路 RTSP：视频 `375/375`、音频 `745/745`，四条相关 Edge dropped/rejected 均为 `0` |
+| CAP-01 至 CAP-02：成本与硬上限 | 待执行 | 完成 C1、C2 后填写单元测试名称、配置和统计快照 |
+| CAP-03 至 CAP-05：轨道策略 | 待执行 | 完成 C3 后填写音频 10 倍突发、关键帧恢复和音频 span 结果 |
+| CAP-06 至 CAP-08：异常、停止和总在途 | 待执行 | 完成 C4、C5 后填写 generation、EOS、Block 停止和指标一致性结果 |
+| CAP-09：生命周期回归 | 待执行 | 记录 100 次 Start/Stop、现有测试集退出码和内存变化 |
+| CAP-10：摄像头长测 | 待执行 | 只使用一路 RTSP，记录至少 10 分钟的五秒采样数据和最终停止结果 |
+| CAP-11：性能回归 | 待执行 | 记录同一机器、同一流、同一构建配置下改造前后的 CPU/吞吐对比 |
+
+每个“待执行”项完成后必须改为“通过”或“未通过”，并附测试命令、关键配置和
+指标摘要。存在失败时保留原始结果和原因，不能只覆盖为最新一次成功数据。
