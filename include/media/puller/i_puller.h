@@ -60,6 +60,13 @@ public:
     /// @brief 关闭流
     virtual void Close() = 0;
 
+    /// @brief 请求中断当前阻塞读，但不等待资源释放。
+    ///
+    /// GracefulStop 使用这个阶段先停止 Source 继续生产，再排空已经进入
+    /// MediaFlow 的消息。实现必须尽快返回；完整的 Close() 仍由 Stop 阶段执行。
+    /// 不会阻塞的 Puller 可以保持默认实现。
+    virtual void RequestStop() {}
+
     /// @brief 读取一个媒体包
     /// @param[out] packet 输出包（成功时为有效对象，失败时为 nullptr）
     /// @return true 成功读取；false 读取失败或流结束

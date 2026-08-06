@@ -73,25 +73,36 @@ bool StreamSourceNode::Start() {
 }
 
 void StreamSourceNode::StopProduction() {
-    // GracefulStop 只需要停止读取线程并关闭 Puller，Decoder/Encoder 仍保持接收
-    // 状态，等待已经进入 Graph 的包排空后再由 Graph 统一调用 Stop。
-    Stop();
+    // 这里只发出非阻塞停止请求，不能在排空屏障建立前等待网络 I/O 或 join
+    // 读取线程；否则 GracefulStop 的 timeout 根本无法覆盖 Source 停止阶段。
+    RequestProductionStop();
+}
+
+bool StreamSourceNode::IsProductionStopped() const {
+    return finished_.load();
 }
 
 void StreamSourceNode::Stop() {
-    // 先让读循环的代次检查失效，再关闭 puller。FFmpegPuller 的 Close 会
-    // 唤醒正在 av_read_frame 中等待的线程，其他 Puller 也应遵守相同契约。
-    stop_requested_.store(true);
-    generation_.fetch_add(1);
+    // 先让读循环失效，并通过 Puller 的非阻塞请求唤醒底层 I/O。
+    RequestProductionStop();
+    if (read_thread_.joinable() &&
+        read_thread_.get_id() != std::this_thread::get_id()) {
+        // 必须先等待读线程退出，再调用 Close 释放 Puller 内部资源；这样
+        // Puller 不需要在 Close 中与 av_read_frame 并发操作同一上下文。
+        read_thread_.join();
+    }
     if (puller_) {
         puller_->Close();
     }
-
-    if (read_thread_.joinable() &&
-        read_thread_.get_id() != std::this_thread::get_id()) {
-        read_thread_.join();
-    }
     finished_.store(true);
+}
+
+void StreamSourceNode::RequestProductionStop() {
+    stop_requested_.store(true);
+    generation_.fetch_add(1);
+    if (puller_) {
+        puller_->RequestStop();
+    }
 }
 
 void StreamSourceNode::Deinit() {

@@ -329,20 +329,7 @@ bool EthernetCapture::Open(const std::string& url) {
 }
 
 void EthernetCapture::Close() {
-    stopped_.store(true);
-    running_.store(false);
-
-    if (handler_) {
-        PcapApi& api = GetPcapApi();
-        if (api.EnsureLoaded()) {
-            api.breakloop(handler_);
-        }
-    }
-
-    {
-        std::lock_guard<std::mutex> lk(queue_mutex_);
-        queue_cv_.notify_all();
-    }
+    RequestStop();
 
     if (capture_thread_.joinable()) {
         capture_thread_.join();
@@ -364,6 +351,21 @@ void EthernetCapture::Close() {
     }
 
     LOG_INFO("EthernetCapture::Close done (dropped={})", dropped_count_.load());
+}
+
+void EthernetCapture::RequestStop() {
+    stopped_.store(true);
+    running_.store(false);
+
+    if (handler_) {
+        PcapApi& api = GetPcapApi();
+        if (api.EnsureLoaded()) {
+            api.breakloop(handler_);
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(queue_mutex_);
+    queue_cv_.notify_all();
 }
 
 bool EthernetCapture::ReadPacket(std::shared_ptr<RawPacket>& packet) {

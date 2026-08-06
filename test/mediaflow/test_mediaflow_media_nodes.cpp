@@ -120,6 +120,98 @@ private:
     EventCallback event_callback_;
 };
 
+class BlockingStopPuller final : public IPuller {
+public:
+    bool Open(const std::string&) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_requested_ = false;
+        read_started_ = false;
+        read_returned_ = false;
+        close_called_ = false;
+        return true;
+    }
+
+    void RequestStop() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_requested_ = true;
+            ++request_stop_count_;
+        }
+        condition_.notify_all();
+    }
+
+    void Close() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        close_called_ = true;
+        // 模拟 Puller 不能与 ReadPacketResult 并发关闭底层上下文：只有读线程
+        // 退出后 Close 才允许返回。若 Source 先 Close 再发停止请求，这里会
+        // 永久等待，正好覆盖本阶段修复的生命周期顺序问题。
+        condition_.wait(lock, [this]() {
+            return read_returned_;
+        });
+    }
+
+    bool ReadPacket(std::shared_ptr<MediaPacket>& packet) override {
+        const auto result = ReadPacketResult();
+        packet = result.packet;
+        return result.status == PullReadStatus::Packet;
+    }
+
+    PullReadResult ReadPacketResult() override {
+        std::unique_lock<std::mutex> lock(mutex_);
+        read_started_ = true;
+        condition_.notify_all();
+        condition_.wait(lock, [this]() {
+            return stop_requested_;
+        });
+        read_returned_ = true;
+        condition_.notify_all();
+        return {PullReadStatus::Stopped, nullptr, 0, "stop requested"};
+    }
+
+    MultiStreamInfo GetStreamInfo() const override {
+        return {};
+    }
+
+    void SetEventCallback(EventCallback cb) override {
+        event_callback_ = std::move(cb);
+    }
+
+    bool WaitUntilReadStarted() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return read_started_;
+        });
+    }
+
+    bool WaitUntilReadReturned() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2), [this]() {
+            return read_returned_;
+        });
+    }
+
+    int RequestStopCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return request_stop_count_;
+    }
+
+    bool CloseCalled() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return close_called_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable condition_;
+    bool stop_requested_{false};
+    bool read_started_{false};
+    bool read_returned_{false};
+    bool close_called_{false};
+    int request_stop_count_{0};
+    EventCallback event_callback_;
+};
+
 class RecordingDecoder final : public IDecoder {
 public:
     explicit RecordingDecoder(std::shared_ptr<DecoderState> state)
@@ -510,6 +602,37 @@ void TestDecoderRejectsIncompleteStreamInfo() {
     decoder.Deinit();
 }
 
+void TestSourceStopRequestIsNonBlocking() {
+    auto puller = std::make_unique<BlockingStopPuller>();
+    auto* puller_state = puller.get();
+    StreamSourceNode source(
+        "blocking-stop", std::move(puller), "test://blocking-stop");
+
+    assert(source.Init());
+    assert(source.Start());
+    assert(puller_state->WaitUntilReadStarted());
+
+    const auto begin = std::chrono::steady_clock::now();
+    source.StopProduction();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin);
+
+    // StopProduction 只请求中断，不应等待 Close 或读线程 join。
+    assert(elapsed < std::chrono::milliseconds(100));
+    assert(puller_state->RequestStopCount() == 1);
+    assert(puller_state->WaitUntilReadReturned());
+    const auto finished_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!source.IsProductionStopped() &&
+           std::chrono::steady_clock::now() < finished_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(source.IsProductionStopped());
+
+    source.Stop();
+    assert(puller_state->CloseCalled());
+}
+
 void TestEncoderAndPublisherChain() {
     auto encoder_state = std::make_shared<EncoderState>();
     auto publisher_state = std::make_shared<PublisherState>();
@@ -692,6 +815,7 @@ void TestMultiTrackPublisherAndGracefulEos() {
 int main() {
     TestSingleVideoChainAndReconnectGeneration();
     TestDecoderRejectsIncompleteStreamInfo();
+    TestSourceStopRequestIsNonBlocking();
     TestEncoderAndPublisherChain();
     TestPublisherAwaitingKeyframeState();
     TestMultiTrackPublisherAndGracefulEos();

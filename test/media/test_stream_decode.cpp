@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include "media/decoder/ffmpeg_decoder.h"
@@ -196,10 +197,63 @@ int main() {
               << "Press Enter to stop...\n";
     std::cin.get();
 
+    // 停止阶段保留一条独立观测线程。它不参与 Graph 调度，只读取公开的
+    // 原子状态和指标，便于区分 Source 读线程、Edge 排空还是节点任务回收卡住。
+    std::atomic<bool> stop_observer_done{false};
+    std::atomic<bool> stop_observer_active{true};
+    auto source_for_observer = graph.GetNode<StreamSourceNode>("source");
+    std::thread stop_observer([&]() {
+        while (!stop_observer_done.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (!stop_observer_active.load()) {
+                continue;
+            }
+
+            NodeMetricsSnapshot observer_video_metrics;
+            NodeMetricsSnapshot observer_audio_metrics;
+            NodeMetricsSnapshot observer_router_metrics;
+            NodeMetricsSnapshot observer_video_counter_metrics;
+            NodeMetricsSnapshot observer_audio_counter_metrics;
+            EdgeMetricsSnapshot observer_source_edge;
+            EdgeMetricsSnapshot observer_video_edge;
+            EdgeMetricsSnapshot observer_audio_edge;
+            graph.GetMetrics("video-decoder", observer_video_metrics);
+            graph.GetMetrics("audio-decoder", observer_audio_metrics);
+            graph.GetMetrics("router", observer_router_metrics);
+            graph.GetMetrics("video-counter", observer_video_counter_metrics);
+            graph.GetMetrics("audio-counter", observer_audio_counter_metrics);
+            graph.GetEdgeMetrics("source:out->router:in", observer_source_edge);
+            graph.GetEdgeMetrics("router:video->video-decoder:in",
+                                 observer_video_edge);
+            graph.GetEdgeMetrics("router:audio->audio-decoder:in",
+                                 observer_audio_edge);
+            std::cerr << "[MediaFlow][StopObserver] source_finished="
+                      << (source_for_observer && source_for_observer->Finished())
+                      << ", source_generation="
+                      << (source_for_observer ? source_for_observer->Generation() : 0)
+                      << ", decoder_pending=("
+                      << observer_video_metrics.pending_tasks << ","
+                      << observer_audio_metrics.pending_tasks << ")"
+                      << ", other_pending=(router="
+                      << observer_router_metrics.pending_tasks
+                      << ", video_counter="
+                      << observer_video_counter_metrics.pending_tasks
+                      << ", audio_counter="
+                      << observer_audio_counter_metrics.pending_tasks << ")"
+                      << ", edge_queue=("
+                      << observer_source_edge.queue_size << ","
+                      << observer_video_edge.queue_size << ","
+                      << observer_audio_edge.queue_size << ")\n";
+        }
+    });
+
     // 交互式停止使用 GracefulStop：先停止 Puller 生产，再排空已经进入 Graph
     // 的包，并让两个 Decoder 输出内部残留帧。即使网络流没有发送 EOS，也能
     // 通过图级 Flush 结束一次完整的解码生命周期。
     const bool stopped = graph.GracefulStop(std::chrono::seconds(5));
+    stop_observer_active.store(false);
+    stop_observer_done.store(true);
+    stop_observer.join();
     if (!stopped) {
         std::cerr << "MediaFlow graceful stop timed out or flush failed\n";
     }

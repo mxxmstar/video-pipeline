@@ -1364,3 +1364,47 @@ test_stream_decode              退出码 0（单路 RTSP，约 5 秒）
 `av_read_frame()` 或 `avformat_close_input()` 不响应中断，Graph 仍可能在进入统一
 截止时间检查之前被阻塞。下一批应拆分“请求停止”和“等待线程退出”的语义，并增加
 Puller 关闭耗时、Source 线程状态和停止阶段队列指标，确保超时后有明确的降级路径。
+
+#### 21.7.9 第二批修复实施记录
+
+本批次处理长时停止阶段的生命周期和队列调度问题：
+
+| 问题 | 修改内容 | 验证结果 |
+|---|---|---|
+| `StopProduction()` 同步等待网络关闭 | 为 `IPuller` 增加非阻塞 `RequestStop()` 契约；`FFmpegPuller` 只设置中断标志，`StreamSourceNode::StopProduction()` 不再调用 `Close()` 或等待读线程 | 阻塞 Puller 回归测试通过，停止请求耗时低于 100 ms |
+| AVTP 读取器没有对应的非阻塞停止入口 | `AvtpPuller` 和 `EthernetCapture` 同样拆分停止请求与线程 `join`，保证切换到 AVTP 输入时遵守同一生命周期契约 | 相关目标随工程 Debug 构建通过 |
+| Source 线程可能在排空屏障后继续发包 | 增加 `INode::IsProductionStopped()`；Graph 的排空屏障等待异步 Source 真正退出后再 Flush | Source 停止顺序测试通过 |
+| Edge Drain 在关闭阶段继续批量提交 | Edge 关闭时设置取消门闩，Drain 每轮检查取消状态，停止后续消息投递并禁止重新调度 | `test_mediaflow`、`test_mediaflow_media_nodes` 通过 |
+| 测试控制器读取日志不及时导致假性停止阻塞 | `test_stream_decode` 的停止观测使用独立线程；现场验证脚本持续异步读取 stdout/stderr，避免音频突发日志填满管道 | 长测可区分媒体失败和停止失败 |
+
+#### 21.7.10 第二批验证记录
+
+使用 VS 18 Community x64 Debug 环境执行：
+
+```text
+test_mediaflow                 退出码 0
+test_mediaflow_media_nodes     退出码 0
+test_stream_decode              约 30 秒运行后停止流程返回
+```
+
+本次真实设备仍只建立一个 `rtsp://192.168.66.83/live/mainstream` 会话。由于设备/会话
+探测再次返回视频 `0x0`，FFmpeg 输出 `unspecified size`；MediaFlow 收到视频压缩包
+742 个但没有视频解码帧，音频收到并解码 6030 帧，Edge 丢弃和拒绝均为零。因此
+`test_stream_decode` 最终退出码为 `1`，原因是 A/V 双轨验收失败，而不是停止流程超时。
+
+停止阶段已经完整执行：Source 标记 finished，Graph 完成 Flush，Executor 和所有
+节点 Deinit 返回，测试控制器在停止后 15 秒窗口内没有强制终止进程。此次结果确认
+第二批已关闭“长时停止卡死”的 MediaFlow 生命周期问题，但没有关闭摄像头视频
+`0x0` 的触发原因。
+
+#### 21.7.11 第二批后的剩余问题
+
+1. **设备视频探测不稳定**：连续单路复测仍可能出现 H.264 `0x0`。当前 Decoder
+   会拒绝不完整 StreamInfo，避免错误打开解码器，但 Source 仍会继续接收该代次的
+   音频和视频压缩包；后续应在 Puller/Open 层增加视频轨道完整性判定和有界重探测，
+   或在确认视频元数据前暂缓该轨道进入 Router。
+2. **音频突发的业务策略**：本次 30 秒复测没有出现 Edge 丢弃，但设备在视频元数据
+   异常时产生高密度音频。后续仍需用模拟 Puller 注入音频突发和视频关键帧，验证
+   轨道级背压、关键帧保护及恢复窗口，而不能只依赖一次设备观测。
+3. **完整长时媒体验收**：待设备恢复稳定视频元数据后，再执行至少 10 分钟单路
+   RTSP 测试，记录首个视频包/帧延迟、generation、A/V 帧数及 Edge dropped/rejected。

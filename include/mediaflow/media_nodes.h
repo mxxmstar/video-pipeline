@@ -116,6 +116,7 @@ public:
     bool Init() override;
     bool Start() override;
     void StopProduction() override;
+    bool IsProductionStopped() const override;
     void Stop() override;
     void Deinit() override;
     std::string Name() const override;
@@ -131,6 +132,7 @@ public:
 
 private:
     void ReadLoop(std::uint64_t generation);
+    void RequestProductionStop();
     bool OpenGeneration(std::uint64_t generation);
     bool WaitBeforeReconnect();
     std::shared_ptr<const MediaStreamInfo> FindStreamInfo(

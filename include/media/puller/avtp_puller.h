@@ -137,6 +137,7 @@ public:
     bool Open(const Config& config);
 
     void Close() override;
+    void RequestStop() override;
 
     /// @brief 读取一个已经组好的媒体包。
     ///

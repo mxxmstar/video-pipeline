@@ -392,12 +392,16 @@ public:
     /// 打开边并清除上一个生命周期的排队消息。
     void Open() override {
         scheduled_.store(false);
+        drain_cancelled_.store(false);
         transport_->Open();
         metrics_->UpdateQueueSize(transport_->Size());
     }
 
     /// 关闭边并复位调度门闩。
     void Close() override {
+        // Drain 可能正在同一个 Executor 上批量提交消息。先设置取消标志，
+        // 让正在运行的 Drain 在下一轮检查时退出，再清空底层 Transport。
+        drain_cancelled_.store(true);
         transport_->Close();
         scheduled_.store(false);
         metrics_->UpdateQueueSize(transport_->Size());
@@ -414,6 +418,10 @@ public:
 private:
     /// 只负责投递 Drain，不直接在发送线程执行消息处理。
     void Schedule() override {
+        if (drain_cancelled_.load()) {
+            scheduled_.store(false);
+            return;
+        }
         bool expected = false;
         if (!scheduled_.compare_exchange_strong(expected, true)) {
             return;
@@ -441,6 +449,9 @@ private:
         std::size_t count = 0;
         metrics_->drain_batches.fetch_add(1);
         while (count < max_batch_size) {
+            if (drain_cancelled_.load()) {
+                break;
+            }
             if (count > 0 && options_.max_drain_time_us > 0 &&
                 std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - start_time).count() >=
@@ -463,7 +474,7 @@ private:
 
         metrics_->UpdateQueueSize(transport_->Size());
         scheduled_.store(false);
-        if (!transport_->Empty()) {
+        if (!drain_cancelled_.load() && !transport_->Empty()) {
             Schedule();
         }
     }
@@ -475,6 +486,7 @@ private:
     std::string edge_id_;                       ///< 源端口到目标端口的稳定标识。
     std::shared_ptr<EdgeMetrics> metrics_;      ///< 本边独立统计。
     std::atomic<bool> scheduled_{false};        ///< 防止重复投递 Drain。
+    std::atomic<bool> drain_cancelled_{false};  ///< 关闭阶段取消正在执行的 Drain。
 };
 
 /**
@@ -869,7 +881,8 @@ private:
         for (;;) {
             bool idle = true;
             for (const auto& id : node_order_) {
-                if (nodes_.at(id)->PendingTasks() != 0) {
+                if (!nodes_.at(id)->node->IsProductionStopped() ||
+                    nodes_.at(id)->PendingTasks() != 0) {
                     idle = false;
                     break;
                 }

@@ -599,6 +599,12 @@ void AvtpPuller::Close() {
     }
 }
 
+void AvtpPuller::RequestStop() {
+    if (capture_) {
+        capture_->RequestStop();
+    }
+}
+
 bool AvtpPuller::ProbeCodec() {
     // probe 会消费底层 raw packet，因此它复用正常 ReadPacket 路径。
     // 如果 probe 期间恰好组出完整 access unit，会放入 pending_packets_，

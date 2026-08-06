@@ -69,6 +69,11 @@ public:
     /// @brief 关闭网卡设备
     void Close();
 
+    /// @brief 请求停止抓包，但不等待抓包线程退出。
+    ///
+    /// Close() 会在后续生命周期阶段执行 join 和句柄释放。
+    void RequestStop();
+
     /// @brief 从队列读取一个包
     /// @param packet 输出参数，存储捕获到的原始数据包
     /// @return true 成功，false 超时或关闭

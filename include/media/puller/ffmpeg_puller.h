@@ -28,6 +28,7 @@ public:
 
     bool Open(const std::string& url) override;
     void Close() override;
+    void RequestStop() override;
     bool ReadPacket(std::shared_ptr<MediaPacket>& packet) override;
     PullReadResult ReadPacketResult() override;
     MultiStreamInfo GetStreamInfo() const override;

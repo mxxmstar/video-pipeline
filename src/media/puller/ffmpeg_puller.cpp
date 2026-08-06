@@ -201,7 +201,7 @@ bool FFmpegPuller::Open(const std::string& url) {
 }
 
 void FFmpegPuller::Close() {
-    interrupt_ctx_.interrupted = true;
+    RequestStop();
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (fmt_ctx_) {
         avformat_close_input(&fmt_ctx_);
@@ -216,6 +216,12 @@ void FFmpegPuller::Close() {
         av_packet_free(&pkt);
     }
     packet_pool_.clear();
+}
+
+void FFmpegPuller::RequestStop() {
+    // 中断回调只读取这个原子标志，因此请求停止不需要抢占 FFmpeg I/O 锁。
+    // Close() 会在后续安全阶段获取 io_mutex_ 并释放 AVFormatContext。
+    interrupt_ctx_.interrupted.store(true);
 }
 
 bool FFmpegPuller::ReadPacket(std::shared_ptr<MediaPacket>& packet) {

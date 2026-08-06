@@ -37,6 +37,11 @@ public:
     /// GracefulStop 会先调用该阶段，等待已经进入 Graph 的消息全部排空，
     /// 再调用 Flush/Stop。只有 SourceNode 一类的生产者通常需要覆写它。
     virtual void StopProduction() {}
+    /// 返回 StopProduction 请求后，节点是否已经不会再产生新消息。
+    ///
+    /// 普通节点默认没有独立生产线程；异步 Source 应在线程真正退出后返回
+    /// true，Graph 才能安全判断排空屏障已经封闭。
+    virtual bool IsProductionStopped() const { return true; }
     /// 在 pending barrier 内刷新节点内部缓存，并把尾部数据送往下游。
     /// 普通节点没有内部缓存时保持默认成功即可。
     virtual bool Flush() { return true; }
