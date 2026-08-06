@@ -466,7 +466,7 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P0-05</td><td><code>include/media/stream/stream_session.h</code>、<code>src/media/stream/stream_session.cpp</code></td><td>Stop 无法中断 CONNECTING；旧 handler 可进入新一代；多线程字段有数据竞争；StreamInfo 回调未快照；Stats 实际不更新</td><td>增加 lifecycle generation、所有状态可停止、回调快照、线程边界和真实原子统计；拆分 Prepare/StartReading</td><td>连接中停止、快速重启、断线重连和统计测试通过，无迟到 packet</td><td>部分完成<br>目录：A0、A1<br>详情：第 17.1、18.1 节</td></tr>
 <tr><td>M-P0-06</td><td><code>include/media/decoder/i_decoder.h</code>、<code>src/media/decoder/ffmpeg_decoder.cpp</code></td><td>Open 不清理旧 context；Close 隐式 flush；Graph 停止时可能与 Decode 并发</td><td>增加显式 Flush；Open 先关闭；Close 只释放或明确契约；节点 Executor 屏障后调用</td><td>重复 Open、flush 多帧、Stop during Decode 无崩溃和丢帧</td><td>已完成<br>目录：A0、A1<br>详情：第 17.1、18.1 节</td></tr>
 <tr><td>M-P0-07</td><td><code>include/media/encoder/i_encoder.h</code>、<code>src/media/encoder/ffmpeg_encoder.cpp</code></td><td>Frame 微秒 PTS 直接写入任意 codec time base；自动视频 time base 未考虑 fps_den；音频 FIFO PTS 固定按微秒累加；输出 packet 缺少 time_base 和 track</td><td>统一重标定；修正 fps time base；按 codec time base 累加音频；补完整 packet 元数据和统一输出描述</td><td>删除测试中的手工 time_base/stream_index 后仍可播放且 A/V 同步</td><td>部分完成<br>目录：A0、A2<br>详情：第 17.1、19.1 节</td></tr>
-<tr><td>M-P0-08</td><td><code>src/media/protocol/ffmpeg_mux_protocol.cpp</code></td><td>多轨使用 <code>av_write_frame</code>，独立音视频节点到达顺序不保证</td><td>使用 <code>av_interleaved_write_frame</code>，或实现有界 DTS 重排；保留单轨回归</td><td>独立音视频 Encoder 并发输入时无非单调 DTS 错误，输出可播放</td><td>已完成<br>目录：A3<br>详情：第 20.4 节</td></tr>
+<tr><td>M-P0-08</td><td><code>src/media/protocol/ffmpeg_mux_protocol.cpp</code></td><td>多轨使用 <code>av_write_frame</code>，独立音视频节点到达顺序不保证</td><td>使用 <code>av_interleaved_write_frame</code>，或实现有界 DTS 重排；保留多轨回归，本阶段性能验收不使用单轨</td><td>独立音视频 Encoder 并发输入时无非单调 DTS 错误，输出可播放</td><td>已完成<br>目录：A3<br>详情：第 20.4 节</td></tr>
 <tr><td>M-P0-09</td><td><code>src/media/publisher/default_publisher.cpp</code>、FFmpeg publish 路径</td><td>重连成功但等待关键帧时仍返回连接中断错误，DefaultPublisher 随即把 <code>started_</code> 置 false，后续关键帧无法恢复</td><td>区分 AwaitingKeyframe、RetryableFailure 和 Closed；只有 Publisher 真正关闭时清除 started</td><td>模拟断线，先送非关键帧再送关键帧能够恢复</td><td>已完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
 <tr><td>M-P0-10</td><td><code>src/media/protocol/rtsp_server_protocol_adapter.cpp</code></td><td>多个相同媒体类型/codec 的 track 回退时直接取第一个候选</td><td>与 FFmpeg adapter 一致，候选不唯一时拒绝并要求显式 track</td><td>双 H264 或双 AAC 轨道不会静默写错</td><td>部分完成<br>目录：A0、A3<br>详情：第 17.3、20.6 节</td></tr>
 <tr><td>MF-P0-01</td><td><code>include/mediaflow/core/graph.h</code>、<code>executor.h</code></td><td>缺少媒体 Graceful Stop 屏障和安全启动/停止顺序</td><td>增加拓扑生命周期顺序、在途任务等待和 Executor 上 flush；禁止控制线程自 join</td><td>编解码处理中停止、重复启动、启动失败回滚测试通过</td><td>已完成<br>目录：A3、A4-3<br>详情：第 20.3、21.7.9 节</td></tr>
@@ -497,7 +497,7 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-09</td><td><code>PublisherResult</code></td><td>增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
-<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18 节<br>后续：上一已提交版本的同配置性能对照</td></tr>
+<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：设备稳定后，使用同一双轨 RTSP 会话复测上一已提交版本</td></tr>
 <tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18 节<br>后续：真实 Decoder 丢包关键帧恢复和统一时钟调度</td></tr>
 </tbody>
 </table>
@@ -852,7 +852,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.18 节</td><td>容量边界、队列和活跃帧引用已通过两轮单路 600 秒复验；当前版本 CPU/吞吐基线已记录，改造前对照、真实 Decoder 关键帧恢复和统一时钟调度仍待实施</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.19 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本双轨 CPU/吞吐基线已记录，改造前对照因摄像头高温断流无效，真实 Decoder 关键帧恢复和统一时钟调度仍待实施</td></tr>
 </tbody>
 </table>
 
@@ -2071,28 +2071,88 @@ CAP-11 性能回归尚未完成：下一阶段建立同一机器、同一 URL、
 
 ##### 21.7.18.2 当前版本采集结果
 
-使用当前工作区构建的 `test_stream_decode --duration-ms 600000`，只建立一路
-`rtsp://192.168.66.83/live/mainstream` RTSP TCP 会话，结果如下：
+使用当前工作区构建的 `test_stream_decode --duration-ms 600000`，建立一个包含
+视频轨和音频轨的 RTSP TCP 会话：`rtsp://192.168.66.166/live/mainstream`。
+本次不使用单轨输入，结果如下：
 
 | 指标 | 当前版本结果 |
 |---|---:|
 | 稳定运行墙钟 | `600015 ms` |
-| 进程 CPU（单核等效） | `14.28%` |
-| 视频吞吐 | `24.95 fps`，停止前 `14973` 帧 |
-| 音频吞吐 | `52.22 fps`，停止前 `31335` 帧 |
-| 指标采样次数 | `119` |
-| 活跃帧峰值 | `4 wrappers / 3111040 packed bytes / 3140077 AVBuffer bytes` |
+| 进程 CPU（单核等效） | `13.60%` |
+| 视频吞吐 | `24.96 fps`，停止前 `14978` 帧 |
+| 音频吞吐 | `50.00 fps`，停止前 `30001` 帧 |
+| 指标采样次数 | `120` |
+| 活跃帧峰值 | `3 wrappers / 3111040 packed bytes / 3140077 AVBuffer bytes` |
 | 最终活跃帧 | `0 / 0 / 0` |
 | 最终 Edge 诊断 | dropped/rejected/timestamp `0` |
 
-完整日志：`build-mediaflow-vs/test_stream_decode_perf_current.out` 和
-`build-mediaflow-vs/test_stream_decode_perf_current.err`。本次运行 RSS 峰值约
-`43.7 MB`，结束前约 `39.8 MB`，没有与活跃帧或 Edge 队列同步单调增长。
+完整日志：`build-mediaflow-vs/test_stream_decode_perf_66166_current.out` 和
+`build-mediaflow-vs/test_stream_decode_perf_66166_current.err`。本次运行 RSS 峰值约
+`39.0 MiB`，没有与活跃帧或 Edge 队列同步单调增长，停止后活跃帧为 `0/0/0`。
 
 ##### 21.7.18.3 验收状态与后续
 
-CPU/吞吐采集能力和当前版本基线已完成，CAP-11 仍不能标记为最终通过，因为本轮
-没有在相同 URL、相同构建配置和相同设备状态下采集改造前对照值。下一步应从上一
-个已提交版本构建独立对照程序，至少各运行三轮，再按中位数比较 CPU 增量和 A/V
-吞吐；若差异超过 5%，再用采样开关或专用 profiler 分解内存统计、队列诊断和
-FFmpeg 帧 pack 的具体成本。
+CPU/吞吐采集能力和当前版本的 66.166 双轨基线已完成，CAP-11 仍不能标记为最终
+通过。上一已提交版本的双轨对照在约 73 秒时同时结束视频和音频输入，FFmpeg
+报告 `Failed reading RTSP data: End of file`；进程随后只是等待测试时长结束，最终
+得到视频 `1810` 帧、音频 `3662` 帧，不能作为 600 秒吞吐或 CPU 对照。结合现场
+判断，本次断流归因于摄像头高温不稳定，暂不归因于 MediaFlow，也不据此修改代码。
+设备冷却并确认稳定后，应在同一 URL、同一构建配置下串行运行至少三轮双轨 600 秒
+测试，再按中位数比较 CPU 增量和 A/V 吞吐；基线若再次中途断流，则该轮仍应标记
+为设备异常无效样本。
+
+#### 21.7.19 改造前双轨对照：摄像头高温导致样本无效
+
+本次对照只使用 `192.168.66.166/live/mainstream`，且每次只建立一个 RTSP
+会话；该会话在探测阶段明确包含 1 路视频和 1 路音频，不使用视频单轨或音频单轨
+测试。隔离构建基于提交 `fcd4a78`，除将测试 URL 指向 66.166 外没有修改 MediaFlow
+实现。
+
+对照先进行 10 秒双轨连通性验证：视频解码 `228` 帧，音频解码 `500` 帧，视频
+和音频 Edge 的 dropped、rejected、timestamp 诊断均为 `0`，说明当时输入确实是
+双轨且短时链路可用。
+
+随后进行 600 秒双轨长测。约 73 秒时，视频和音频同时停止增长，stderr 出现两条
+`Failed reading RTSP data: End of file`，Source 标记为 `finished=1`；截至断流前
+已解码视频 `1810` 帧、音频 `3662` 帧，Edge dropped/rejected/timestamp 仍为 `0`。
+程序因测试时长参数继续等待到约 `602790 ms` 后退出，外部采集到的单核 CPU
+`1.68%` 仅反映断流后的空等阶段，不具备性能比较意义。
+
+根据现场判断，设备处于高温状态导致 RTSP 会话不稳定。本条记录归类为测试环境的
+设备异常，不作为 MediaFlow 缺陷或单轨架构问题；本轮不修改代码，CAP-11 保持
+“待稳定设备复测”。复测前需先冷却或更换稳定设备，并继续遵守单设备单 RTSP
+会话、音视频双轨和串行测试约束。
+
+##### 21.7.19.1 备用复测方法：本机 FFmpeg 双轨循环推流
+
+为避免摄像头温度、网络和设备重启影响，可使用本机视频文件通过 FFmpeg 推送到
+本机 RTSP 服务，再让当前版本和 `fcd4a78` 基线分别拉取同一个本地 RTSP URL。
+本方法只记录为后续复测方案，本次未执行。
+
+已确认的视频目录为：
+`D:\file_mx\新建文件夹 (2)\初级go工程师训练营\17第十五周：支付服务设计与实现`。
+其中三段 MP4 均为双轨输入：H.264 视频 `1920x1242/25 fps` 加 AAC 音频
+`44100 Hz/2 channels`，时长约 2.8 至 3.1 小时，满足 600 秒长测需求。
+
+FFmpeg 位于：
+`D:\file_mx\aaaaa\learncpp\tools\win32\ffmpeg-2025-05-01-git-707c04fe06-full_build\ffmpeg.exe`。
+建议先启动本机 ZLMediaKit 的 RTSP 服务，并确认监听端口，例如 `554`；再使用
+以下命令循环、实时推送一段双轨文件，避免文件播放到尾部产生 EOS：
+
+```powershell
+& 'D:\file_mx\aaaaa\learncpp\tools\win32\zlmediakit\MediaServer.exe' '-c' 'D:\file_mx\aaaaa\learncpp\tools\win32\zlmediakit\config.ini'
+
+& 'D:\file_mx\aaaaa\learncpp\tools\win32\ffmpeg-2025-05-01-git-707c04fe06-full_build\ffmpeg.exe' `
+  '-re' '-stream_loop' '-1' `
+  '-i' 'D:\file_mx\新建文件夹 (2)\初级go工程师训练营\17第十五周：支付服务设计与实现\第四十九讲：支付服务实现（二） .mp4' `
+  '-map' '0:v:0' '-map' '0:a:0' '-c' 'copy' `
+  '-f' 'rtsp' '-rtsp_transport' 'tcp' `
+  'rtsp://127.0.0.1:554/mediaflow/benchmark'
+```
+
+推流建立后，将 `test_stream_decode` 的 URL 设置为
+`rtsp://127.0.0.1:554/mediaflow/benchmark`，分别运行当前版本和基线版本，
+每轮只保留一个拉流会话，测试结束后先停止拉流程序，再停止 FFmpeg 推流程序。
+验收仍要求视频和音频均被探测和解码，视频/音频 Edge 的 dropped、rejected、
+timestamp 均为 `0`，并完成 600 秒稳定吞吐和 CPU 采集；不使用视频单轨或音频
+单轨样本替代双轨结果。
