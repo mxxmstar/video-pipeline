@@ -478,6 +478,38 @@ void TestSingleVideoChainAndReconnectGeneration() {
     graph.Stop();
 }
 
+void TestDecoderRejectsIncompleteStreamInfo() {
+    auto decoder_state = std::make_shared<DecoderState>();
+    DecoderNode decoder(std::make_unique<RecordingDecoder>(decoder_state));
+
+    PortRegistry registry;
+    assert(decoder.RegisterPorts(registry));
+    assert(decoder.Init());
+    assert(decoder.Start());
+
+    // 模拟 FFmpeg 探测阶段返回的 H.264 轨道：codec 和 time_base 已知，
+    // 但视频尺寸仍为 0。DecoderNode 必须拒绝这条描述，不能把无效参数
+    // 交给具体 Decoder，也不能让测试误报为“已打开视频解码”。
+    MediaStreamInfo incomplete = MakeVideoInfo();
+    incomplete.detail = VideoStreamInfo{0, 0, 25.0F, PixelFormat::kUnknown};
+
+    MediaPacketMessage message;
+    message.packet = MakePacket(MediaType::VIDEO, 7, 0, CodecType::H264);
+    message.stream_info = std::make_shared<MediaStreamInfo>(incomplete);
+    message.generation = 1;
+    decoder.Input().Receive(std::move(message));
+
+    assert(decoder.LastError() == "stream info is incomplete for decoder open");
+    {
+        std::lock_guard<std::mutex> lock(decoder_state->mutex);
+        assert(decoder_state->open_count == 0);
+        assert(decoder_state->decode_count == 0);
+    }
+
+    decoder.Stop();
+    decoder.Deinit();
+}
+
 void TestEncoderAndPublisherChain() {
     auto encoder_state = std::make_shared<EncoderState>();
     auto publisher_state = std::make_shared<PublisherState>();
@@ -659,6 +691,7 @@ void TestMultiTrackPublisherAndGracefulEos() {
 
 int main() {
     TestSingleVideoChainAndReconnectGeneration();
+    TestDecoderRejectsIncompleteStreamInfo();
     TestEncoderAndPublisherChain();
     TestPublisherAwaitingKeyframeState();
     TestMultiTrackPublisherAndGracefulEos();

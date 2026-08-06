@@ -1333,3 +1333,34 @@ Could not find codec parameters for stream 0 (Video: h264, none): unspecified si
 
 在上述问题关闭前，`test_mediaflow` 和 `test_mediaflow_media_nodes` 可以作为本地回归
 测试通过，但不能代表真实摄像头 MediaFlow 链路已经完成长时稳定性验收。
+
+#### 21.7.7 第一批修复实施记录
+
+本批次先处理可以在 MediaFlow 边界内闭环的问题，改动如下：
+
+| 问题 | 修改内容 | 验证结果 |
+|---|---|---|
+| GracefulStop 超时预算按阶段累加 | `Graph::GracefulStop()` 在调用 `StopProduction()` 前建立统一的 `steady_clock` 截止时间；初始排空和每级 `Flush` 共用该截止时间，不再为每个节点重复分配完整 timeout | 代码已编译；现有 Graph/媒体节点测试通过 |
+| 视频 StreamInfo 为 `0x0` 仍尝试打开 Decoder | `DecoderNode::IsUsableStreamInfo()` 增加 detail 类型、视频宽高、音频采样率和通道数校验；不完整描述直接拒绝，底层 Decoder 不执行 `Open()`/`Decode()` | 新增 `TestDecoderRejectsIncompleteStreamInfo()`，测试通过 |
+| 测试无法区分元数据错误和 Decoder 打开成功 | 测试使用 `RecordingDecoder` 统计 `Open`、`Decode` 调用次数，并断言返回明确错误 `stream info is incomplete for decoder open` | `test_mediaflow_media_nodes` 退出码 `0` |
+
+#### 21.7.8 第一批修复验证记录
+
+使用 VS 18 Community x64 Debug 环境执行：
+
+```text
+test_mediaflow                 退出码 0
+test_mediaflow_media_nodes     退出码 0
+test_stream_decode              退出码 0（单路 RTSP，约 5 秒）
+```
+
+本次摄像头短测只建立一个 `rtsp://192.168.66.83/live/mainstream` 会话，保持现有
+测试配置。连接成功识别到视频 `1920x1080/25fps` 和音频 `16kHz/单声道`；停止前视频
+解码 65 帧、音频解码 176 帧，Source、Router、视频和音频 Edge 均未出现拒绝或丢弃。
+这次短测没有复现 `0x0` 元数据，也没有复现超过测试窗口的停止阻塞。
+
+本批次没有声称解决长时停止问题。`StreamSourceNode::StopProduction()` 当前仍会
+同步调用 `Stop()`，而 `Stop()` 需要等待读线程和 Puller 关闭；如果底层
+`av_read_frame()` 或 `avformat_close_input()` 不响应中断，Graph 仍可能在进入统一
+截止时间检查之前被阻塞。下一批应拆分“请求停止”和“等待线程退出”的语义，并增加
+Puller 关闭耗时、Source 线程状态和停止阶段队列指标，确保超时后有明确的降级路径。

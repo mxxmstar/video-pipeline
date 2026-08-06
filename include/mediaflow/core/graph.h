@@ -746,12 +746,19 @@ private:
 
         bool graceful_completed = true;
         if (graceful) {
+            // 生产者停止本身也属于停止过程的一部分；截止时间必须在调用
+            // StopProduction 前建立，不能只限制后面的排空/Flush 阶段。
+            const auto graceful_deadline =
+                std::chrono::steady_clock::now() + timeout;
+
             // 只停止生产者，不能在这里让 Decoder/Encoder 拒绝已经入队的消息。
             for (const auto& id : node_order_) {
                 nodes_.at(id)->node->StopProduction();
             }
 
-            graceful_completed = WaitForQuiescence(timeout);
+            // timeout 是整次 GracefulStop 的总预算，而不是每个节点各自拥有一
+            // 份预算。否则多个 Decoder/Encoder 会让停止时间按节点数量累加。
+            graceful_completed = WaitForQuiescence(graceful_deadline);
             if (graceful_completed) {
                 // 节点注册顺序就是媒体链路的构建顺序；媒体节点按此顺序逐级
                 // 刷新，保证上游刚产生的尾部消息仍有机会进入下游屏障。
@@ -760,7 +767,7 @@ private:
                         graceful_completed = false;
                         break;
                     }
-                    if (!WaitForQuiescence(timeout)) {
+                    if (!WaitForQuiescence(graceful_deadline)) {
                         graceful_completed = false;
                         break;
                     }
@@ -856,9 +863,9 @@ public:
     }
 
 private:
-    /// 等待节点任务和 Edge Drain 同时归零，避免 Flush 与 Decode/Encode 并发。
-    bool WaitForQuiescence(std::chrono::milliseconds timeout) const {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+    /// 等待节点任务和 Edge Drain 同时归零，且不超过整次停止的截止时间。
+    bool WaitForQuiescence(
+        std::chrono::steady_clock::time_point deadline) const {
         for (;;) {
             bool idle = true;
             for (const auto& id : node_order_) {
@@ -878,8 +885,7 @@ private:
             if (idle) {
                 return true;
             }
-            if (timeout.count() == 0 ||
-                std::chrono::steady_clock::now() >= deadline) {
+            if (std::chrono::steady_clock::now() >= deadline) {
                 return false;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));

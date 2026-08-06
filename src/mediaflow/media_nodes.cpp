@@ -533,7 +533,7 @@ bool DecoderNode::OpenForMessage(const MediaPacketMessage& message) {
         info = *message.stream_info;
     }
     if (!IsUsableStreamInfo(info)) {
-        SetError("stream info is unavailable for decoder open");
+        SetError("stream info is incomplete for decoder open");
         return false;
     }
 
@@ -566,10 +566,30 @@ bool DecoderNode::OpenForMessage(const MediaPacketMessage& message) {
 }
 
 bool DecoderNode::IsUsableStreamInfo(const MediaStreamInfo& info) const {
-    return (info.media_type == MediaType::VIDEO ||
-            info.media_type == MediaType::AUDIO) &&
-           info.codec_type != CodecType::UNKNOWN &&
-           IsValidTimeBase(info.time_base);
+    if ((info.media_type != MediaType::VIDEO &&
+         info.media_type != MediaType::AUDIO) ||
+        info.codec_type == CodecType::UNKNOWN ||
+        !IsValidTimeBase(info.time_base) ||
+        info.stream_index < 0) {
+        return false;
+    }
+
+    // FFmpeg 在网络探测尚未拿到 SPS/PPS 或音频参数时，可能返回 codec 已知但
+    // 尺寸/采样参数仍为 0 的 StreamInfo。这样的描述不能用于打开 Decoder：
+    // 继续 Open 会把一次探测不完整伪装成正常媒体流，随后只剩音频或静默无帧。
+    if (info.media_type == MediaType::VIDEO) {
+        if (!std::holds_alternative<VideoStreamInfo>(info.detail)) {
+            return false;
+        }
+        const auto& video = info.get_detail<VideoStreamInfo>();
+        return video.width > 0 && video.height > 0;
+    }
+
+    if (!std::holds_alternative<AudioStreamInfo>(info.detail)) {
+        return false;
+    }
+    const auto& audio = info.get_detail<AudioStreamInfo>();
+    return audio.sample_rate > 0 && audio.channels > 0;
 }
 
 bool DecoderNode::SameStream(const MediaStreamInfo& left,
