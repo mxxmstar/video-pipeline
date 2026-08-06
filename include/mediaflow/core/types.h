@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 /**
@@ -13,6 +14,64 @@
  * 一套节点和队列接口。
  */
 namespace mediaflow {
+
+/// @brief 队列成本中表示“没有可靠媒体时间戳”的统一值。
+///
+/// 该值与媒体模块的 kNoTimestamp 使用相同数值，但核心模块不依赖具体媒体类型。
+inline constexpr std::int64_t kNoQueueTimestamp =
+    (std::numeric_limits<std::int64_t>::min)();
+
+/// @brief 单条消息占用队列预算的成本。
+///
+/// bytes 表示本队列对消息载荷的逻辑计费，不推断 shared_ptr 在进程中的全局引用数。
+/// timestamp_us 和 duration_us 已统一换算为微秒；没有可靠时间戳时使用
+/// kNoQueueTimestamp，队列仍会继续使用 items/bytes 两个维度限流。
+struct QueueItemCost {
+    std::size_t bytes{0};
+    std::int64_t timestamp_us{kNoQueueTimestamp};
+    std::int64_t duration_us{0};
+    std::uint64_t generation{0};
+};
+
+/// @brief 队列的多维硬上限及水位配置。
+///
+/// 任一已启用维度达到上限都会触发对应背压策略。值为 0 表示该维度不启用；
+/// EdgeOptions 未显式配置任何维度时，会退回兼容的 capacity 消息数上限。
+struct QueueBudget {
+    std::size_t max_items{0};
+    std::size_t max_bytes{0};
+    std::int64_t max_span_us{0};
+    std::uint32_t high_watermark_percent{80};
+    std::uint32_t low_watermark_percent{60};
+
+    bool IsValid() const {
+        return max_span_us >= 0 && high_watermark_percent <= 100 &&
+               low_watermark_percent <= high_watermark_percent;
+    }
+};
+
+/// @brief 本次入队因哪一种容量约束受到影响。
+enum class QueueLimitReason {
+    None,
+    Items,
+    Bytes,
+    Span,
+    Oversized,
+};
+
+/// @brief QueueTransport 的线程安全状态快照。
+struct QueueMetricsSnapshot {
+    std::size_t items{0};
+    std::size_t bytes{0};
+    std::int64_t span_us{0};
+    std::size_t items_high_watermark{0};
+    std::size_t bytes_high_watermark{0};
+    std::int64_t span_high_watermark_us{0};
+    std::uint64_t limit_items{0};
+    std::uint64_t limit_bytes{0};
+    std::uint64_t limit_span{0};
+    std::uint64_t oversized{0};
+};
 
 /// 队列已满时的处理策略。
 enum class BackpressurePolicy {
@@ -50,6 +109,7 @@ struct EdgeOptions {
     BackpressurePolicy backpressure{BackpressurePolicy::DropNewest};
     std::size_t max_batch_size{32};                 ///< 一次 Drain 最多提交的消息数。
     std::int64_t max_drain_time_us{0};              ///< Drain 时间预算，0 表示不限制。
+    QueueBudget budget{};                            ///< 可选多维队列预算；全 0 时兼容 capacity。
 };
 
 /// 节点内部 Dispatch 队列的配置。

@@ -382,7 +382,8 @@ public:
         } else {
             transport_ = std::make_shared<QueueTransport<T>>(
                 options_.capacity,
-                options_.backpressure);
+                options_.backpressure,
+                options_.budget);
         }
 
         // Transport 会持有回调；回调不能再强引用 Transport，否则边销毁后会
@@ -657,8 +658,12 @@ public:
                            "Graph topology is frozen or lifecycle is active");
             return false;
         }
-        if (options.capacity == 0 || options.max_batch_size == 0 ||
-            options.max_drain_time_us < 0) {
+        const bool has_queue_limit = options.capacity > 0 ||
+            options.budget.max_items > 0 || options.budget.max_bytes > 0 ||
+            options.budget.max_span_us > 0;
+        if (options.max_batch_size == 0 || options.max_drain_time_us < 0 ||
+            !options.budget.IsValid() ||
+            (options.transport == TransportKind::Queue && !has_queue_limit)) {
             SetErrorLocked(FlowErrorCode::InvalidOptions,
                            "Edge capacity, batch size and drain budget are invalid");
             return false;

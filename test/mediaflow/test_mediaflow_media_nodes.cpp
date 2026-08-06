@@ -60,6 +60,57 @@ std::shared_ptr<MediaPacket> MakePacket(MediaType type,
     return packet;
 }
 
+void TestMediaQueueItemCostTraits() {
+    auto packet = MakePacket(MediaType::VIDEO, 7, 40, CodecType::H264);
+    packet->buffer = std::make_shared<SimpleBuffer>(
+        std::vector<std::uint8_t>{0, 1, 2, 3, 4, 5, 6});
+    packet->dts = 20;
+    packet->duration = 2;
+
+    MediaPacketMessage packet_message;
+    packet_message.packet = packet;
+    packet_message.generation = 3;
+    const auto packet_cost = QueueItemTraits<MediaPacketMessage>::Cost(packet_message);
+    assert(packet_cost.bytes == 7);
+    assert(packet_cost.timestamp_us == 20000);
+    assert(packet_cost.duration_us == 2000);
+    assert(packet_cost.generation == 3);
+    assert(QueueItemTraits<MediaPacketMessage>::IsVideo(packet_message));
+    assert(QueueItemTraits<MediaPacketMessage>::IsKeyframe(packet_message));
+
+    packet->dts = kNoTimestamp;
+    packet->pts = kNoTimestamp;
+    assert(QueueItemTraits<MediaPacketMessage>::Cost(packet_message).timestamp_us ==
+           kNoQueueTimestamp);
+
+    MediaPacketMessage eos_packet;
+    eos_packet.generation = 3;
+    eos_packet.eos = true;
+    const auto eos_packet_cost =
+        QueueItemTraits<MediaPacketMessage>::Cost(eos_packet);
+    assert(eos_packet_cost.bytes == 0);
+    assert(eos_packet_cost.timestamp_us == kNoQueueTimestamp);
+    assert(QueueItemTraits<MediaPacketMessage>::IsControl(eos_packet));
+
+    auto frame = std::make_shared<MediaFrame>();
+    frame->type = MediaType::AUDIO;
+    frame->time.pts_us = 50000;
+    frame->time.duration_us = 20000;
+    frame->buffer = std::make_shared<SimpleBuffer>(
+        std::vector<std::uint8_t>(12, 0));
+    MediaFrameMessage frame_message{frame, 4};
+    const auto frame_cost = QueueItemTraits<MediaFrameMessage>::Cost(frame_message);
+    assert(frame_cost.bytes == 12);
+    assert(frame_cost.timestamp_us == 50000);
+    assert(frame_cost.duration_us == 20000);
+    assert(frame_cost.generation == 4);
+    assert(QueueItemTraits<MediaFrameMessage>::IsAudio(frame_message));
+
+    MediaFrameMessage eos_frame{nullptr, 4, true};
+    assert(QueueItemTraits<MediaFrameMessage>::Cost(eos_frame).bytes == 0);
+    assert(QueueItemTraits<MediaFrameMessage>::IsControl(eos_frame));
+}
+
 class ScriptedPuller final : public IPuller {
 public:
     bool Open(const std::string&) override {
@@ -1046,6 +1097,7 @@ void TestMultiTrackPublisherAndGracefulEos() {
 } // namespace
 
 int main() {
+    TestMediaQueueItemCostTraits();
     TestSingleVideoChainAndReconnectGeneration();
     TestSourceTrackQueuesAreIndependent();
     TestDecoderRejectsIncompleteStreamInfo();

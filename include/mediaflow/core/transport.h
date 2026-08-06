@@ -7,8 +7,10 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <utility>
 
@@ -34,6 +36,7 @@ struct QueueItemTraits {
     static bool IsVideo(const T&) { return false; }
     static bool IsKeyframe(const T&) { return false; }
     static bool IsControl(const T&) { return false; }
+    static QueueItemCost Cost(const T&) { return {}; }
 };
 
 /**
@@ -47,6 +50,7 @@ class ITransport {
 public:
     using NotifyCallback = std::function<void()>;
     using SendResultCallback = std::function<void(MailboxPushResult)>;
+    using CapacityReasonCallback = std::function<void(QueueLimitReason)>;
 
     virtual ~ITransport() = default;
     /// 发送消息并返回精确的背压结果。
@@ -59,10 +63,14 @@ public:
     virtual void Close() = 0;
     virtual bool Empty() const = 0;
     virtual std::size_t Size() const = 0;
+    virtual QueueMetricsSnapshot Metrics() const { return {}; }
     /// 设置消息入队后触发的调度通知。
     virtual void SetNotifyCallback(NotifyCallback callback) = 0;
     /// 设置用于 NodeMetrics 统计的发送结果回调。
     virtual void SetSendResultCallback(SendResultCallback callback) = 0;
+    virtual void SetCapacityReasonCallback(CapacityReasonCallback callback) {
+        (void)callback;
+    }
 };
 
 /**
@@ -73,11 +81,12 @@ public:
  * 唤醒等待者，使停止流程不会永久阻塞在发送端。
  */
 template <typename T>
-class QueueTransport final : public ITransport<T> {
+class LegacyQueueTransport final : public ITransport<T> {
 public:
     /// capacity 为 0 时自动调整为 1，避免永远无法入队。
-    explicit QueueTransport(std::size_t capacity = 64,
-                            BackpressurePolicy policy = BackpressurePolicy::DropNewest)
+    explicit LegacyQueueTransport(
+        std::size_t capacity = 64,
+        BackpressurePolicy policy = BackpressurePolicy::DropNewest)
         : capacity_(capacity == 0 ? 1 : capacity),
           policy_(policy) {}
 
@@ -266,6 +275,383 @@ private:
  * 目标执行器，因此它只省略中间队列，不会让媒体处理逻辑意外跑在发送方
  * 线程中。它适合低延迟或明确要求无缓冲的边，不适合可能阻塞的网络写入。
  */
+template <typename T>
+class QueueTransport final : public ITransport<T> {
+public:
+    explicit QueueTransport(std::size_t capacity = 64,
+                            BackpressurePolicy policy = BackpressurePolicy::DropNewest,
+                            QueueBudget budget = {})
+        : policy_(policy), budget_(NormalizeBudget(capacity, budget)) {}
+
+    MailboxPushResult Send(T value) override {
+        const QueueItemCost cost = QueueItemTraits<T>::Cost(value);
+        MailboxPushResult result = MailboxPushResult::Closed;
+        QueueLimitReason reason = QueueLimitReason::None;
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (closed_) {
+                result = MailboxPushResult::Closed;
+            } else if (policy_ == BackpressurePolicy::Block) {
+                space_cv_.wait(lock, [this, &cost]() {
+                    return closed_ || FitsLocked(cost, nullptr);
+                });
+                if (!closed_) {
+                    AppendLocked(std::move(value), cost);
+                    result = MailboxPushResult::Accepted;
+                }
+            } else if (FitsLocked(cost, &reason)) {
+                AppendLocked(std::move(value), cost);
+                result = MailboxPushResult::Accepted;
+            } else {
+                RecordLimitLocked(reason);
+                if (policy_ == BackpressurePolicy::DropOldest) {
+                    if (MakeRoomByDroppingOldestLocked(value, cost, reason)) {
+                        AppendLocked(std::move(value), cost);
+                        result = MailboxPushResult::DroppedOldest;
+                    } else {
+                        result = MailboxPushResult::DroppedNewest;
+                    }
+                } else if (policy_ == BackpressurePolicy::PreferVideoKeyframes) {
+                    if (MakeRoomByPriorityLocked(value, cost, reason)) {
+                        AppendLocked(std::move(value), cost);
+                        result = MailboxPushResult::DroppedOldest;
+                    } else {
+                        result = MailboxPushResult::DroppedNewest;
+                    }
+                } else if (QueueItemTraits<T>::IsControl(value)) {
+                    result = MailboxPushResult::DroppedNewest;
+                    auto victim = FindNonControlLocked();
+                    if (victim != queue_.end()) {
+                        EraseLocked(victim);
+                        if (FitsLocked(cost, nullptr)) {
+                            AppendLocked(std::move(value), cost);
+                            result = MailboxPushResult::DroppedOldest;
+                        }
+                    }
+                } else {
+                    result = MailboxPushResult::DroppedNewest;
+                }
+            }
+        }
+
+        space_cv_.notify_all();
+        if (reason != QueueLimitReason::None && capacity_reason_callback_) {
+            capacity_reason_callback_(reason);
+        }
+        if (send_result_callback_) {
+            send_result_callback_(result);
+        }
+        if ((result == MailboxPushResult::Accepted ||
+             result == MailboxPushResult::DroppedOldest) && notify_callback_) {
+            notify_callback_();
+        }
+        return result;
+    }
+
+    std::optional<T> TryReceive() override {
+        std::optional<T> value;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!queue_.empty()) {
+                value.emplace(std::move(queue_.front().value));
+                EraseLocked(queue_.begin());
+            }
+        }
+        space_cv_.notify_all();
+        return value;
+    }
+
+    void Open() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            ClearCurrentLocked();
+            closed_ = false;
+        }
+        space_cv_.notify_all();
+    }
+
+    void Close() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+            ClearCurrentLocked();
+        }
+        space_cv_.notify_all();
+    }
+
+    bool Empty() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.empty();
+    }
+
+    std::size_t Size() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return queue_.size();
+    }
+
+    QueueMetricsSnapshot Metrics() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return MetricsLocked();
+    }
+
+    void SetNotifyCallback(typename ITransport<T>::NotifyCallback callback) override {
+        notify_callback_ = std::move(callback);
+    }
+
+    void SetSendResultCallback(typename ITransport<T>::SendResultCallback callback) override {
+        send_result_callback_ = std::move(callback);
+    }
+
+    void SetCapacityReasonCallback(
+        typename ITransport<T>::CapacityReasonCallback callback) override {
+        capacity_reason_callback_ = std::move(callback);
+    }
+
+    std::size_t Capacity() const { return budget_.max_items; }
+    const QueueBudget& Budget() const { return budget_; }
+
+private:
+    struct QueueEntry {
+        T value;
+        QueueItemCost cost;
+    };
+
+    struct TimeBounds {
+        std::multiset<std::int64_t> starts;
+        std::multiset<std::int64_t> ends;
+    };
+
+    static QueueBudget NormalizeBudget(std::size_t capacity, QueueBudget budget) {
+        if (budget.max_items == 0 && budget.max_bytes == 0 &&
+            budget.max_span_us == 0) {
+            budget.max_items = capacity == 0 ? 1 : capacity;
+        }
+        return budget;
+    }
+
+    static std::int64_t EndTimestamp(const QueueItemCost& cost) {
+        if (cost.timestamp_us == kNoQueueTimestamp || cost.duration_us <= 0) {
+            return cost.timestamp_us;
+        }
+        const auto max_value = (std::numeric_limits<std::int64_t>::max)();
+        return cost.timestamp_us > max_value - cost.duration_us
+                   ? max_value
+                   : cost.timestamp_us + cost.duration_us;
+    }
+
+    static std::int64_t Difference(std::int64_t start, std::int64_t end) {
+        if (end <= start) return 0;
+        const long double difference = static_cast<long double>(end) -
+                                       static_cast<long double>(start);
+        const auto max_value = (std::numeric_limits<std::int64_t>::max)();
+        return difference >= static_cast<long double>(max_value)
+                   ? max_value
+                   : static_cast<std::int64_t>(difference);
+    }
+
+    void AddCostLocked(const QueueItemCost& cost) {
+        const auto max_bytes = (std::numeric_limits<std::size_t>::max)();
+        bytes_ = cost.bytes > max_bytes - bytes_ ? max_bytes : bytes_ + cost.bytes;
+        if (cost.timestamp_us != kNoQueueTimestamp) {
+            auto& bounds = time_bounds_[cost.generation];
+            bounds.starts.insert(cost.timestamp_us);
+            bounds.ends.insert(EndTimestamp(cost));
+        }
+        RecomputeSpanLocked();
+    }
+
+    void RemoveCostLocked(const QueueItemCost& cost) {
+        bytes_ = cost.bytes > bytes_ ? 0 : bytes_ - cost.bytes;
+        if (cost.timestamp_us != kNoQueueTimestamp) {
+            auto bounds_it = time_bounds_.find(cost.generation);
+            if (bounds_it != time_bounds_.end()) {
+                auto& bounds = bounds_it->second;
+                auto start = bounds.starts.find(cost.timestamp_us);
+                if (start != bounds.starts.end()) bounds.starts.erase(start);
+                auto end = bounds.ends.find(EndTimestamp(cost));
+                if (end != bounds.ends.end()) bounds.ends.erase(end);
+                if (bounds.starts.empty()) time_bounds_.erase(bounds_it);
+            }
+        }
+        RecomputeSpanLocked();
+    }
+
+    void RecomputeSpanLocked() {
+        span_us_ = 0;
+        for (const auto& [generation, bounds] : time_bounds_) {
+            (void)generation;
+            if (!bounds.starts.empty() && !bounds.ends.empty()) {
+                span_us_ = std::max(span_us_, Difference(*bounds.starts.begin(),
+                                                         *bounds.ends.rbegin()));
+            }
+        }
+    }
+
+    std::int64_t SpanWithLocked(const QueueItemCost& cost) const {
+        if (cost.timestamp_us == kNoQueueTimestamp) return span_us_;
+
+        std::int64_t result = 0;
+        bool has_generation = false;
+        for (const auto& [generation, bounds] : time_bounds_) {
+            auto start = *bounds.starts.begin();
+            auto end = *bounds.ends.rbegin();
+            if (generation == cost.generation) {
+                has_generation = true;
+                start = std::min(start, cost.timestamp_us);
+                end = std::max(end, EndTimestamp(cost));
+            }
+            result = std::max(result, Difference(start, end));
+        }
+        if (!has_generation) {
+            result = std::max(result, Difference(cost.timestamp_us,
+                                                 EndTimestamp(cost)));
+        }
+        return result;
+    }
+
+    bool FitsLocked(const QueueItemCost& cost, QueueLimitReason* reason) const {
+        if (reason) *reason = QueueLimitReason::None;
+        if (budget_.max_items > 0 && queue_.size() >= budget_.max_items) {
+            if (reason) *reason = QueueLimitReason::Items;
+            return false;
+        }
+        if (budget_.max_bytes > 0) {
+            if (cost.bytes > budget_.max_bytes) {
+                if (reason) *reason = QueueLimitReason::Oversized;
+                return false;
+            }
+            if (bytes_ > budget_.max_bytes - cost.bytes) {
+                if (reason) *reason = QueueLimitReason::Bytes;
+                return false;
+            }
+        }
+        if (budget_.max_span_us > 0) {
+            const auto candidate_span = SpanWithLocked(cost);
+            if (candidate_span > budget_.max_span_us) {
+                const auto item_span = cost.timestamp_us == kNoQueueTimestamp
+                                           ? 0
+                                           : Difference(cost.timestamp_us,
+                                                        EndTimestamp(cost));
+                if (reason) {
+                    *reason = queue_.empty() && item_span > budget_.max_span_us
+                                  ? QueueLimitReason::Oversized
+                                  : QueueLimitReason::Span;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void AppendLocked(T value, const QueueItemCost& cost) {
+        queue_.push_back(QueueEntry{std::move(value), cost});
+        AddCostLocked(cost);
+        items_high_watermark_ = std::max(items_high_watermark_, queue_.size());
+        bytes_high_watermark_ = std::max(bytes_high_watermark_, bytes_);
+        span_high_watermark_us_ = std::max(span_high_watermark_us_, span_us_);
+    }
+
+    void EraseLocked(typename std::deque<QueueEntry>::iterator position) {
+        RemoveCostLocked(position->cost);
+        queue_.erase(position);
+    }
+
+    void ClearCurrentLocked() {
+        queue_.clear();
+        time_bounds_.clear();
+        bytes_ = 0;
+        span_us_ = 0;
+    }
+
+    typename std::deque<QueueEntry>::iterator FindNonControlLocked() {
+        return std::find_if(queue_.begin(), queue_.end(),
+            [](const QueueEntry& entry) {
+                return !QueueItemTraits<T>::IsControl(entry.value);
+            });
+    }
+
+    void RecordLimitLocked(QueueLimitReason reason) {
+        switch (reason) {
+        case QueueLimitReason::Items: ++limit_items_; break;
+        case QueueLimitReason::Bytes: ++limit_bytes_; break;
+        case QueueLimitReason::Span: ++limit_span_; break;
+        case QueueLimitReason::Oversized: ++oversized_; break;
+        case QueueLimitReason::None: break;
+        }
+    }
+
+    bool MakeRoomByDroppingOldestLocked(const T& value,
+                                        const QueueItemCost& cost,
+                                        QueueLimitReason reason) {
+        if (reason == QueueLimitReason::Oversized) return false;
+        while (!FitsLocked(cost, nullptr)) {
+            auto victim = QueueItemTraits<T>::IsControl(value)
+                              ? FindNonControlLocked()
+                              : queue_.begin();
+            if (victim == queue_.end()) return false;
+            EraseLocked(victim);
+        }
+        return true;
+    }
+
+    bool MakeRoomByPriorityLocked(const T& value,
+                                  const QueueItemCost& cost,
+                                  QueueLimitReason reason) {
+        if (reason == QueueLimitReason::Oversized ||
+            QueueItemTraits<T>::IsAudio(value)) {
+            return false;
+        }
+        while (!FitsLocked(cost, nullptr)) {
+            auto victim = queue_.end();
+            if (QueueItemTraits<T>::IsControl(value)) {
+                victim = FindNonControlLocked();
+            } else if (QueueItemTraits<T>::IsVideo(value)) {
+                victim = std::find_if(queue_.begin(), queue_.end(),
+                    [](const QueueEntry& entry) {
+                        return QueueItemTraits<T>::IsAudio(entry.value);
+                    });
+                if (victim == queue_.end() &&
+                    QueueItemTraits<T>::IsKeyframe(value)) {
+                    victim = std::find_if(queue_.begin(), queue_.end(),
+                        [](const QueueEntry& entry) {
+                            return QueueItemTraits<T>::IsVideo(entry.value) &&
+                                   !QueueItemTraits<T>::IsKeyframe(entry.value);
+                        });
+                }
+            }
+            if (victim == queue_.end()) return false;
+            EraseLocked(victim);
+        }
+        return true;
+    }
+
+    QueueMetricsSnapshot MetricsLocked() const {
+        return {queue_.size(), bytes_, span_us_, items_high_watermark_,
+                bytes_high_watermark_, span_high_watermark_us_, limit_items_,
+                limit_bytes_, limit_span_, oversized_};
+    }
+
+    BackpressurePolicy policy_;
+    QueueBudget budget_;
+    mutable std::mutex mutex_;
+    std::condition_variable space_cv_;
+    std::deque<QueueEntry> queue_;
+    std::map<std::uint64_t, TimeBounds> time_bounds_;
+    std::size_t bytes_{0};
+    std::int64_t span_us_{0};
+    std::size_t items_high_watermark_{0};
+    std::size_t bytes_high_watermark_{0};
+    std::int64_t span_high_watermark_us_{0};
+    std::uint64_t limit_items_{0};
+    std::uint64_t limit_bytes_{0};
+    std::uint64_t limit_span_{0};
+    std::uint64_t oversized_{0};
+    bool closed_{false};
+    typename ITransport<T>::NotifyCallback notify_callback_;
+    typename ITransport<T>::SendResultCallback send_result_callback_;
+    typename ITransport<T>::CapacityReasonCallback capacity_reason_callback_;
+};
+
 template <typename T>
 class ExecutorDispatchTransport final : public ITransport<T> {
 public:

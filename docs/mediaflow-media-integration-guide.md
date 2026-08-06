@@ -1696,7 +1696,7 @@ struct QueueBudget {
 
 struct QueueItemCost {
     std::size_t bytes{0};
-    std::int64_t timestamp_us{kNoTimestamp};
+    std::int64_t timestamp_us{kNoQueueTimestamp};
     std::int64_t duration_us{0};
     std::uint64_t generation{0};
 };
@@ -1791,3 +1791,38 @@ recommended_bytes = bitrate_bits_per_second / 8
 
 每个“待执行”项完成后必须改为“通过”或“未通过”，并附测试命令、关键配置和
 指标摘要。存在失败时保留原始结果和原因，不能只覆盖为最新一次成功数据。
+
+##### 21.7.16.7 C1+C2 第一批实施记录
+
+本批完成容量控制的基础契约和队列记账，代码已接入现有 Graph，但未修改实时摄像头
+测试的默认 `2048/8192` 消息数配置。未显式设置 `EdgeOptions::budget` 时，
+`capacity` 继续作为兼容的 `max_items` 硬上限；设置任意 `max_bytes` 或 `max_span_us`
+后，消息数维度可以保持关闭。
+
+实施内容：
+
+- 在 `include/mediaflow/core/types.h` 增加 `QueueBudget`、`QueueItemCost`、
+  `QueueLimitReason` 和 `QueueMetricsSnapshot`；校验水位百分比关系及非负时间跨度。
+- 在 `QueueTransport` 中为每条消息保存成本，维护当前 `items`、`bytes`、按
+  `(generation)` 分组的有效时间跨度，以及三类高水位和容量触发累计计数。
+- Push、Pop、DropOldest、DropNewest、Open、Close 均同步更新记账；超大单包不会
+  突破 `max_bytes` 或 `max_span_us`，并单独累计 `oversized`。
+- `MediaPacketMessage` 使用 DTS 优先、PTS 兜底并按 packet `time_base` 换算微秒；
+  `MediaFrameMessage` 直接使用微秒时间戳。两者均按 shared buffer 的逻辑载荷计费，
+  EOS 和无时间戳消息不伪造时间跨度。
+- Graph 将 `EdgeOptions::budget` 透传给队列，同时保留普通类型零成本 traits 和
+  原有 Edge 聚合初始化方式。
+
+本批验证结果：
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| C1 成本契约 | 通过 | `test_mediaflow_media_nodes` 的 `TestMediaQueueItemCostTraits` 验证音频、视频、EOS、无时间戳和 time base 换算 |
+| C2 多维记账 | 通过 | `test_mediaflow` 的 `TestQueueBudgetAccounting` 验证 items/bytes/span、DropOldest、超大单包、generation 隔离和 Open/Close 清零 |
+| CAP-01 | 通过 | `test_mediaflow.exe` 退出码 `0`；当前值与队列内容一致，高水位和累计限制计数保留 |
+| CAP-02 | 通过 | 10 字节上限、50/100 微秒时间跨度上限及超大消息测试均未突破硬上限 |
+| CAP-03 至 CAP-11 | 待执行 | 需要后续 C3-C7 实施和现场长测，不能由本批单元测试代替 |
+
+本批构建环境为 VS 18 Community x64 Debug；执行目标为 `test_mediaflow` 和
+`test_mediaflow_media_nodes`，两个程序退出码均为 `0`。本批没有执行摄像头拉流，
+遵守设备只允许一路 RTSP 会话的约束。

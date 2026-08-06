@@ -11,6 +11,30 @@
 #include <utility>
 #include <vector>
 
+struct CostedMessage {
+    std::size_t bytes{0};
+    std::int64_t timestamp_us{mediaflow::kNoQueueTimestamp};
+    std::int64_t duration_us{0};
+    std::uint64_t generation{0};
+};
+
+namespace mediaflow {
+
+template <>
+struct QueueItemTraits<::CostedMessage> {
+    static bool IsAudio(const ::CostedMessage&) { return false; }
+    static bool IsVideo(const ::CostedMessage&) { return false; }
+    static bool IsKeyframe(const ::CostedMessage&) { return false; }
+    static bool IsControl(const ::CostedMessage&) { return false; }
+
+    static QueueItemCost Cost(const ::CostedMessage& message) {
+        return {message.bytes, message.timestamp_us, message.duration_us,
+                message.generation};
+    }
+};
+
+} // namespace mediaflow
+
 namespace {
 
 using namespace mediaflow;
@@ -344,6 +368,74 @@ void TestQueueBackpressure() {
     close_transport.Open();
     assert(close_transport.Send(13) == MailboxPushResult::Accepted);
     assert(close_transport.TryReceive().value() == 13);
+}
+
+void TestQueueBudgetAccounting() {
+    QueueBudget bytes_budget;
+    bytes_budget.max_items = 8;
+    bytes_budget.max_bytes = 10;
+    bytes_budget.max_span_us = 100;
+
+    QueueTransport<CostedMessage> byte_queue(
+        8, BackpressurePolicy::DropNewest, bytes_budget);
+    assert(byte_queue.Send({4, 100, 10, 1}) == MailboxPushResult::Accepted);
+    assert(byte_queue.Send({5, 150, 20, 1}) == MailboxPushResult::Accepted);
+    auto snapshot = byte_queue.Metrics();
+    assert(snapshot.items == 2);
+    assert(snapshot.bytes == 9);
+    assert(snapshot.span_us == 70);
+    assert(byte_queue.Send({2, 200, 20, 1}) ==
+           MailboxPushResult::DroppedNewest);
+    snapshot = byte_queue.Metrics();
+    assert(snapshot.items == 2 && snapshot.bytes == 9);
+    assert(snapshot.limit_bytes == 1);
+
+    QueueTransport<CostedMessage> drop_oldest(
+        8, BackpressurePolicy::DropOldest, bytes_budget);
+    assert(drop_oldest.Send({4, 100, 10, 1}) == MailboxPushResult::Accepted);
+    assert(drop_oldest.Send({5, 150, 20, 1}) == MailboxPushResult::Accepted);
+    assert(drop_oldest.Send({2, 200, 20, 1}) ==
+           MailboxPushResult::DroppedOldest);
+    snapshot = drop_oldest.Metrics();
+    assert(snapshot.items == 2);
+    assert(snapshot.bytes == 7);
+    assert(snapshot.span_us == 70);
+
+    QueueBudget span_budget;
+    span_budget.max_items = 8;
+    span_budget.max_span_us = 50;
+    QueueTransport<CostedMessage> span_queue(
+        8, BackpressurePolicy::DropOldest, span_budget);
+    assert(span_queue.Send({1, 100, 10, 1}) == MailboxPushResult::Accepted);
+    assert(span_queue.Send({1, 130, 10, 1}) == MailboxPushResult::Accepted);
+    assert(span_queue.Send({1, 170, 10, 1}) ==
+           MailboxPushResult::DroppedOldest);
+    snapshot = span_queue.Metrics();
+    assert(snapshot.items == 2);
+    assert(snapshot.span_us == 50);
+    assert(snapshot.limit_span == 1);
+
+    // 不同 generation 的时间轴不能拼接为一个跨重连的大跨度。
+    assert(span_queue.Send({1, 5000000, 10, 2}) ==
+           MailboxPushResult::Accepted);
+    snapshot = span_queue.Metrics();
+    assert(snapshot.span_us == 50);
+
+    QueueBudget oversized_budget;
+    oversized_budget.max_bytes = 10;
+    QueueTransport<CostedMessage> oversized_queue(
+        8, BackpressurePolicy::DropOldest, oversized_budget);
+    assert(oversized_queue.Send({11, 0, 0, 1}) ==
+           MailboxPushResult::DroppedNewest);
+    snapshot = oversized_queue.Metrics();
+    assert(snapshot.items == 0 && snapshot.bytes == 0);
+    assert(snapshot.oversized == 1);
+
+    span_queue.Close();
+    snapshot = span_queue.Metrics();
+    assert(snapshot.items == 0 && snapshot.bytes == 0 && snapshot.span_us == 0);
+    span_queue.Open();
+    assert(span_queue.Send({1, 0, 10, 3}) == MailboxPushResult::Accepted);
 }
 
 void TestVideoPriorityBackpressure() {
@@ -725,6 +817,7 @@ void TestGraphStartStopStart() {
 
 int main() {
     TestQueueBackpressure();
+    TestQueueBudgetAccounting();
     TestVideoPriorityBackpressure();
     TestVideoPriorityDispatchQueue();
     TestVideoPriorityExecutorDispatch();

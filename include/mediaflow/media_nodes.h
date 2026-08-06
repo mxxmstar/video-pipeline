@@ -17,9 +17,11 @@
 #include "media/publisher/i_publisher.h"
 
 #include <atomic>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -70,6 +72,75 @@ struct QueueItemTraits<MediaPacketMessage> {
 
     static bool IsControl(const MediaPacketMessage& message) {
         return message.eos;
+    }
+
+    static QueueItemCost Cost(const MediaPacketMessage& message) {
+        QueueItemCost cost;
+        cost.generation = message.generation;
+        if (!message.packet || message.eos) {
+            return cost;
+        }
+
+        const auto& packet = *message.packet;
+        cost.bytes = packet.buffer ? packet.buffer->Size() : 0;
+        const auto timestamp = IsValidTimestamp(packet.dts)
+                                   ? packet.dts
+                                   : packet.pts;
+        cost.timestamp_us = ToMicroseconds(timestamp, packet.time_base);
+        cost.duration_us = ToMicroseconds(packet.duration, packet.time_base);
+        return cost;
+    }
+
+private:
+    static std::int64_t ToMicroseconds(std::int64_t timestamp,
+                                       const Rational& time_base) {
+        if (!IsValidTimestamp(timestamp) || !IsValidTimeBase(time_base)) {
+            return kNoQueueTimestamp;
+        }
+        const long double value = static_cast<long double>(timestamp) *
+                                   static_cast<long double>(time_base.num) *
+                                   1000000.0L /
+                                   static_cast<long double>(time_base.den);
+        const auto min_value = (std::numeric_limits<std::int64_t>::min)();
+        const auto max_value = (std::numeric_limits<std::int64_t>::max)();
+        if (value <= static_cast<long double>(min_value)) return min_value;
+        if (value >= static_cast<long double>(max_value)) return max_value;
+        return static_cast<std::int64_t>(value);
+    }
+};
+
+/// 解码帧按已经统一为微秒的 MediaTime 计费，避免核心队列重新解释 time base。
+template <>
+struct QueueItemTraits<MediaFrameMessage> {
+    static bool IsAudio(const MediaFrameMessage& message) {
+        return message.frame && message.frame->type == MediaType::AUDIO;
+    }
+
+    static bool IsVideo(const MediaFrameMessage& message) {
+        return message.frame && message.frame->type == MediaType::VIDEO;
+    }
+
+    static bool IsKeyframe(const MediaFrameMessage&) { return false; }
+
+    static bool IsControl(const MediaFrameMessage& message) {
+        return message.eos;
+    }
+
+    static QueueItemCost Cost(const MediaFrameMessage& message) {
+        QueueItemCost cost;
+        cost.generation = message.generation;
+        if (!message.frame || message.eos) {
+            return cost;
+        }
+        cost.bytes = message.frame->buffer ? message.frame->buffer->Size() : 0;
+        cost.timestamp_us = IsValidTimestamp(message.frame->time.pts_us)
+                                ? message.frame->time.pts_us
+                                : kNoQueueTimestamp;
+        cost.duration_us = IsValidTimestamp(message.frame->time.duration_us)
+                               ? std::max<std::int64_t>(
+                                     0, message.frame->time.duration_us)
+                               : 0;
+        return cost;
     }
 };
 
