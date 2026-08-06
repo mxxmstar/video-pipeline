@@ -226,6 +226,8 @@ struct EdgeMetrics {
                !queue_span_high_watermark_us.compare_exchange_weak(
                    previous_span, state.span_us)) {
         }
+        std::lock_guard<std::mutex> lock(budget_mutex_);
+        budget_snapshot_ = state;
     }
 
     EdgeMetricsSnapshot Snapshot() const {
@@ -240,12 +242,16 @@ struct EdgeMetrics {
             queue_size.load(),
             queue_high_watermark.load(),
         };
-        snapshot.budget = QueueMetricsSnapshot{
-            queue_size.load(), queue_bytes.load(), queue_span_us.load(),
-            queue_high_watermark.load(), queue_bytes_high_watermark.load(),
-            queue_span_high_watermark_us.load(), 0, 0, 0, 0};
+        {
+            std::lock_guard<std::mutex> lock(budget_mutex_);
+            snapshot.budget = budget_snapshot_;
+        }
         return snapshot;
     }
+
+private:
+    mutable std::mutex budget_mutex_;
+    QueueMetricsSnapshot budget_snapshot_{};
 };
 
 /**

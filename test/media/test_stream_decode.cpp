@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -92,6 +93,46 @@ void PrintGraphError(const Graph& graph, const std::string& operation) {
     std::cerr << operation << " failed: " << error.message << "\n";
 }
 
+EdgeOptions MakeRealtimeEdgeOptions(QueueTrack track,
+                                    std::size_t max_items,
+                                    std::uint64_t bitrate_bits_per_second,
+                                    std::int64_t max_span_us,
+                                    BackpressurePolicy backpressure,
+                                    std::size_t max_batch_size) {
+    EdgeOptions options;
+    options.transport = TransportKind::Queue;
+    options.capacity = max_items;
+    options.backpressure = backpressure;
+    options.max_batch_size = max_batch_size;
+    options.budget = QueueBudget::FromBitrate(
+        max_items, bitrate_bits_per_second, max_span_us);
+    options.track = track;
+    return options;
+}
+
+void PrintEdgeDiagnostics(const char* name, const EdgeMetricsSnapshot& metrics) {
+    const auto& budget = metrics.budget;
+    std::cout << "  " << name
+              << ": accepted=" << metrics.accepted
+              << ", dropped_newest=" << metrics.dropped_newest
+              << ", dropped_oldest=" << metrics.dropped_oldest
+              << ", rejected=" << metrics.rejected
+              << ", queue=(items=" << budget.items
+              << ", bytes=" << budget.bytes
+              << ", span_us=" << budget.span_us
+              << ", high=" << budget.items_high_watermark << "/"
+              << budget.bytes_high_watermark << "/"
+              << budget.span_high_watermark_us
+              << ", watermarks=" << budget.high_watermark_enters << "/"
+              << budget.high_watermark_leaves
+              << ", limits=" << budget.limit_items << "/"
+              << budget.limit_bytes << "/" << budget.limit_span
+              << ", oversized=" << budget.oversized
+              << ", keyframes=" << budget.dropped_keyframes
+              << ", timestamps=" << budget.timestamp_invalid << "/"
+              << budget.timestamp_discontinuity << ")\n";
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -123,31 +164,25 @@ int main(int argc, char* argv[]) {
     auto executor = std::make_shared<AsioExecutor>("stream-decode", 2);
 
     // 真实 RTSP 拉流器可能一次性读出网络接收缓冲区中的一段历史数据，
-    // 因此 Source 在启动初期会短暂快于 Decoder。音频和视频入口现在使用
-    // 两条独立的有界队列：音频突发只能消耗 audio 边的容量，不能再占用
-    // video 边的槽位；视频边仍使用关键帧保护策略，避免启动突发破坏恢复窗口。
+    // 因此 Source 在启动初期会短暂快于 Decoder。压缩包预算由目标积压时间、
+    // 预估码率和 2 倍突发系数计算，max_items 只作为码率未知和异常时间戳时的
+    // 兜底；不能再把 2048/8192 当作所有设备和所有场景的固定默认值。
     NodeOptions decode_node_options{
         NodeExecutionMode::Serialized,
         4096};
     decode_node_options.prefer_video_keyframes = true;
-    const EdgeOptions video_packet_edge_options{
-        TransportKind::Queue,
-        2048,
-        BackpressurePolicy::PreferVideoKeyframes,
-        64,
-        0};
-    const EdgeOptions audio_packet_edge_options{
-        TransportKind::Queue,
-        8192,
-        BackpressurePolicy::DropNewest,
-        128,
-        0};
-    const EdgeOptions frame_edge_options{
-        TransportKind::Queue,
-        1024,
-        BackpressurePolicy::DropNewest,
-        64,
-        0};
+    const auto video_packet_edge_options = MakeRealtimeEdgeOptions(
+        QueueTrack::Video, 256, 16000000, 1000000,
+        BackpressurePolicy::PreferVideoKeyframes, 64);
+    const auto audio_packet_edge_options = MakeRealtimeEdgeOptions(
+        QueueTrack::Audio, 512, 384000, 500000,
+        BackpressurePolicy::DropOldest, 128);
+    // 解码后的原始帧不适合根据压缩码率估算字节数。这里使用帧数和媒体时间
+    // 窗口限流，待 PipelineBuilder 能获得像素格式和分辨率后再补充原始帧字节预算。
+    const auto video_frame_edge_options = MakeRealtimeEdgeOptions(
+        QueueTrack::Video, 8, 0, 250000, BackpressurePolicy::DropOldest, 8);
+    const auto audio_frame_edge_options = MakeRealtimeEdgeOptions(
+        QueueTrack::Audio, 64, 0, 500000, BackpressurePolicy::DropOldest, 32);
     Graph graph;
 
     // Graph 会先启动 Router、Decoder 和统计 Sink，最后才启动 Source 并打开
@@ -205,9 +240,9 @@ int main(int argc, char* argv[]) {
             "router", "audio", "audio-decoder", "in",
             audio_packet_edge_options) ||
         !graph.Connect<MediaFrameMessage>(
-            "video-decoder", "video-counter", frame_edge_options) ||
+            "video-decoder", "video-counter", video_frame_edge_options) ||
         !graph.Connect<MediaFrameMessage>(
-            "audio-decoder", "audio-counter", frame_edge_options)) {
+            "audio-decoder", "audio-counter", audio_frame_edge_options)) {
         PrintGraphError(graph, "connect mediaflow graph");
         return 1;
     }
@@ -327,15 +362,12 @@ int main(int argc, char* argv[]) {
     std::cout << "Graph metrics: source(processed=" << source_metrics.processed
               << ", rejected=" << source_metrics.rejected
               << "), router(processed=" << router_metrics.processed
-              << ", rejected=" << router_metrics.rejected
-              << "), edges(source_video=" << source_video_edge_metrics.accepted
-              << "/" << source_video_edge_metrics.dropped_newest
-              << ", source_audio=" << source_audio_edge_metrics.accepted
-              << "/" << source_audio_edge_metrics.dropped_newest
-              << ", video=" << video_edge_metrics.accepted
-              << "/" << video_edge_metrics.dropped_newest
-              << ", audio=" << audio_edge_metrics.accepted
-              << "/" << audio_edge_metrics.dropped_newest << ")\n";
+              << ", rejected=" << router_metrics.rejected << ")\n";
+    std::cout << "Edge diagnostics:\n";
+    PrintEdgeDiagnostics("source-video", source_video_edge_metrics);
+    PrintEdgeDiagnostics("source-audio", source_audio_edge_metrics);
+    PrintEdgeDiagnostics("router-video", video_edge_metrics);
+    PrintEdgeDiagnostics("router-audio", audio_edge_metrics);
     if (source) {
         std::cout << "Source state: generation=" << source->Generation()
                   << ", finished=" << source->Finished() << "\n";

@@ -378,6 +378,7 @@ void TestQueueBackpressure() {
     assert(drop_newest.Send(2) == MailboxPushResult::Accepted);
     assert(drop_newest.Send(3) == MailboxPushResult::DroppedNewest);
     assert(drop_newest.Size() == 2);
+    assert(drop_newest.Metrics().limit_items == 1);
 
     // DropOldest 淘汰最早进入队列的消息，让最新数据及时进入管线。
     QueueTransport<int> drop_oldest(2, BackpressurePolicy::DropOldest);
@@ -505,6 +506,63 @@ void TestTrackBudgetIsolationAndControlRetention() {
     assert(video_snapshot.bytes == 9);
     assert(video_snapshot.span_us == 80000);
     assert(audio_snapshot.items == 2);
+}
+
+void TestQueueDiagnosticsAndBudgetFormula() {
+    const auto video_budget = QueueBudget::FromBitrate(
+        64, 8000000, 1000000);
+    assert(video_budget.max_items == 64);
+    assert(video_budget.max_bytes == 2000000);
+    assert(video_budget.max_span_us == 1000000);
+    const auto audio_budget = QueueBudget::FromBitrate(
+        128, 256000, 500000);
+    assert(audio_budget.max_bytes == 32000);
+    const auto unknown_bitrate_budget = QueueBudget::FromBitrate(
+        16, 0, 250000);
+    assert(unknown_bitrate_budget.max_bytes == 0);
+
+    QueueBudget watermark_budget;
+    watermark_budget.max_items = 4;
+    watermark_budget.max_bytes = 16;
+    watermark_budget.max_span_us = 100;
+    watermark_budget.high_watermark_percent = 50;
+    watermark_budget.low_watermark_percent = 25;
+    QueueTransport<CostedMessage> watermark_queue(
+        4, BackpressurePolicy::DropNewest, watermark_budget);
+    assert(watermark_queue.Send({4, 100, 10, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(watermark_queue.Send({4, 120, 10, 1}) ==
+           MailboxPushResult::Accepted);
+    auto snapshot = watermark_queue.Metrics();
+    assert(snapshot.high_watermark_active);
+    assert(snapshot.high_watermark_enters == 1);
+    assert(snapshot.high_watermark_leaves == 0);
+    assert(watermark_queue.TryReceive().has_value());
+    snapshot = watermark_queue.Metrics();
+    assert(!snapshot.high_watermark_active);
+    assert(snapshot.high_watermark_leaves == 1);
+
+    QueueTransport<CostedMessage> timestamp_queue(8);
+    assert(timestamp_queue.Send({4, kNoQueueTimestamp, 0, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({4, 100, 10, 1}) ==
+           MailboxPushResult::Accepted);
+    assert(timestamp_queue.Send({4, 50, 10, 1}) ==
+           MailboxPushResult::Accepted);
+    snapshot = timestamp_queue.Metrics();
+    assert(snapshot.timestamp_invalid == 1);
+    assert(snapshot.timestamp_discontinuity == 1);
+
+    QueueTransport<MediaPacketMessage> keyframe_queue(
+        1, BackpressurePolicy::PreferVideoKeyframes);
+    assert(keyframe_queue.Send(MakeCostedMediaMessage(
+               MediaType::VIDEO, 0, 40, 4)) == MailboxPushResult::Accepted);
+    assert(keyframe_queue.Send(MakeCostedMediaMessage(
+               MediaType::VIDEO, 40, 40, 4)) ==
+           MailboxPushResult::DroppedNewest);
+    snapshot = keyframe_queue.Metrics();
+    assert(snapshot.limit_items == 1);
+    assert(snapshot.dropped_keyframes == 1);
 }
 
 void TestVideoPriorityBackpressure() {
@@ -910,6 +968,8 @@ void TestMediaEdgeAndDispatchInflightMetrics() {
     assert(edge_snapshot.budget.bytes == 7);
     assert(edge_snapshot.budget.span_us == 80000);
     assert(edge_snapshot.budget.items_high_watermark == 2);
+    assert(edge_snapshot.budget.high_watermark_enters == 1);
+    assert(edge_snapshot.budget.dropped_keyframes == 1);
     assert(edge_snapshot.dropped_newest == 1);
     assert(node_snapshot.pending.items == 1);
     assert(node_snapshot.pending.bytes == 2);
@@ -973,6 +1033,7 @@ int main() {
     TestQueueBackpressure();
     TestQueueBudgetAccounting();
     TestTrackBudgetIsolationAndControlRetention();
+    TestQueueDiagnosticsAndBudgetFormula();
     TestVideoPriorityBackpressure();
     TestVideoPriorityDispatchQueue();
     TestVideoPriorityExecutorDispatch();

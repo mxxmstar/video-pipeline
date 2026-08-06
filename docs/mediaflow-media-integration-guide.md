@@ -852,7 +852,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算的 C1-C4 已完成</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C4：多维预算、控制消息保护和 Edge/Dispatch 在途快照；C5-C7 与现场验收待实施</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16 节</td><td>已完成 C1-C6：多维预算、控制消息保护、在途快照、队列诊断和实时解码接入；C7 与现场验收待实施</td></tr>
 </tbody>
 </table>
 
@@ -1785,9 +1785,9 @@ recommended_bytes = bitrate_bits_per_second / 8
 | CAP-01 至 CAP-02：成本与硬上限 | 通过 | `TestQueueBudgetAccounting` 与 `TestMediaQueueItemCostTraits` 已覆盖 items/bytes/span、超大包、generation、EOS 和无时间戳成本 |
 | CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 验证独立音频/视频预算；尚未执行 30 秒 10 倍音频突发和关键帧恢复解码 |
 | CAP-04 至 CAP-05：实时延迟与视频恢复 | 待执行 | 仍需阻塞恢复后的低水位验证，以及关键帧后依赖窗口的解码恢复测试 |
-| CAP-06：时间戳异常 | 部分通过 | 已覆盖无时间戳、DTS/PTS 换算和跨 generation span 隔离；回退时间戳与 discontinuity 测试待补 |
+| CAP-06：时间戳异常 | 部分通过 | 已覆盖无时间戳、DTS/PTS 换算、跨 generation span 隔离和回退诊断计数；discontinuity 的时间窗口重建待补 |
 | CAP-07：EOS 与停止 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 和 `TestVideoPriorityDispatchQueue` 验证 EOS 在 Queue/Dispatch 满载时替换普通媒体任务；Block 被关闭唤醒和三类上限组合停止待补 |
-| CAP-08：总在途可观测性 | 部分通过 | `TestMediaEdgeAndDispatchInflightMetrics` 核对 `edge_queue + node_pending` 的 items/bytes/span；多 Edge 聚合与诊断指标待 C5 完成 |
+| CAP-08：总在途可观测性 | 部分通过 | `TestMediaEdgeAndDispatchInflightMetrics` 核对 `edge_queue + node_pending` 的 items/bytes/span；C5 已补充队列诊断，跨多 Edge 汇总待上层 Pipeline 接入 |
 | CAP-09：生命周期回归 | 待执行 | 记录 100 次 Start/Stop、现有测试集退出码和内存变化 |
 | CAP-10：摄像头长测 | 待执行 | 只使用一路 RTSP，记录至少 10 分钟的五秒采样数据和最终停止结果 |
 | CAP-11：性能回归 | 待执行 | 记录同一机器、同一流、同一构建配置下改造前后的 CPU/吞吐对比 |
@@ -1858,10 +1858,52 @@ recommended_bytes = bitrate_bits_per_second / 8
 | C3 分轨背压与 EOS 保护 | 通过 | `TestTrackBudgetIsolationAndControlRetention` 验证音频队列满载后 EOS 保留、视频独立预算仍可接收；`TestVideoPriorityDispatchQueue` 验证 Dispatch 中 EOS 不被音频和关键帧替换策略淘汰 |
 | C4 Edge/Dispatch 在途快照 | 通过 | `TestMediaEdgeAndDispatchInflightMetrics` 在阻塞视频 Sink 时核对 Edge `2 items/7 bytes/80000 us`、Node `1 item/2 bytes/40000 us`，并在排空后确认当前值归零 |
 | CAP-03 | 部分通过 | 已具备独立预算和控制消息保护；尚缺 30 秒 10 倍音频突发和关键帧恢复解码验证 |
-| CAP-06 | 部分通过 | generation 与无时间戳基线已覆盖；回退时间戳和 discontinuity 待 C7 补测 |
+| CAP-06 | 部分通过 | generation、无时间戳和回退时间戳诊断已覆盖；discontinuity 的时间窗口重建待 C7 补测 |
 | CAP-07 | 部分通过 | Queue 与 Dispatch 的 EOS 满载保护已覆盖；Block 关闭唤醒和停止组合测试待 C7 补测 |
-| CAP-08 | 部分通过 | 单 Edge 到单 Node 的总在途核对已覆盖；多 Edge 汇总和诊断分类待 C5 补齐 |
+| CAP-08 | 部分通过 | 单 Edge 到单 Node 的总在途核对已覆盖；多 Edge 汇总待上层 Pipeline 接入 |
 
 本批构建环境为 VS 18 Community x64 Debug。执行 `test_mediaflow.exe` 和
 `test_mediaflow_media_nodes.exe`，退出码均为 `0`；未连接摄像头，避免占用设备唯一的
 RTSP 会话。
+
+##### 21.7.16.9 C5+C6 第三批实施记录
+
+本批将队列满载从“只看到 `dropped_newest`”推进到可按容量原因、关键帧和时间戳
+诊断，并把第一条真实 RTSP 解码图改为显式的分轨预算配置。预算计算不改变
+`QueueTransport` 的调用方式，其他 Graph 可以继续使用原有 `capacity`，或按自己的
+码率和目标延迟创建 `QueueBudget`。
+
+实施内容：
+
+- `QueueMetricsSnapshot` 增加当前是否处于高水位、进入/离开高水位累计次数、被丢弃
+  的关键帧数、无时间戳数和时间戳回退数；原有 items/bytes/span 高水位及
+  items/bytes/span/oversized 容量原因继续保留。
+- `QueueTransport` 在入队、出队、淘汰和 Open/Close 清理时维护高低水位状态。控制消息
+  不计入时间戳异常；带媒体成本的普通消息缺少时间戳或相同 generation 的时间戳回退时，
+  分别记录 `timestamp_invalid` 和 `timestamp_discontinuity`，但本批不擅自重写其
+  时间轴语义。
+- 所有通过 `QueueTransport` 的诊断快照完整透传至 `EdgeMetricsSnapshot::budget`，避免
+  Edge 监控只能看到当前 items/bytes/span 而丢失容量和媒体原因计数。
+- `QueueBudget::FromBitrate(max_items, bitrate, max_span_us, safety_percent)` 以
+  `bitrate * span * safety / 8` 向上取整生成 `max_bytes`，保留 `max_items` 和
+  `max_span_us`；码率为零时只启用消息数与时间维度。
+- `test_stream_decode` 的视频压缩包边配置为 `16 Mbps / 1000 ms / 256 items`，音频为
+  `384 kbps / 500 ms / 512 items`，均使用 2 倍突发系数。音频实时边改为
+  `DropOldest`；视频仍使用 `PreferVideoKeyframes`。视频和音频解码帧边分别配置
+  items/span，未用压缩码率错误推算原始帧字节数。
+- `test_stream_decode` 最终输出四条压缩包 Edge 的诊断明细，包括当前队列、三个历史
+  高水位、进出水位次数、容量原因、超大包、关键帧和时间戳计数。
+
+本批验证结果：
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| C5 队列诊断 | 通过 | `TestQueueDiagnosticsAndBudgetFormula` 验证高/低水位进出、关键帧丢弃、无时间戳、时间戳回退和容量原因；`TestMediaEdgeAndDispatchInflightMetrics` 验证完整快照透传到 Edge |
+| C6 实时解码配置接入 | 通过 | `test_stream_decode` 已按音频、视频、压缩包、解码帧四类边建立独立预算并成功编译；配置由 `QueueBudget::FromBitrate` 生成，不再采用固定 `2048/8192` 默认值 |
+| CAP-06 | 部分通过 | 已记录异常和回退；discontinuity 的时间窗口重建、变码率和跨 generation 压力回归待 C7 完成 |
+| CAP-08 | 部分通过 | 单 Edge 与 Node pending 的核对、Edge 容量诊断均已完成；多 Edge 汇总待 Pipeline 上层入口实施 |
+| CAP-10 至 CAP-11 | 待执行 | 未连接摄像头，未执行 10 分钟单路长测和性能基准，以免影响设备唯一 RTSP 会话 |
+
+本批构建环境为 VS 18 Community x64 Debug。已构建 `test_mediaflow`、
+`test_mediaflow_media_nodes` 和 `test_stream_decode`；前两个测试程序退出码均为 `0`。
+`test_stream_decode` 未运行，未产生摄像头会话。

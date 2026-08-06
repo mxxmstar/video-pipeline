@@ -56,6 +56,39 @@ struct QueueBudget {
         return max_span_us >= 0 && high_watermark_percent <= 100 &&
                low_watermark_percent <= high_watermark_percent;
     }
+
+    /// @brief 按目标积压时间和码率估算字节硬上限。
+    ///
+    /// max_items 仍是码率未知、突发变码率或时间戳不可用时的兜底上限；bitrate 为
+    /// 0 时只启用 items/span 两个维度。结果向上取整并在 size_t 上限处饱和。
+    static QueueBudget FromBitrate(std::size_t max_items,
+                                   std::uint64_t bitrate_bits_per_second,
+                                   std::int64_t max_span_us,
+                                   std::uint32_t burst_safety_percent = 200) {
+        QueueBudget budget;
+        budget.max_items = max_items;
+        budget.max_span_us = max_span_us;
+        if (bitrate_bits_per_second == 0 || max_span_us <= 0 ||
+            burst_safety_percent == 0) {
+            return budget;
+        }
+
+        const long double bytes =
+            static_cast<long double>(bitrate_bits_per_second) *
+            static_cast<long double>(max_span_us) *
+            static_cast<long double>(burst_safety_percent) /
+            (8.0L * 1000000.0L * 100.0L);
+        const auto max_value = (std::numeric_limits<std::size_t>::max)();
+        if (bytes >= static_cast<long double>(max_value)) {
+            budget.max_bytes = max_value;
+            return budget;
+        }
+        budget.max_bytes = static_cast<std::size_t>(bytes);
+        if (static_cast<long double>(budget.max_bytes) < bytes) {
+            ++budget.max_bytes;
+        }
+        return budget;
+    }
 };
 
 /// @brief 本次入队因哪一种容量约束受到影响。
@@ -79,6 +112,12 @@ struct QueueMetricsSnapshot {
     std::uint64_t limit_bytes{0};
     std::uint64_t limit_span{0};
     std::uint64_t oversized{0};
+    bool high_watermark_active{false};
+    std::uint64_t high_watermark_enters{0};
+    std::uint64_t high_watermark_leaves{0};
+    std::uint64_t dropped_keyframes{0};
+    std::uint64_t timestamp_invalid{0};
+    std::uint64_t timestamp_discontinuity{0};
 };
 
 /// 队列已满时的处理策略。

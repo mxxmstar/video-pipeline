@@ -285,13 +285,17 @@ public:
 
     MailboxPushResult Send(T value) override {
         const QueueItemCost cost = QueueItemTraits<T>::Cost(value);
+        const bool is_control = QueueItemTraits<T>::IsControl(value);
         MailboxPushResult result = MailboxPushResult::Closed;
         QueueLimitReason reason = QueueLimitReason::None;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (closed_) {
                 result = MailboxPushResult::Closed;
-            } else if (policy_ == BackpressurePolicy::Block) {
+            } else {
+                RecordTimestampLocked(cost, is_control);
+            }
+            if (!closed_ && policy_ == BackpressurePolicy::Block) {
                 space_cv_.wait(lock, [this, &cost]() {
                     return closed_ || FitsLocked(cost, nullptr);
                 });
@@ -299,10 +303,10 @@ public:
                     AppendLocked(std::move(value), cost);
                     result = MailboxPushResult::Accepted;
                 }
-            } else if (FitsLocked(cost, &reason)) {
+            } else if (!closed_ && FitsLocked(cost, &reason)) {
                 AppendLocked(std::move(value), cost);
                 result = MailboxPushResult::Accepted;
-            } else {
+            } else if (!closed_) {
                 RecordLimitLocked(reason);
                 if (policy_ == BackpressurePolicy::DropOldest) {
                     if (MakeRoomByDroppingOldestLocked(value, cost, reason)) {
@@ -322,6 +326,7 @@ public:
                     result = MailboxPushResult::DroppedNewest;
                     auto victim = FindNonControlLocked();
                     if (victim != queue_.end()) {
+                        RecordDroppedItemLocked(*victim);
                         EraseLocked(victim);
                         if (FitsLocked(cost, nullptr)) {
                             AppendLocked(std::move(value), cost);
@@ -331,6 +336,10 @@ public:
                 } else {
                     result = MailboxPushResult::DroppedNewest;
                 }
+            }
+            if (result == MailboxPushResult::DroppedNewest &&
+                QueueItemTraits<T>::IsKeyframe(value)) {
+                ++dropped_keyframes_;
             }
         }
 
@@ -449,6 +458,84 @@ private:
                    : static_cast<std::int64_t>(difference);
     }
 
+    static bool ReachesPercent(std::size_t value,
+                                std::size_t limit,
+                                std::uint32_t percent) {
+        return value > 0 && limit > 0 &&
+               static_cast<long double>(value) * 100.0L >=
+                   static_cast<long double>(limit) * percent;
+    }
+
+    static bool ReachesPercent(std::int64_t value,
+                                std::int64_t limit,
+                                std::uint32_t percent) {
+        return value > 0 && limit > 0 &&
+               static_cast<long double>(value) * 100.0L >=
+                   static_cast<long double>(limit) * percent;
+    }
+
+    static bool ExceedsPercent(std::size_t value,
+                               std::size_t limit,
+                               std::uint32_t percent) {
+        return limit > 0 && static_cast<long double>(value) * 100.0L >
+                                static_cast<long double>(limit) * percent;
+    }
+
+    static bool ExceedsPercent(std::int64_t value,
+                               std::int64_t limit,
+                               std::uint32_t percent) {
+        return limit > 0 && static_cast<long double>(value) * 100.0L >
+                                static_cast<long double>(limit) * percent;
+    }
+
+    bool AtOrAboveHighWatermarkLocked() const {
+        return ReachesPercent(queue_.size(), budget_.max_items,
+                               budget_.high_watermark_percent) ||
+               ReachesPercent(bytes_, budget_.max_bytes,
+                               budget_.high_watermark_percent) ||
+               ReachesPercent(span_us_, budget_.max_span_us,
+                               budget_.high_watermark_percent);
+    }
+
+    bool AtOrBelowLowWatermarkLocked() const {
+        return !ExceedsPercent(queue_.size(), budget_.max_items,
+                               budget_.low_watermark_percent) &&
+               !ExceedsPercent(bytes_, budget_.max_bytes,
+                               budget_.low_watermark_percent) &&
+               !ExceedsPercent(span_us_, budget_.max_span_us,
+                               budget_.low_watermark_percent);
+    }
+
+    void UpdateWatermarkStateLocked() {
+        if (!high_watermark_active_ && AtOrAboveHighWatermarkLocked()) {
+            high_watermark_active_ = true;
+            ++high_watermark_enters_;
+        } else if (high_watermark_active_ && AtOrBelowLowWatermarkLocked()) {
+            high_watermark_active_ = false;
+            ++high_watermark_leaves_;
+        }
+    }
+
+    void RecordTimestampLocked(const QueueItemCost& cost, bool is_control) {
+        if (is_control) return;
+        if (cost.timestamp_us == kNoQueueTimestamp) {
+            if (cost.bytes > 0 || cost.duration_us > 0) {
+                ++timestamp_invalid_;
+            }
+            return;
+        }
+
+        auto [it, inserted] = latest_timestamp_by_generation_.try_emplace(
+            cost.generation, cost.timestamp_us);
+        if (!inserted) {
+            if (cost.timestamp_us < it->second) {
+                ++timestamp_discontinuity_;
+            } else {
+                it->second = cost.timestamp_us;
+            }
+        }
+    }
+
     void AddCostLocked(const QueueItemCost& cost) {
         const auto max_bytes = (std::numeric_limits<std::size_t>::max)();
         bytes_ = cost.bytes > max_bytes - bytes_ ? max_bytes : bytes_ + cost.bytes;
@@ -549,18 +636,22 @@ private:
         items_high_watermark_ = std::max(items_high_watermark_, queue_.size());
         bytes_high_watermark_ = std::max(bytes_high_watermark_, bytes_);
         span_high_watermark_us_ = std::max(span_high_watermark_us_, span_us_);
+        UpdateWatermarkStateLocked();
     }
 
     void EraseLocked(typename std::deque<QueueEntry>::iterator position) {
         RemoveCostLocked(position->cost);
         queue_.erase(position);
+        UpdateWatermarkStateLocked();
     }
 
     void ClearCurrentLocked() {
         queue_.clear();
         time_bounds_.clear();
+        latest_timestamp_by_generation_.clear();
         bytes_ = 0;
         span_us_ = 0;
+        UpdateWatermarkStateLocked();
     }
 
     typename std::deque<QueueEntry>::iterator FindNonControlLocked() {
@@ -580,6 +671,12 @@ private:
         }
     }
 
+    void RecordDroppedItemLocked(const QueueEntry& entry) {
+        if (QueueItemTraits<T>::IsKeyframe(entry.value)) {
+            ++dropped_keyframes_;
+        }
+    }
+
     bool MakeRoomByDroppingOldestLocked(const T& value,
                                         const QueueItemCost& cost,
                                         QueueLimitReason reason) {
@@ -588,6 +685,7 @@ private:
             // 控制边界不能被普通低延迟消息淘汰；没有普通消息可换时拒绝当前消息。
             auto victim = FindNonControlLocked();
             if (victim == queue_.end()) return false;
+            RecordDroppedItemLocked(*victim);
             EraseLocked(victim);
         }
         return true;
@@ -619,6 +717,7 @@ private:
                 }
             }
             if (victim == queue_.end()) return false;
+            RecordDroppedItemLocked(*victim);
             EraseLocked(victim);
         }
         return true;
@@ -627,7 +726,10 @@ private:
     QueueMetricsSnapshot MetricsLocked() const {
         return {queue_.size(), bytes_, span_us_, items_high_watermark_,
                 bytes_high_watermark_, span_high_watermark_us_, limit_items_,
-                limit_bytes_, limit_span_, oversized_};
+                limit_bytes_, limit_span_, oversized_, high_watermark_active_,
+                high_watermark_enters_, high_watermark_leaves_,
+                dropped_keyframes_, timestamp_invalid_,
+                timestamp_discontinuity_};
     }
 
     BackpressurePolicy policy_;
@@ -636,6 +738,7 @@ private:
     std::condition_variable space_cv_;
     std::deque<QueueEntry> queue_;
     std::map<std::uint64_t, TimeBounds> time_bounds_;
+    std::map<std::uint64_t, std::int64_t> latest_timestamp_by_generation_;
     std::size_t bytes_{0};
     std::int64_t span_us_{0};
     std::size_t items_high_watermark_{0};
@@ -645,6 +748,12 @@ private:
     std::uint64_t limit_bytes_{0};
     std::uint64_t limit_span_{0};
     std::uint64_t oversized_{0};
+    bool high_watermark_active_{false};
+    std::uint64_t high_watermark_enters_{0};
+    std::uint64_t high_watermark_leaves_{0};
+    std::uint64_t dropped_keyframes_{0};
+    std::uint64_t timestamp_invalid_{0};
+    std::uint64_t timestamp_discontinuity_{0};
     bool closed_{false};
     typename ITransport<T>::NotifyCallback notify_callback_;
     typename ITransport<T>::SendResultCallback send_result_callback_;
