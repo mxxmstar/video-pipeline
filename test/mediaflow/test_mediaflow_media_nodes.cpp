@@ -711,6 +711,41 @@ private:
     EncodedTrackInfo info_;
 };
 
+/// 双轨压缩包源：故意让 PTS 显示顺序与 DTS 解码顺序交叉，验证 Publisher
+/// 节点实际使用 MediaFlow 的 DTS 交织器，而不是按两个输入 Edge 的到达顺序写出。
+class DtsOrderPacketSource final : public SourceNode<EncodedPacketMessage> {
+public:
+    DtsOrderPacketSource(int track_id,
+                         EncodedTrackInfo info,
+                         std::vector<std::pair<std::int64_t, std::int64_t>> times)
+        : track_id_(track_id), info_(std::move(info)), times_(std::move(times)) {}
+
+    std::string Name() const override {
+        return "dts-order-source";
+    }
+
+    bool Start() override {
+        for (const auto& [pts, dts] : times_) {
+            auto packet = MakePacket(info_.media_type, track_id_, pts,
+                                     info_.codec_type);
+            packet->dts = dts;
+            packet->pts = pts;
+            packet->time_base = info_.time_base;
+            packet->keyframe = info_.media_type == MediaType::VIDEO && pts == 0;
+            Emit(EncodedPacketMessage{
+                packet, info_, track_id_, 1, false});
+        }
+        Emit(EncodedPacketMessage{
+            nullptr, info_, track_id_, 1, true});
+        return true;
+    }
+
+private:
+    int track_id_;
+    EncodedTrackInfo info_;
+    std::vector<std::pair<std::int64_t, std::int64_t>> times_;
+};
+
 bool WaitForPublished(const std::shared_ptr<PublisherState>& state,
                       std::size_t count) {
     std::unique_lock<std::mutex> lock(state->mutex);
@@ -1221,6 +1256,73 @@ void TestMultiTrackPublisherAndGracefulEos() {
     assert(graph.GetState() == Graph::State::Stopped);
 }
 
+void TestPublisherInterleavesMultipleTracksByDts() {
+    auto publisher_state = std::make_shared<PublisherState>();
+    auto executor = std::make_shared<AsioExecutor>("publisher-dts-order-test", 2);
+
+    EncodedTrackInfo video_info;
+    video_info.media_type = MediaType::VIDEO;
+    video_info.codec_type = CodecType::H264;
+    video_info.time_base = Rational{1, 1000};
+    video_info.width = 640;
+    video_info.height = 360;
+    video_info.fps = 25.0F;
+    video_info.extra_data = {0x01, 0x64, 0x00, 0x1f};
+
+    EncodedTrackInfo audio_info;
+    audio_info.media_type = MediaType::AUDIO;
+    audio_info.codec_type = CodecType::AAC;
+    audio_info.time_base = Rational{1, 1000};
+    audio_info.sample_rate = 48000;
+    audio_info.channels = 2;
+
+    PublisherConfig publisher_config;
+    publisher_config.url = "recording://dts-order-publisher";
+    publisher_config.protocol = PublishProtocol::FfmpegMux;
+    publisher_config.tracks = {
+        MediaTrackConfig{1, MediaType::VIDEO, CodecType::H264,
+                         640, 360, 25.0F, 0, 0, 1, 1000,
+                         video_info.extra_data},
+        MediaTrackConfig{2, MediaType::AUDIO, CodecType::AAC,
+                         0, 0, 0.0F, 48000, 2, 1, 1000, {}}
+    };
+
+    PublisherSinkNodeOptions options{true, true, 32};
+    options.enable_dts_interleaving = true;
+    options.dts_interleaver.max_pending_packets = 2;
+    options.dts_interleaver.max_pending_span_us = 0;
+
+    Graph graph;
+    assert(graph.AddNode<DtsOrderPacketSource>(
+        "video-source", executor, NodeOptions{}, 1, video_info,
+        std::vector<std::pair<std::int64_t, std::int64_t>>{
+            {0, 0}, {40, 20}}));
+    assert(graph.AddNode<DtsOrderPacketSource>(
+        "audio-source", executor, NodeOptions{}, 2, audio_info,
+        std::vector<std::pair<std::int64_t, std::int64_t>>{
+            {10, 10}, {30, 30}}));
+    assert(graph.AddNode<PublisherSinkNode>(
+        "publisher", executor, NodeOptions{}, publisher_config,
+        std::make_unique<RecordingPublisher>(publisher_state), options));
+    assert(graph.Connect<EncodedPacketMessage>("video-source", "publisher"));
+    assert(graph.Connect<EncodedPacketMessage>("audio-source", "publisher"));
+    assert(graph.Start());
+
+    assert(WaitForPublished(publisher_state, 4));
+    assert(WaitForPublisherStop(publisher_state));
+
+    std::vector<std::int64_t> dts;
+    {
+        std::lock_guard<std::mutex> lock(publisher_state->mutex);
+        for (const auto& packet : publisher_state->packets) {
+            dts.push_back(packet.dts * 1000);
+        }
+    }
+    // 视频关键帧首先作为发布锚点发送；其余包由交织器按微秒 DTS 输出。
+    assert((dts == std::vector<std::int64_t>{0, 10'000, 20'000, 30'000}));
+    graph.Stop();
+}
+
 } // namespace
 
 int main() {
@@ -1233,5 +1335,6 @@ int main() {
     TestEncoderAndPublisherChain();
     TestPublisherAwaitingKeyframeState();
     TestMultiTrackPublisherAndGracefulEos();
+    TestPublisherInterleavesMultipleTracksByDts();
     return 0;
 }

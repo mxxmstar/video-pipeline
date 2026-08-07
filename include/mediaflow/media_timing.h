@@ -9,7 +9,7 @@
  * OpenGL 或音频设备。
  */
 
-#include "media/media_packet.h"
+#include "media/encoder/i_encoder.h"
 
 #include <chrono>
 #include <cstddef>
@@ -171,6 +171,10 @@ private:
 struct DtsPacket {
     std::shared_ptr<MediaPacket> packet;
     MediaTiming timing;
+    /// Publisher 需要保留 Encoder 的轨道描述，不能只靠 packet 推断采样率、
+    /// extradata 等配置。交织器本身不修改这些字段，只在排序时携带它们。
+    EncodedTrackInfo track_info;
+    int track_id{0};
     std::uint64_t generation{0};
 
     bool Valid() const {

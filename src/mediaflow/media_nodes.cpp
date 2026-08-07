@@ -1089,7 +1089,8 @@ PublisherSinkNode::PublisherSinkNode(
     PublisherSinkNodeOptions options)
     : config_(std::move(config)),
       publisher_(std::move(publisher)),
-      options_(options) {}
+      options_(options),
+      dts_interleaver_(options_.dts_interleaver) {}
 
 PublisherSinkNode::~PublisherSinkNode() {
     Deinit();
@@ -1109,6 +1110,7 @@ bool PublisherSinkNode::Start() {
     active_generation_ = 0;
     publisher_started_ = false;
     awaiting_keyframe_ = options_.wait_for_keyframe_on_start;
+    dts_interleaver_.Reset();
     pending_packets_.clear();
     seen_track_ids_.clear();
     eos_track_ids_.clear();
@@ -1130,6 +1132,7 @@ void PublisherSinkNode::Deinit() {
     }
     publisher_started_ = false;
     awaiting_keyframe_ = false;
+    dts_interleaver_.Reset();
     pending_packets_.clear();
     seen_track_ids_.clear();
     eos_track_ids_.clear();
@@ -1185,6 +1188,9 @@ void PublisherSinkNode::Process(EncodedPacketMessage message) {
     if (active_generation_ != 0 && message.generation != active_generation_) {
         // 新输入代次必须从独立关键帧重新建立发布入口；旧 Publisher 会话不
         // 能把上一代的 DTS/网络状态带进新流。
+        // 先刷出旧代次已经进入交织器的尾包，再关闭旧会话；否则这些包会
+        // 静默丢失，且新代次不能复用旧代次的解码顺序缓存。
+        PublishReadyDtsPackets(dts_interleaver_.Flush());
         if (publisher_) {
             publisher_->Stop();
         }
@@ -1194,6 +1200,9 @@ void PublisherSinkNode::Process(EncodedPacketMessage message) {
         eos_track_ids_.clear();
     }
     active_generation_ = message.generation;
+
+    const bool is_keyframe = IsVideoKeyframe(message);
+    const bool is_video = message.track_info.media_type == MediaType::VIDEO;
 
     // 多轨配置必须先收齐每条轨道的真实编码描述，才能一次性建立包含
     // 音频和视频的 FFmpeg 输出上下文。等待期间使用有界队列，防止某条轨道
@@ -1215,43 +1224,102 @@ void PublisherSinkNode::Process(EncodedPacketMessage message) {
             pending_packets_.push_back(std::move(message));
             return;
         }
-    }
 
-    const bool is_keyframe = IsVideoKeyframe(message);
-    const bool is_video = message.track_info.media_type == MediaType::VIDEO;
-    if (options_.wait_for_keyframe_on_start && awaiting_keyframe_ &&
-        HasConfiguredVideoTrack() && (!is_video || !is_keyframe) &&
-        (publisher_started_ || is_video || !AllConfiguredTracksSeen())) {
-        if (!publisher_started_) {
-            if (pending_packets_.size() >= options_.max_pending_packets) {
-                last_result_ = PublisherResult::Failure(
-                    PublisherErrorCode::InvalidState,
-                    "publisher keyframe queue is full");
+        if (options_.wait_for_keyframe_on_start && awaiting_keyframe_ &&
+            HasConfiguredVideoTrack()) {
+            // 多轨输入可能先收到音频。即使所有轨道描述已经齐全，也不能让
+            // 音频先启动 Publisher；视频关键帧才是可随机解码的发布锚点。
+            // 如果关键帧已经在“等待另一条轨道描述”的窗口里到达，则从
+            // pending 中取它作为锚点，不能因为后面没有新视频包而永远等待。
+            const auto anchor = std::find_if(
+                pending_packets_.begin(), pending_packets_.end(),
+                [this](const EncodedPacketMessage& queued) {
+                    return IsVideoKeyframe(queued);
+                });
+            if (anchor != pending_packets_.end()) {
+                const auto anchor_message = *anchor;
+                std::deque<EncodedPacketMessage> pending_after_anchor;
+                bool reached_anchor = false;
+                for (auto& queued : pending_packets_) {
+                    if (!reached_anchor) {
+                        // 关键帧之前的包无法独立解码，必须丢弃；关键帧之后的
+                        // 包已经属于新的可解码窗口，不能随着启动缓存整体清空。
+                        reached_anchor = &queued == &*anchor;
+                        continue;
+                    }
+                    pending_after_anchor.push_back(std::move(queued));
+                }
+                pending_packets_.clear();
+                if (!StartPublisher(anchor_message)) {
+                    return;
+                }
+                dts_interleaver_.Reset(anchor_message.generation);
+                PublishPacket(anchor_message);
+                for (const auto& queued : pending_after_anchor) {
+                    PublishOrInterleave(queued);
+                }
+                // 当前消息是在锚点之后到达的，允许它进入新的 DTS 时间窗。
+                PublishOrInterleave(message);
                 return;
             }
-            pending_packets_.push_back(std::move(message));
+
+            if (!is_video || !is_keyframe) {
+                if (pending_packets_.size() >= options_.max_pending_packets) {
+                    last_result_ = PublisherResult::Failure(
+                        PublisherErrorCode::InvalidState,
+                        "publisher keyframe queue is full");
+                    return;
+                }
+                pending_packets_.push_back(std::move(message));
+                return;
+            }
+
+            if (!StartPublisher(message)) {
+                return;
+            }
+            // 当前关键帧建立新的发布时间轴。关键帧之前的历史不能在
+            // 随机访问点之前写出，也不应拖慢首帧启动。
+            pending_packets_.clear();
+            dts_interleaver_.Reset(message.generation);
+            PublishPacket(message);
             return;
         }
-        last_result_ = PublisherResult::Failure(
-            PublisherErrorCode::AwaitingKeyframe,
-            "publisher is waiting for the next video keyframe");
-        return;
-    }
 
-    if (!publisher_started_ && !StartPublisher(message)) {
-        return;
-    }
-
-    if (!pending_packets_.empty()) {
-        auto pending = std::move(pending_packets_);
-        pending_packets_.clear();
-        for (const auto& queued : pending) {
-            PublishPacket(queued);
+        if (!StartPublisher(message)) {
+            return;
         }
+
+        // 无视频或显式关闭首帧关键帧保护时，启动前缓存可以按统一入口继续
+        // 处理；显式多轨仍会经过 DTS 交织器。
+        if (!pending_packets_.empty()) {
+            auto pending = std::move(pending_packets_);
+            pending_packets_.clear();
+            for (const auto& queued : pending) {
+                PublishOrInterleave(queued);
+            }
+        }
+        PublishOrInterleave(message);
+        return;
     }
 
-    PublishPacket(message);
+    // Publisher 已经启动但协议层要求重新等待关键帧时，只接受新的关键帧
+    // 作为恢复锚点。旧交织缓存属于失败前时间窗，必须清空。
+    if (options_.wait_for_keyframe_on_start && awaiting_keyframe_ &&
+        HasConfiguredVideoTrack()) {
+        if (!is_video || !is_keyframe) {
+            last_result_ = PublisherResult::Failure(
+                PublisherErrorCode::AwaitingKeyframe,
+                "publisher is waiting for the next video keyframe");
+            return;
+        }
+        dts_interleaver_.Reset(message.generation);
+        PublishPacket(message);
+        return;
+    }
+
+    PublishOrInterleave(message);
     return;
+
 }
 
 bool PublisherSinkNode::AllConfiguredTracksSeen() const {
@@ -1312,6 +1380,50 @@ bool PublisherSinkNode::PublishPacket(const EncodedPacketMessage& message) {
     return false;
 }
 
+bool PublisherSinkNode::PublishOrInterleave(
+    const EncodedPacketMessage& message) {
+    if (!message.packet || !message.Valid()) {
+        return false;
+    }
+
+    // 单轨发布没有跨轨交织需求，继续直接发送，避免为实时单轨链路增加
+    // 不必要的启动延迟。显式多轨才需要同时协调音频和视频 DTS。
+    if (!options_.enable_dts_interleaving || config_.tracks.size() <= 1) {
+        return PublishPacket(message);
+    }
+
+    DtsPacket timed;
+    timed.packet = message.packet;
+    timed.timing = GetMediaTiming(*message.packet);
+    timed.track_info = message.track_info;
+    timed.track_id = message.track_id;
+    timed.generation = message.generation;
+    return PublishReadyDtsPackets(dts_interleaver_.Push(std::move(timed)));
+}
+
+bool PublisherSinkNode::PublishReadyDtsPackets(
+    const std::vector<DtsPacket>& packets) {
+    bool accepted = true;
+    for (const auto& packet : packets) {
+        if (!packet.packet) {
+            accepted = false;
+            continue;
+        }
+
+        EncodedPacketMessage message;
+        message.packet = packet.packet;
+        message.track_info = packet.track_info;
+        message.track_id = packet.track_id;
+        message.generation = packet.generation;
+        accepted = PublishPacket(message) && accepted;
+    }
+    return accepted;
+}
+
+bool PublisherSinkNode::FlushDtsInterleaver() {
+    return PublishReadyDtsPackets(dts_interleaver_.Flush());
+}
+
 void PublisherSinkNode::HandleEndOfStream(
     const EncodedPacketMessage& message) {
     eos_track_ids_.insert(message.track_id);
@@ -1325,6 +1437,9 @@ void PublisherSinkNode::HandleEndOfStream(
                       })
         : true;
     if (all_tracks_finished && publisher_started_ && publisher_) {
+        // EOS 是多轨时间轴的最后边界，先把尚未达到交织器水位的尾包发完，
+        // 再关闭 Publisher，不能让音频/视频尾部因缓存未满而消失。
+        FlushDtsInterleaver();
         publisher_->Stop();
         publisher_started_ = false;
         awaiting_keyframe_ = false;

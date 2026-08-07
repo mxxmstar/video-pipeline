@@ -498,7 +498,7 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
 <tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：使用无坏包双轨媒体源完成三轮性能复测</td></tr>
-<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6、A4-7<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20、21.7.21 节<br>已完成：轨道隔离、容量基础、Source 轨道序号、Decoder 关键帧恢复，以及统一时钟/PTS/DTS 纯逻辑基础组件<br>后续：把可中断等待和 DTS 交织接入真实渲染/发布节点，并完成端到端双轨验收</td></tr>
+<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6、A4-7<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20、21.7.21、21.7.22 节<br>已完成：轨道隔离、容量基础、Source 轨道序号、Decoder 关键帧恢复、统一时钟/PTS/DTS 基础组件，以及 RenderSession 和多轨 PublisherSinkNode 接入<br>后续：使用真实双轨媒体源完成端到端播放误差、真实发布交织和网络丢包互操作验收</td></tr>
 </tbody>
 </table>
 
@@ -853,7 +853,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
 <tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.20 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本基线和本机双轨初步前后对照已记录；双轨本地 FFmpeg 已验证序号丢包后的关键帧恢复，最终性能验收仍需无坏包媒体源三轮复测</td></tr>
-<tr><td>A4-7</td><td>统一时钟与 PTS/DTS 调度基础</td><td>建立音频 master/system fallback 时钟、PTS/DTS 安全换算、视频 PTS 调度决策和有界 DTS 交织基础组件</td><td>第 21.7.21 节</td><td>纯逻辑基础组件及双轨语义回归已完成；尚未接入渲染等待、音频设备播放位置和 Publisher 真实多轨交织，端到端同步验收留待下一批</td></tr>
+<tr><td>A4-7</td><td>统一时钟与 PTS/DTS 调度基础</td><td>建立音频 master/system fallback 时钟、PTS/DTS 安全换算、视频 PTS 调度决策和有界 DTS 交织基础组件</td><td>第 21.7.21-21.7.22 节</td><td>基础组件、RenderSession 可中断等待/音频 master 接入、多轨 Publisher DTS 交织及双轨回归已完成；端到端设备/真实网络同步验收仍待后续</td></tr>
 </tbody>
 </table>
 
@@ -2291,12 +2291,12 @@ timestamp 错误；完整日志如下：
 
 ##### 21.7.21.3 接入边界与下一批计划
 
-本阶段完成的是可复用的纯逻辑基础设施，尚未把等待动作直接接入
-`DecoderNode`、`RenderSession` 或 `PublisherSinkNode`。原因是 `Serialized Executor`
-中不能长时间 `sleep`：调度等待必须通过有界 pending 队列、可取消 timer/通知和
-`GracefulStop` 唤醒机制实现，否则会把等待一个视频帧变成阻塞整条节点链路。
+本阶段完成的是可复用的纯逻辑基础设施。由于 `Serialized Executor` 中不能长时间
+`sleep`，后续接入必须通过有界 pending 队列、可取消通知和 `GracefulStop` 唤醒机制
+实现，不能把等待一个视频帧变成阻塞整条节点链路。本节列出的接入顺序已在
+21.7.22 中完成其中的 RenderSession 和 PublisherSinkNode 两项。
 
-下一批实施顺序如下：
+基础阶段结束时确定的接入顺序如下：
 
 1. 在 `MediaFrameMessage` 和 `EncodedPacketMessage` 的下游适配点接入统一时间
    读取，保持原始 PTS、DTS、duration、time base 和 generation，不在消息边界重复
@@ -2308,5 +2308,65 @@ timestamp 错误；完整日志如下：
 4. 音频 renderer 的实际已播放 PTS 接入 `UnifiedClock::UpdateAudioPosition()`，
    对音频设备暂时不可用、暂停、EOS 和重连分别补充验证。
 
-本阶段不宣称已经完成端到端 A/V 同步；当前验收证明的是时间契约和调度决策本身
-正确，端到端播放误差、真实发布交织和网络丢包互操作仍属于后续接入验收。
+基础组件本身不宣称已经完成端到端 A/V 同步；端到端播放误差、真实发布交织和网络
+丢包互操作仍需要在接入完成后单独验收。
+
+#### 21.7.22 统一时钟接入渲染与多轨 Publisher
+
+本阶段承接 21.7.21 的接入计划，开始把统一时间轴接入现有渲染会话和多轨发布节点。
+核心原则仍然是：渲染按 PTS 和统一时钟决定等待/显示/丢弃，编码发布按 DTS 维护
+解码顺序；不能按音频帧数和视频帧数配对，也不能把不同 time base 下的 tick 直接比较。
+
+##### 21.7.22.1 已实施修改
+
+| 领域 | 实际修改 | 主要文件 |
+|---|---|---|
+| RenderSession 时钟 | `RenderSession` 改用 `mediaflow::UnifiedClock`。启动时建立固定的本地代次；在音频 renderer 已有实际播放位置前使用 system fallback，拿到已播放 PTS 后切换为音频 master；暂停、恢复和重启仍通过原有会话控制完成 | `src/render/render_session.cpp` |
+| RenderSession 视频调度 | 将既有 AV sync 配置转换为 `mediaflow::VideoScheduleConfig`，视频帧通过 `VideoPtsScheduler` 按 PTS 调度；早到帧使用可中断的条件变量等待，停止或暂停会唤醒等待，迟到非关键帧单独计数并丢弃，关键帧保留 | `src/render/render_session.cpp` |
+| 音频时钟上报 | 音频 renderer 的 `PlayedPtsUs()` 直接调用 `UnifiedClock::UpdateAudioPosition()`；PTS `0` 仍是有效的音频时钟起点，不再被当成未初始化值 | `src/render/render_session.cpp` |
+| Publisher DTS 交织 | `PublisherSinkNode` 对显式多轨启用有界 `DtsInterleaver`，交织包同时携带 `EncodedTrackInfo`、track id 和 generation，确保排序后仍能按正确轨道发布；单轨继续走直接发布路径 | `include/mediaflow/media_nodes.h`、`src/mediaflow/media_nodes.cpp`、`include/mediaflow/media_timing.h` |
+| Publisher 启动锚点 | 多轨发布先收齐轨道描述，再等待视频关键帧建立发布锚点；关键帧之前的缓存丢弃，关键帧之后的缓存保留并进入 DTS 交织器，避免音频先到或启动窗口误删合法视频包 | `src/mediaflow/media_nodes.cpp` |
+| EOS 与代次边界 | 多轨 EOS 只有在所有配置轨道结束后才关闭 Publisher，并先刷出 DTS 尾包；generation 切换时先刷旧代次交织缓存，再停止旧会话并等待新关键帧，禁止跨代次排序 | `src/mediaflow/media_nodes.cpp` |
+| 回归测试 | 新增双轨 DTS 交织 Publisher 测试，使用视频 `0/20 ms` DTS 和音频 `10/30 ms` DTS，验证输出为 `0/10/20/30 ms`；同时覆盖所有轨道 EOS 和发布停止 | `test/mediaflow/test_mediaflow_media_nodes.cpp` |
+
+##### 21.7.22.2 问题修复记录
+
+首次接入后的回归发现：视频关键帧和关键帧之后的视频包可能同时进入“等待另一条轨道
+描述”的启动缓存。状态机找到关键帧后原先清空整个缓存，导致关键帧之后的合法视频包被
+误删；在音频先到的情况下，Publisher 只收到 3 个包，DTS 交织测试等待第 4 个包超时。
+
+修复后启动缓存按关键帧划分为两个区域：
+
+1. 关键帧之前的包无法独立解码，直接丢弃；
+2. 关键帧本身先作为发布锚点发送；
+3. 关键帧之后的包保留，和当前新到包一起送入有界 DTS 交织器；
+4. 所有轨道 EOS 到达后刷出交织器尾包，再执行 Publisher Stop。
+
+该修复保留了“视频关键帧先启动”的协议要求，同时避免因音频和视频到达顺序不同而
+丢失关键帧之后的有效视频数据。
+
+##### 21.7.22.3 验收结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| VS Debug 构建 | 通过 | VS 18 Community x64 Developer Command Prompt 下，`video_pipeline_lib`、`test_mediaflow_media_nodes`、`test_render_session`、`test_mediaflow_timing` 均构建成功 |
+| 统一时钟与 PTS 调度回归 | 通过 | `test_mediaflow_timing` 退出码 `0` |
+| RenderSession 接入回归 | 通过 | `test_render_session` 退出码 `0`，保留暂停/停止可中断等待行为 |
+| 多轨 Publisher 启动与 EOS | 通过 | `test_mediaflow_media_nodes` 退出码 `0`，多轨发布收到完整包集并在所有轨道 EOS 后停止 |
+| 多轨 DTS 单调交织 | 通过 | `test_mediaflow_media_nodes` 验证发布 DTS 为 `0/10/20/30 ms` |
+| 端到端网络同步 | 未完成 | 当前仅完成本地确定性双轨回归；真实摄像头只有一路 RTSP 会话且设备状态不稳定，不能据此宣称网络长测通过 |
+
+##### 21.7.22.4 当前边界与下一步
+
+本阶段已经完成统一时钟和 DTS 调度在 `RenderSession`、`PublisherSinkNode` 的代码接入，
+但还没有完成真实播放设备的端到端误差测量，也没有使用真实 FFmpeg mux 输出做长时间可
+播放性验证。`RenderSession` 内部当前使用固定本地 generation `1`，网络 Source/Decoder
+消息中的 generation 仍由各自链路维护；跨重连的渲染会话边界需要后续显式接入。
+
+下一步应在保持双轨输入的前提下：
+
+1. 使用已校验的本地 H.264/AAC 双轨媒体源，接入真实 FFmpeg Publisher，验证输出容器的
+   DTS 单调性、PTS 保留和可播放性；
+2. 为音频设备不可用、暂停、EOS、重连和时钟跳变补充系统级测试；
+3. 记录音频 master 与视频实际显示 PTS 的误差分布，再据此调整早到/迟到阈值；
+4. 继续保留现场摄像头“单路 RTSP 会话”约束，不使用第二路拉流规避 A/V 问题。

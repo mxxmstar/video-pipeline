@@ -10,6 +10,7 @@
  */
 
 #include "mediaflow/core/node.h"
+#include "mediaflow/media_timing.h"
 
 #include "media/decoder/i_decoder.h"
 #include "media/encoder/i_encoder.h"
@@ -207,6 +208,9 @@ struct PublisherSinkNodeOptions {
     bool wait_for_keyframe_on_start{true}; ///< 首次启动前丢弃非关键视频包。
     bool wait_for_all_tracks{true};        ///< 配置多轨时等待所有轨道描述齐全再 Start。
     std::size_t max_pending_packets{256};  ///< 多轨等待期间允许缓存的最大包数。
+    /// 显式多轨发布默认启用 DTS 交织；单轨发布不会经过该缓存。
+    bool enable_dts_interleaving{true};
+    DtsInterleaverConfig dts_interleaver{}; ///< DTS 缓存的数量/时间跨度上限。
 };
 
 /**
@@ -503,6 +507,9 @@ private:
     bool AllConfiguredTracksSeen() const;
     bool HasConfiguredVideoTrack() const;
     bool PublishPacket(const EncodedPacketMessage& message);
+    bool PublishOrInterleave(const EncodedPacketMessage& message);
+    bool PublishReadyDtsPackets(const std::vector<DtsPacket>& packets);
+    bool FlushDtsInterleaver();
     void HandleEndOfStream(const EncodedPacketMessage& message);
     bool IsVideoKeyframe(const EncodedPacketMessage& message) const;
     void SetError(std::string message);
@@ -518,6 +525,7 @@ private:
     bool accepting_{false};
     bool publisher_started_{false};
     bool awaiting_keyframe_{false};
+    DtsInterleaver dts_interleaver_;
     std::deque<EncodedPacketMessage> pending_packets_;
     std::unordered_set<int> seen_track_ids_;
     std::unordered_set<int> eos_track_ids_;

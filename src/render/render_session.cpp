@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -11,8 +12,7 @@
 #include <utility>
 
 #include "render/audio/wasapi_audio_renderer.h"
-#include "render/av_sync_controller.h"
-#include "render/media_clock.h"
+#include "mediaflow/media_timing.h"
 #include "render/opengl_video_renderer.h"
 #include "render/video_pts_normalizer.h"
 
@@ -20,6 +20,21 @@ namespace render {
 namespace {
 
 constexpr auto kIdlePollInterval = std::chrono::milliseconds(5);
+
+std::int64_t MillisecondsToUs(int value_ms) {
+    return static_cast<std::int64_t>(std::max(0, value_ms)) * 1000;
+}
+
+mediaflow::VideoScheduleConfig ToMediaFlowScheduleConfig(
+    const AvSyncConfig& config) {
+    mediaflow::VideoScheduleConfig result;
+    result.enabled = config.enabled;
+    result.late_threshold_us = MillisecondsToUs(config.late_threshold_ms);
+    result.early_threshold_us = MillisecondsToUs(config.early_threshold_ms);
+    result.max_wait_us = MillisecondsToUs(config.max_wait_ms);
+    result.drop_late_video_frames = config.drop_late_video_frames;
+    return result;
+}
 
 bool IsValidConfig(const RenderSessionConfig& config, std::string& error) {
     if (!config.enable_video && !config.enable_audio) {
@@ -97,8 +112,9 @@ public:
         video_available_ = false;
         audio_available_ = false;
         last_error_.clear();
-        media_clock_.Reset();
-        av_sync_.SetConfig(config_.av_sync);
+        mediaflow_clock_.Reset();
+        video_pts_scheduler_.SetConfig(
+            ToMediaFlowScheduleConfig(config_.av_sync));
         video_pts_normalizer_.SetConfig(config_.video_pts);
         system_clock_anchored_ = false;
         return true;
@@ -267,7 +283,7 @@ public:
         startup_done_ = true;
         video_available_ = false;
         audio_available_ = false;
-        media_clock_.Reset(stats_.playback_pts_us);
+        mediaflow_clock_.Reset(1, stats_.playback_pts_us);
         video_pts_normalizer_.Reset();
         system_clock_anchored_ = false;
     }
@@ -278,7 +294,7 @@ public:
             return;
         }
         paused_ = true;
-        media_clock_.Pause();
+        mediaflow_clock_.Pause();
         queue_cv_.notify_all();
     }
 
@@ -288,7 +304,7 @@ public:
             return;
         }
         paused_ = false;
-        media_clock_.Resume();
+        mediaflow_clock_.Resume();
         queue_cv_.notify_all();
     }
 
@@ -314,10 +330,10 @@ public:
             snapshot.audio_renderer_queue_size = audio_stats.queued_pcm_chunks;
             snapshot.audio_renderer_queued_frames = audio_stats.queued_pcm_frames;
         }
-        const auto clock_snapshot = media_clock_.Snapshot(audio_available_);
+        const auto clock_snapshot = mediaflow_clock_.Snapshot(audio_available_);
         snapshot.playback_pts_us = clock_snapshot.position_us;
         snapshot.playback_clock_source =
-            clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
+            clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
         return snapshot;
     }
 
@@ -390,10 +406,10 @@ private:
                     std::lock_guard<std::mutex> lock(mutex_);
                     ++stats_.rendered_video_frames;
                     const auto clock_snapshot =
-                        media_clock_.Snapshot(audio_available_);
+                        mediaflow_clock_.Snapshot(audio_available_);
                     stats_.playback_pts_us = clock_snapshot.position_us;
                     stats_.playback_clock_source =
-                        clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
+                        clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
                 }
             }
 
@@ -470,11 +486,14 @@ private:
                 ++stats_.rendered_audio_frames;
                 UpdateAudioStatsLocked();
                 stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
-                media_clock_.UpdateAudioPosition(stats_.playback_pts_us);
-                const auto clock_snapshot = media_clock_.Snapshot(audio_available_);
+                // 音频 renderer 上报的是已经播放到的媒体 PTS。统一时钟以此
+                // 作为 master；0 是合法起始位置，不能按“未初始化”处理。
+                mediaflow_clock_.UpdateAudioPosition(1, stats_.playback_pts_us);
+                const auto clock_snapshot =
+                    mediaflow_clock_.Snapshot(audio_available_);
                 stats_.playback_pts_us = clock_snapshot.position_us;
                 stats_.playback_clock_source =
-                    clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
+                    clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
             }
         }
 
@@ -504,7 +523,9 @@ private:
         startup_done_ = true;
         running_ = startup_success_;
         if (startup_success_) {
-            media_clock_.Start();
+            // RenderSession 内部没有网络重连边界，固定使用本地代次 1；外层
+            // MediaFlow 消息的 generation 仍由 Source/Decoder 独立维护。
+            mediaflow_clock_.Start(1);
         } else {
             stop_requested_ = true;
         }
@@ -540,14 +561,14 @@ private:
             // 每次等待后都重新读取 clock，因为 audio master 可能已经继续前进。
             // 对早到帧来说，这个循环会把“短等待”拆成多次小步，保持 Stop/Pause 响应。
             const auto clock_snapshot = CurrentClockSnapshot();
-            const auto decision =
-                av_sync_.Decide(video_pts_us, clock_snapshot);
+            const auto decision = video_pts_scheduler_.Decide(
+                video_pts_us, false, 1, clock_snapshot);
 
-            if (decision.action == AvSyncAction::Render) {
+            if (decision.action == mediaflow::VideoScheduleAction::Render) {
                 return VideoFrameSyncAction::Render;
             }
 
-            if (decision.action == AvSyncAction::Drop) {
+            if (decision.action == mediaflow::VideoScheduleAction::Drop) {
                 // 这里的丢帧是 AV sync 主动丢晚帧；SubmitFrame() 中队列满丢帧不会
                 // 进入这个分支。两个计数拆开后，camera 日志能区分“渲染慢导致队列满”
                 // 和“同步策略认为帧已经过期”。
@@ -556,7 +577,7 @@ private:
                 ++stats_.av_sync_dropped_video_frames;
                 stats_.playback_pts_us = clock_snapshot.position_us;
                 stats_.playback_clock_source =
-                    clock_snapshot.source == MediaClockSource::Audio ? 1 : 0;
+                    clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
                 video_frame.reset();
                 return VideoFrameSyncAction::Drop;
             }
@@ -566,11 +587,10 @@ private:
                 // 被 Pause/Stop 提前唤醒，该统计也能反映同步策略施加过节奏控制。
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.av_sync_video_waits;
-                stats_.av_sync_video_wait_us +=
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        decision.wait_duration).count();
+                stats_.av_sync_video_wait_us += decision.wait_us;
             }
-            if (!WaitForVideoSync(decision.wait_duration)) {
+            if (!WaitForVideoSync(
+                    std::chrono::microseconds(decision.wait_us))) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (stop_requested_) {
                     return VideoFrameSyncAction::Stop;
@@ -613,24 +633,24 @@ private:
         // 只有真正拿到音频播放位置后，audio master 才算 ready。音频设备初始化成功但
         // 尚未播放出第一批 PCM 时，仍然需要用视频首帧锚定 fallback clock。
         const bool audio_master_ready =
-            audio_available_ && media_clock_.HasAudioPosition();
+            audio_available_ && mediaflow_clock_.HasAudioPosition();
         if (audio_master_ready || system_clock_anchored_) {
             return;
         }
 
-        media_clock_.SetSystemPositionUs(video_pts_us);
+        mediaflow_clock_.SetSystemPositionUs(video_pts_us);
         stats_.playback_pts_us = video_pts_us;
         system_clock_anchored_ = true;
     }
 
-    MediaClockSnapshot CurrentClockSnapshot() const {
+    mediaflow::ClockSnapshot CurrentClockSnapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
         // audio_available_ 只表示音频 renderer 初始化成功；MediaClock 内部还会判断
         // 是否已经有有效音频播放位置，没有时自动回退到 system clock。
-        return media_clock_.Snapshot(audio_available_);
+        return mediaflow_clock_.Snapshot(audio_available_);
     }
 
-    bool WaitForVideoSync(std::chrono::milliseconds duration) {
+    bool WaitForVideoSync(std::chrono::microseconds duration) {
         if (duration.count() <= 0) {
             return true;
         }
@@ -688,8 +708,8 @@ private:
 
     RenderSessionConfig config_;
     RenderStats stats_;
-    MediaClock media_clock_;
-    AvSyncController av_sync_;
+    mediaflow::UnifiedClock mediaflow_clock_;
+    mediaflow::VideoPtsScheduler video_pts_scheduler_;
     VideoPtsNormalizer video_pts_normalizer_;
     std::deque<std::shared_ptr<MediaFrame>> video_queue_;
     std::deque<std::shared_ptr<MediaFrame>> audio_queue_;
