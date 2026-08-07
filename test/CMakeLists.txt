@@ -7,6 +7,16 @@ else()
 endif()
 add_test(NAME test_mediaflow COMMAND test_mediaflow)
 
+add_executable(test_mediaflow_timing mediaflow/test_mediaflow_timing.cpp)
+target_link_libraries(test_mediaflow_timing PRIVATE video_pipeline_lib)
+video_pipeline_copy_runtime_dlls(test_mediaflow_timing)
+if(MSVC)
+    target_compile_options(test_mediaflow_timing PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_mediaflow_timing PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_mediaflow_timing COMMAND test_mediaflow_timing)
+
 add_executable(test_mediaflow_media_nodes mediaflow/test_mediaflow_media_nodes.cpp)
 target_link_libraries(test_mediaflow_media_nodes PRIVATE video_pipeline_lib)
 target_compile_definitions(test_mediaflow_media_nodes
