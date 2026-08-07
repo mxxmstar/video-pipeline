@@ -9,6 +9,10 @@ add_test(NAME test_mediaflow COMMAND test_mediaflow)
 
 add_executable(test_mediaflow_media_nodes mediaflow/test_mediaflow_media_nodes.cpp)
 target_link_libraries(test_mediaflow_media_nodes PRIVATE video_pipeline_lib)
+target_compile_definitions(test_mediaflow_media_nodes
+    PRIVATE
+        VIDEO_PIPELINE_TEST_AV_PATH="${CMAKE_SOURCE_DIR}/third_apps/win32/zlmediakit/www/live/video_pipeline_test/2026-07-19/09/35-46_0.ts"
+)
 video_pipeline_copy_runtime_dlls(test_mediaflow_media_nodes)
 if(MSVC)
     target_compile_options(test_mediaflow_media_nodes PRIVATE /W3 /utf-8 /Zc:__cplusplus)

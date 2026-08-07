@@ -37,6 +37,10 @@ struct MediaPacketMessage {
     std::shared_ptr<const MediaStreamInfo> stream_info;    ///< 当前包所属轨道描述。
     std::uint64_t generation{0};                           ///< 拉流连接代次。
     bool eos{false};                                        ///< 当前代次是否已经正常结束。
+    // Source 为每条媒体轨道分别生成代次内递增序号。旧的手工构造消息可以
+    // 保持 0，Decoder 会跳过序号检查；真实 Source 产生的消息从 1 开始，
+    // 这样队列或 Dispatch 丢包后，下游可以明确知道视频解码输入已经断裂。
+    std::uint64_t sequence{0};
 
     bool Valid() const {
         return generation != 0 && (eos || packet != nullptr);
@@ -112,6 +116,18 @@ private:
         if (value >= static_cast<long double>(max_value)) return max_value;
         return static_cast<std::int64_t>(value);
     }
+};
+
+/// Decoder 在发生输入间隙或解码失败后的恢复统计。
+///
+/// 这些统计只记录 Decoder 的恢复状态，不替代 Edge 的 dropped/rejected
+/// 指标。两者结合可以区分“包在队列中被丢弃”和“解码器收到包后失败”。
+struct DecoderRecoveryStats {
+    std::uint64_t sequence_gaps{0};              ///< 检测到的序号间隙或乱序次数。
+    std::uint64_t decode_failures{0};             ///< 具体 Decoder 返回 false 的次数。
+    std::uint64_t dropped_until_keyframe{0};     ///< 等待恢复关键帧期间丢弃的包数。
+    std::uint64_t recovered_keyframes{0};        ///< 成功重新接受的恢复关键帧数。
+    bool awaiting_keyframe{false};               ///< 当前是否仍在等待关键帧。
 };
 
 /// 解码帧按已经统一为微秒的 MediaTime 计费，避免核心队列重新解释 time base。
@@ -354,6 +370,9 @@ public:
     /// 最近一次解码失败的简要原因，便于节点级监控。
     std::string LastError() const;
 
+    /// 获取输入丢包恢复状态，供现场诊断和测试验收使用。
+    DecoderRecoveryStats RecoveryStats() const;
+
 private:
     void Process(MediaPacketMessage message);
     void OnDecodedFrame(std::shared_ptr<MediaFrame> frame);
@@ -361,6 +380,8 @@ private:
     bool IsUsableStreamInfo(const MediaStreamInfo& info) const;
     bool SameStream(const MediaStreamInfo& left,
                     const MediaStreamInfo& right) const;
+    /// 在 state_mutex_ 保护下进入关键帧恢复状态，并关闭损坏的旧上下文。
+    void BeginKeyframeRecoveryLocked(const char* reason);
     void SetError(std::string message);
     void SetErrorLocked(std::string message);
 
@@ -374,6 +395,11 @@ private:
     std::string last_error_;
     std::uint64_t active_generation_{0};
     std::uint64_t callback_generation_{0};
+    std::uint64_t sequence_generation_{0};
+    std::uint64_t last_packet_sequence_{0};
+    DecoderRecoveryStats recovery_stats_;
+    bool recovery_pending_{false};
+    bool awaiting_keyframe_{false};
     bool decoder_open_{false};
     bool accepting_{false};
     bool flushed_{false};

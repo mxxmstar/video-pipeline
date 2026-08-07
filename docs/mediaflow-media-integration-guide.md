@@ -498,7 +498,7 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
 <tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：使用无坏包双轨媒体源完成三轮性能复测</td></tr>
-<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18 节<br>后续：真实 Decoder 丢包关键帧恢复和统一时钟调度</td></tr>
+<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20 节<br>已完成：Source 轨道序号和 Decoder 关键帧恢复已通过双轨本地 FFmpeg 验证<br>后续：统一时钟调度、真实网络丢包互操作</td></tr>
 </tbody>
 </table>
 
@@ -852,7 +852,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-3</td><td>摄像头测试问题修复</td><td>修复停止阻塞、无效视频元数据、探测恢复和 Edge 视频保护</td><td>第 21.7.7-21.7.13 节</td><td>已完成三批修复并通过短时单路验证，仍需长时验证</td></tr>
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
-<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.19 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本基线和本机双轨初步前后对照已记录，最终性能验收仍需无坏包媒体源三轮复测；真实 Decoder 关键帧恢复和统一时钟调度仍待实施</td></tr>
+<tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.20 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本基线和本机双轨初步前后对照已记录；双轨本地 FFmpeg 已验证序号丢包后的关键帧恢复，最终性能验收仍需无坏包媒体源三轮复测，统一时钟调度仍待实施</td></tr>
 </tbody>
 </table>
 
@@ -1783,9 +1783,9 @@ recommended_bytes = bitrate_bits_per_second / 8
 |---|---|---|
 | 第 21.7.15 节入口分轨基线 | 已通过 | 15 秒单路 RTSP：视频 `375/375`、音频 `745/745`，四条相关 Edge dropped/rejected 均为 `0` |
 | CAP-01 至 CAP-02：成本与硬上限 | 通过 | `TestQueueBudgetAccounting` 与 `TestMediaQueueItemCostTraits` 已覆盖 items/bytes/span、超大包、generation、EOS 和无时间戳成本 |
-| CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 与 `TestCapacityRegressionScenarios` 验证独立预算、30 秒媒体时间的 10 倍音频突发和 25 fps 视频接收；关键帧恢复解码待补 |
+| CAP-03：音视频隔离 | 部分通过 | `TestTrackBudgetIsolationAndControlRetention` 与 `TestCapacityRegressionScenarios` 验证独立预算、30 秒媒体时间的 10 倍音频突发和 25 fps 视频接收；双轨真实 Decoder 恢复已补，真实网络队列丢包联动待补 |
 | CAP-04：实时音频延迟 | 通过（离线） | `TestRealtimeAudioLowWatermarkRecovery` 验证突发后 span 回落到低水位 |
-| CAP-05：视频恢复 | 部分通过 | `TestVideoKeyframeRecoveryWindow` 验证关键帧替换和后续依赖窗口；真实 FFmpeg 丢包后解码验收待补 |
+| CAP-05：视频恢复 | 通过（本地 FFmpeg） | `TestFfmpegDecoderRecoversAfterVideoPacketGap` 使用双轨 H.264/AAC TS，跳过一个带序号的视频包后验证 Decoder 丢弃依赖帧、重开上下文并从下一关键帧新增输出；真实网络/协议丢包互操作待补 |
 | CAP-06：时间戳异常 | 通过（离线） | 回退时间戳建立新 epoch，旧/新窗口不拼接；无时间戳、跨 generation 和诊断计数已有回归 |
 | CAP-07：EOS 与停止 | 通过（离线） | 三维满载 EOS、超大 Block 包、GracefulStop 中断等待和 ImmediateStop 均有回归 |
 | CAP-08：总在途可观测性 | 部分通过 | `TestMediaEdgeAndDispatchInflightMetrics` 核对 `edge_queue + node_pending` 的 items/bytes/span；C5 已补充队列诊断，跨多 Edge 汇总待上层 Pipeline 接入 |
@@ -2001,10 +2001,10 @@ GracefulStop 完成。运行期间 A/V 帧持续增长，未观察到队列单�
 | RSS 跃升 | 约 360 秒前工作集约 `41.5 MB`，约 430 秒跃升至 `94.9 MB`，结束时约 `95.2 MB`；队列和诊断未同步增长 | 未通过，列为必须调查的问题；需要增加进程/FFmpeg buffer 分层统计并重复长测，定位是否为解码器缓存、帧引用或系统工作集行为 |
 | 瞬时 pending | 个别 5 秒采样出现 video decoder 或 audio counter pending `1`，下一采样恢复，Edge 仍为 `0/0/0` | 观察通过，不构成积压；后续性能基线中继续记录峰值 |
 
-因此当前 C7 结论为：CAP-04、CAP-06、CAP-07 的离线验收通过，CAP-05、CAP-09
-部分通过，CAP-10 部分通过且被 RSS 问题阻断最终通过，CAP-11 仍待建立改造前基线。
-下一阶段应优先调查 RSS 跃升，并补真实 Decoder 的关键帧恢复验收；在此之前不应宣称
-A/V 轨道容量控制已经完成全部现场验收。
+因此当前 C7 结论为：CAP-04、CAP-06、CAP-07 的离线验收通过，CAP-05 已通过本地
+真实 FFmpeg 解码验证但仍缺真实网络丢包互操作，CAP-09 部分通过，CAP-10 部分通过
+且被 RSS 问题阻断最终通过，CAP-11 仍待无坏包媒体源的最终性能复测。A/V 轨道容量
+控制仍不能宣称已经完成全部现场验收。
 
 #### 21.7.17 下一阶段：FFmpeg 解码帧内存诊断与 CAP-10 复验
 
@@ -2099,7 +2099,8 @@ CPU/吞吐采集能力和当前版本的 66.166 双轨基线已完成，CAP-11 �
 判断，本次断流归因于摄像头高温不稳定，暂不归因于 MediaFlow，也不据此修改代码。
 设备冷却并确认稳定后，应在同一 URL、同一构建配置下串行运行至少三轮双轨 600 秒
 测试，再按中位数比较 CPU 增量和 A/V 吞吐；基线若再次中途断流，则该轮仍应标记
-为设备异常无效样本。
+为设备异常无效样本。真实 Decoder 丢包关键帧恢复已在第 21.7.20 节补充离线验证，
+后续仍需在受控网络丢包或协议层丢包环境中验证 Edge 丢弃与 Decoder 恢复统计的一致性。
 
 #### 21.7.19 改造前双轨对照：摄像头高温导致样本无效
 
@@ -2208,3 +2209,52 @@ timestamp 错误；完整日志如下：
 后续正式验收应先准备一段经过完整校验的 H.264/AAC 双轨文件，继续使用视频复制、
 音频复制或无需额外实时转码的推流方式，至少串行复测三轮 600 秒；禁止改成视频
 单轨或音频单轨来规避音视频队列问题。
+
+#### 21.7.20 下一阶段：真实 Decoder 丢包后的关键帧恢复
+
+本阶段承接 21.7.18 和 21.7.19 中“补真实 FFmpeg 丢包关键帧恢复验收”的要求。
+目标是让队列或 Dispatch 丢包能够被 Decoder 识别，并把视频输出边界明确收敛到
+“丢包后等待下一关键帧”，而不是继续用损坏的参考帧输出不可预测的画面。本阶段
+不连接摄像头，不改变当前唯一 RTSP 会话的现场测试约束，也不把单轨输入作为验收
+样本；回归使用仓库内的 H.264/AAC 双轨 TS 文件。
+
+##### 21.7.20.1 已实施修改
+
+- `MediaPacketMessage` 增加 `sequence`。`StreamSourceNode` 对音频和视频分别维护
+  代次内递增序号，重连后从新的序号窗口开始；旧的手工构造消息保持 `0` 时仍可
+  兼容，不强制所有非网络 Puller 立即改造。
+- `DecoderNode` 增加视频输入序号间隙和乱序检测。发现同一 generation 内的间隙
+  后立即关闭旧 Decoder，不执行会输出不完整 GOP 尾帧的 Flush，并进入等待关键帧
+  状态。
+- Decoder 在等待状态只接受视频关键帧，后续非关键帧被丢弃并计数；关键帧到达后
+  按当前 `StreamInfo` 重开 Decoder，成功解码后解除等待。具体 Decoder 返回 false
+  时复用同一恢复路径。
+- 增加 `DecoderRecoveryStats` 和 `DecoderNode::RecoveryStats()`，记录序号间隙、
+  解码失败、等待期间丢弃包和成功恢复关键帧，便于与 Edge 的 dropped/rejected
+  指标交叉定位。
+- `test_mediaflow_media_nodes` 增加
+  `TestFfmpegDecoderRecoversAfterVideoPacketGap`：读取双轨 H.264/AAC TS，同时
+  运行音频 Decoder；视频跳过一个非关键包并继续送入后续包，验证视频等待下一
+  关键帧后产生新的解码输出，音频轨仍能正常解码。
+
+##### 21.7.20.2 验证结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| Source 代次内序号 | 通过 | Source 为音频、视频分别计数，重连时清零；旧消息序号为 `0` 的兼容路径保持可用 |
+| Decoder 丢包状态机 | 通过 | 新测试断言 `sequence_gaps >= 1`、`dropped_until_keyframe >= 1`、`recovered_keyframes >= 1`，且最终 `awaiting_keyframe=false` |
+| 真实 FFmpeg 视频恢复 | 通过（本地双轨） | 双轨 TS 中视频跳过一个非关键包后，真实 `FFmpegDecoder` 重开上下文并在下一关键帧后新增视频帧 |
+| 音频并行影响 | 通过（本地双轨） | 同一测试的 AAC 音频 Decoder 和音频 Sink 均收到解码帧，未使用单轨替代输入 |
+| 既有 MediaFlow 回归 | 通过 | `test_mediaflow.exe`、`test_mediaflow_media_nodes.exe` 均退出码 `0`；`test_stream_decode` 已重新编译通过 |
+
+##### 21.7.20.3 边界与下一步
+
+本阶段的“真实”指使用真实 FFmpeg Puller、H.264/AAC 压缩包和 FFmpeg Decoder，
+丢包由测试在 MediaFlow 消息边界注入序号间隙。它已经验证 Decoder 的重建行为，
+但还没有模拟 RTSP UDP 丢 RTP 包、TCP 断流重连或真实 Edge 满载后的自动统计联动。
+因此 CAP-05 的本地 FFmpeg 验收可以通过，网络互操作验收仍需单独补充。
+
+下一阶段进入统一时钟调度：保留 PTS/DTS、time base、generation 和 discontinuity，
+以音频时钟作为实时播放参考，视频按照 PTS 等待或丢弃迟到的非关键帧；编码发布
+链路则按 DTS 做有界交织。该阶段不能通过音频帧数与视频帧数配对实现，也不能把
+当前 Decoder 的恢复状态误认为已经完成音视频同步。

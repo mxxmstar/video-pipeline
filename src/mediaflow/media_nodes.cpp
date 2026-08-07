@@ -145,6 +145,10 @@ bool StreamSourceNode::Finished() const {
 void StreamSourceNode::ReadLoop(std::uint64_t generation) {
     int reconnect_count = 0;
     std::uint64_t current_generation = generation;
+    // 序号在 Source 读取线程内维护，不需要额外锁；每条轨道单独计数，
+    // 音频突发不会推进视频序号。
+    std::uint64_t video_sequence = 0;
+    std::uint64_t audio_sequence = 0;
 
     while (!stop_requested_.load() && generation_.load() == current_generation) {
         const IPuller::PullReadResult result = puller_->ReadPacketResult();
@@ -168,6 +172,13 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
                 message.packet = result.packet;
                 message.stream_info = FindStreamInfo(result.packet);
                 message.generation = current_generation;
+                // 真实 Source 产生的消息带有代次内序号。下游如果观察到间隙，
+                // 就能把队列/Dispatch 丢包与 Decoder 内部错误区分开。
+                if (result.packet->type == MediaType::VIDEO) {
+                    message.sequence = ++video_sequence;
+                } else if (result.packet->type == MediaType::AUDIO) {
+                    message.sequence = ++audio_sequence;
+                }
                 // 先向兼容的混合 out 发送，再向对应轨道端口发送。未连接的
                 // 端口不会创建队列；迁移后的正式图只连接 video/audio，因此
                 // 音频和视频在 Source 边界使用完全独立的容量和背压策略。
@@ -195,6 +206,10 @@ void StreamSourceNode::ReadLoop(std::uint64_t generation) {
                 }
 
                 current_generation = generation_.fetch_add(1) + 1;
+                // 重连后的第一包必须从新的序号窗口开始，不能把上一代的
+                // 最后一条序号带入新连接。
+                video_sequence = 0;
+                audio_sequence = 0;
                 if (!OpenGeneration(current_generation)) {
                     // Open 失败仍属于可重试阶段；下一轮继续等待并尝试，
                     // 直到达到配置上限或收到 Stop。
@@ -488,6 +503,13 @@ bool DecoderNode::Start() {
     accepting_ = true;
     active_generation_ = 0;
     callback_generation_ = 0;
+    sequence_generation_ = 0;
+    last_packet_sequence_ = 0;
+    recovery_stats_ = {};
+    // 视频解码不能从任意 P/B 帧开始。首次输入同样等待关键帧，避免
+    // 连接建立时恰好先收到参考帧而产生一段不可恢复的花屏输出。
+    awaiting_keyframe_ = configured_stream_info_.media_type == MediaType::VIDEO;
+    recovery_pending_ = false;
     flushed_ = false;
     return true;
 }
@@ -509,6 +531,10 @@ void DecoderNode::Deinit() {
     decoder_open_ = false;
     active_generation_ = 0;
     callback_generation_ = 0;
+    sequence_generation_ = 0;
+    last_packet_sequence_ = 0;
+    recovery_pending_ = false;
+    awaiting_keyframe_ = false;
     flushed_ = false;
 }
 
@@ -550,8 +576,16 @@ std::string DecoderNode::LastError() const {
     return last_error_;
 }
 
+DecoderRecoveryStats DecoderNode::RecoveryStats() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    auto stats = recovery_stats_;
+    stats.awaiting_keyframe = awaiting_keyframe_;
+    return stats;
+}
+
 void DecoderNode::Process(MediaPacketMessage message) {
     bool invalid_message = false;
+    bool flush_message = false;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (!accepting_) {
@@ -569,6 +603,48 @@ void DecoderNode::Process(MediaPacketMessage message) {
             // 不能重新送入新连接已经 Open 的 decoder。
             return;
         }
+
+        if (!message.eos && message.packet &&
+            message.packet->type == MediaType::VIDEO) {
+            const bool generation_changed =
+                active_generation_ != 0 &&
+                active_generation_ != message.generation;
+            if (generation_changed) {
+                // 重连后旧解码上下文的参考帧已经不再可靠。即使新代次的
+                // 第一个包不是关键帧，也必须先关闭旧上下文并等待恢复点。
+                BeginKeyframeRecoveryLocked(nullptr);
+                active_generation_ = message.generation;
+            } else if (active_generation_ == 0) {
+                // configured_stream_info_ 可能为空，首个消息才提供真实轨道
+                // 描述；此时也要建立视频的首关键帧边界。
+                awaiting_keyframe_ = true;
+            }
+
+            if (sequence_generation_ != message.generation) {
+                sequence_generation_ = message.generation;
+                last_packet_sequence_ = 0;
+            }
+
+            if (message.sequence != 0) {
+                const bool sequence_gap =
+                    last_packet_sequence_ != 0 &&
+                    (message.sequence <= last_packet_sequence_ ||
+                     message.sequence - last_packet_sequence_ > 1);
+                if (sequence_gap) {
+                    ++recovery_stats_.sequence_gaps;
+                    BeginKeyframeRecoveryLocked(
+                        "video packet sequence gap; waiting for keyframe");
+                }
+                last_packet_sequence_ = message.sequence;
+            }
+
+            if (awaiting_keyframe_ && !message.packet->keyframe) {
+                // 在恢复窗口内继续送 P/B 帧只会污染新旧参考帧状态，必须
+                // 丢弃到下一个关键帧，而不是把“有 Decode 调用”当作恢复。
+                ++recovery_stats_.dropped_until_keyframe;
+                return;
+            }
+        }
     }
 
     if (invalid_message) {
@@ -581,8 +657,9 @@ void DecoderNode::Process(MediaPacketMessage message) {
             std::lock_guard<std::mutex> lock(state_mutex_);
             active_generation_ = message.generation;
             callback_generation_ = message.generation;
+            flush_message = true;
         }
-        if (!Flush()) {
+        if (flush_message && !Flush()) {
             return;
         }
         output_.Send(MediaFrameMessage{nullptr, message.generation, true});
@@ -593,13 +670,30 @@ void DecoderNode::Process(MediaPacketMessage message) {
         return;
     }
 
+    const bool decoded_video_keyframe =
+        message.packet && message.packet->type == MediaType::VIDEO &&
+        message.packet->keyframe;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         callback_generation_ = message.generation;
         flushed_ = false;
     }
     if (!decoder_->Decode(std::move(message.packet))) {
-        SetError("decoder decode failed");
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        ++recovery_stats_.decode_failures;
+        BeginKeyframeRecoveryLocked("decoder decode failed; waiting for keyframe");
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (decoded_video_keyframe && awaiting_keyframe_) {
+            if (recovery_pending_) {
+                ++recovery_stats_.recovered_keyframes;
+            }
+            recovery_pending_ = false;
+            awaiting_keyframe_ = false;
+        }
     }
 }
 
@@ -709,6 +803,22 @@ bool DecoderNode::SameStream(const MediaStreamInfo& left,
                left_audio.channel_layout == right_audio.channel_layout;
     }
     return true;
+}
+
+void DecoderNode::BeginKeyframeRecoveryLocked(const char* reason) {
+    awaiting_keyframe_ = true;
+    recovery_pending_ = true;
+    callback_generation_ = 0;
+    flushed_ = false;
+    if (decoder_open_) {
+        // 丢包后不能继续复用旧参考帧。这里不 Flush，因为 Flush 会把已经
+        // 不完整的 GOP 当作正常尾部输出；真正的恢复边界是下一关键帧。
+        decoder_->Close();
+        decoder_open_ = false;
+    }
+    if (reason) {
+        last_error_ = reason;
+    }
 }
 
 void DecoderNode::SetError(std::string message) {

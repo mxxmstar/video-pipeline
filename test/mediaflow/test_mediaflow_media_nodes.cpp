@@ -1,5 +1,7 @@
 #include "mediaflow/mediaflow.h"
 
+#include "media/decoder/ffmpeg_decoder.h"
+#include "media/puller/ffmpeg_puller.h"
 #include "media/simple_buffer.h"
 
 #include <cassert>
@@ -11,6 +13,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#ifndef VIDEO_PIPELINE_TEST_AV_PATH
+#define VIDEO_PIPELINE_TEST_AV_PATH "test_av.ts"
+#endif
 
 namespace {
 
@@ -400,6 +406,11 @@ public:
     std::vector<std::uint64_t> Generations() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return generations_;
+    }
+
+    std::size_t Count() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return generations_.size();
     }
 
     std::string Name() const override {
@@ -888,6 +899,120 @@ void TestDecoderRejectsIncompleteStreamInfo() {
     decoder.Deinit();
 }
 
+void TestFfmpegDecoderRecoversAfterVideoPacketGap() {
+    // 该测试使用真实 FFmpegPuller/FFmpegDecoder，但不连接摄像头。跳过一个
+    // 非关键包来模拟 Queue/Dispatch 丢包，MediaFlow 序号负责把这个事实传给
+    // Decoder；因此测试验证的是实际 H.264 解码器重建，而不是模拟 Decoder
+    // 只返回一帧的理想路径。
+    FFmpegPuller puller;
+    puller.SetLowLatency(false);
+    puller.SetConnectTimeoutMs(3000);
+    puller.SetReadTimeoutMs(3000);
+    assert(puller.Open(VIDEO_PIPELINE_TEST_AV_PATH));
+
+    const auto streams = puller.GetStreamInfo();
+    assert(streams.HasVideoStream());
+    assert(streams.HasAudioStream());
+    const auto video_info =
+        streams.stream_infos[streams.video_stream_idx_];
+    const auto audio_info =
+        streams.stream_infos[streams.audio_stream_idx_];
+    auto video_stream_info =
+        std::make_shared<const MediaStreamInfo>(video_info);
+    auto audio_stream_info =
+        std::make_shared<const MediaStreamInfo>(audio_info);
+
+    auto executor = std::make_shared<AsioExecutor>("ffmpeg-recovery-test", 2);
+    Graph graph;
+    assert(graph.AddNode<DecoderNode>(
+        "decoder", executor, NodeOptions{},
+        std::make_unique<FFmpegDecoder>()));
+    assert(graph.AddNode<DecoderNode>(
+        "audio-decoder", executor, NodeOptions{},
+        std::make_unique<FFmpegDecoder>()));
+    assert(graph.AddNode<FrameSink>("sink", executor, NodeOptions{}));
+    assert(graph.AddNode<FrameSink>("audio-sink", executor, NodeOptions{}));
+    assert(graph.Connect<MediaFrameMessage>("decoder", "sink"));
+    assert(graph.Connect<MediaFrameMessage>("audio-decoder", "audio-sink"));
+    assert(graph.Start());
+
+    auto decoder = graph.GetNode<DecoderNode>("decoder");
+    auto audio_decoder = graph.GetNode<DecoderNode>("audio-decoder");
+    auto sink = graph.GetNode<FrameSink>("sink");
+    auto audio_sink = graph.GetNode<FrameSink>("audio-sink");
+    assert(decoder && audio_decoder && sink && audio_sink);
+
+    std::uint64_t video_sequence = 0;
+    std::uint64_t audio_sequence = 0;
+    bool gap_injected = false;
+    bool recovery_keyframe_sent = false;
+    std::size_t frames_before_recovery = 0;
+    int video_packets_seen = 0;
+    constexpr int kMaxVideoPackets = 360;
+
+    while (video_packets_seen < kMaxVideoPackets &&
+           (!recovery_keyframe_sent || sink->Count() <= frames_before_recovery)) {
+        std::shared_ptr<MediaPacket> packet;
+        if (!puller.ReadPacket(packet)) {
+            break;
+        }
+        if (!packet || (packet->type != MediaType::VIDEO &&
+                        packet->type != MediaType::AUDIO)) {
+            continue;
+        }
+
+        if (packet->type == MediaType::AUDIO) {
+            MediaPacketMessage audio_message;
+            audio_message.packet = std::move(packet);
+            audio_message.stream_info = audio_stream_info;
+            audio_message.generation = 1;
+            audio_message.sequence = ++audio_sequence;
+            audio_decoder->Input().Receive(std::move(audio_message));
+            continue;
+        }
+
+        ++video_packets_seen;
+        const auto packet_sequence = ++video_sequence;
+
+        // 选择首个已送出若干包后的非关键帧作为丢失包，避免把测试退化为
+        // “首包就等待关键帧”。下一条仍是依赖帧时，Decoder 应继续丢弃。
+        if (!gap_injected && video_packets_seen > 10 && !packet->keyframe) {
+            assert(sink->WaitFor(1));
+            frames_before_recovery = sink->Count();
+            gap_injected = true;
+            continue;
+        }
+
+        MediaPacketMessage message;
+        message.packet = std::move(packet);
+        message.stream_info = video_stream_info;
+        message.generation = 1;
+        message.sequence = packet_sequence;
+        const bool is_keyframe = message.packet->keyframe;
+        decoder->Input().Receive(std::move(message));
+
+        if (gap_injected && is_keyframe) {
+            recovery_keyframe_sent = true;
+        }
+    }
+
+    assert(gap_injected);
+    assert(recovery_keyframe_sent);
+    // 必须看到恢复关键帧之后新增的解码帧，不能只凭关键帧已经送入
+    // Decoder 就宣称恢复成功。
+    assert(sink->WaitFor(frames_before_recovery + 1));
+    assert(audio_sink->WaitFor(1));
+
+    const auto recovery = decoder->RecoveryStats();
+    assert(recovery.sequence_gaps >= 1);
+    assert(recovery.dropped_until_keyframe >= 1);
+    assert(recovery.recovered_keyframes >= 1);
+    assert(!recovery.awaiting_keyframe);
+
+    graph.Stop();
+    puller.Close();
+}
+
 void TestSourceStopRequestIsNonBlocking() {
     auto puller = std::make_unique<BlockingStopPuller>();
     auto* puller_state = puller.get();
@@ -1103,6 +1228,7 @@ int main() {
     TestSingleVideoChainAndReconnectGeneration();
     TestSourceTrackQueuesAreIndependent();
     TestDecoderRejectsIncompleteStreamInfo();
+    TestFfmpegDecoderRecoversAfterVideoPacketGap();
     TestSourceStopRequestIsNonBlocking();
     TestEncoderAndPublisherChain();
     TestPublisherAwaitingKeyframeState();
