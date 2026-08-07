@@ -31,6 +31,21 @@ else()
 endif()
 add_test(NAME test_mediaflow_media_nodes COMMAND test_mediaflow_media_nodes)
 
+add_executable(test_mediaflow_ffmpeg_publisher mediaflow/test_mediaflow_ffmpeg_publisher.cpp)
+target_link_libraries(test_mediaflow_ffmpeg_publisher PRIVATE video_pipeline_lib)
+target_compile_definitions(test_mediaflow_ffmpeg_publisher
+    PRIVATE
+        VIDEO_PIPELINE_TEST_AV_PATH="${CMAKE_SOURCE_DIR}/third_apps/win32/zlmediakit/www/live/video_pipeline_test/2026-07-19/09/35-46_0.ts"
+        VIDEO_PIPELINE_TEST_OUTPUT_PATH="${CMAKE_BINARY_DIR}/mediaflow_ffmpeg_publisher_acceptance.mkv"
+)
+video_pipeline_copy_runtime_dlls(test_mediaflow_ffmpeg_publisher)
+if(MSVC)
+    target_compile_options(test_mediaflow_ffmpeg_publisher PRIVATE /W3 /utf-8 /Zc:__cplusplus)
+else()
+    target_compile_options(test_mediaflow_ffmpeg_publisher PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME test_mediaflow_ffmpeg_publisher COMMAND test_mediaflow_ffmpeg_publisher)
+
 add_executable(test_spdlog test_spdlog.cpp)
 target_link_libraries(test_spdlog PRIVATE video-pipeline::spdlog)
 video_pipeline_copy_runtime_dlls(test_spdlog)

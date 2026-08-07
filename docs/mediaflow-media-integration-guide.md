@@ -498,7 +498,7 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
 <tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：使用无坏包双轨媒体源完成三轮性能复测</td></tr>
-<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6、A4-7<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20、21.7.21、21.7.22 节<br>已完成：轨道隔离、容量基础、Source 轨道序号、Decoder 关键帧恢复、统一时钟/PTS/DTS 基础组件，以及 RenderSession 和多轨 PublisherSinkNode 接入<br>后续：使用真实双轨媒体源完成端到端播放误差、真实发布交织和网络丢包互操作验收</td></tr>
+<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6、A4-7<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20、21.7.21、21.7.22、21.7.23、21.7.24 节<br>已完成：轨道隔离、容量基础、Source 轨道序号、Decoder 关键帧恢复、统一时钟/PTS/DTS 基础组件、RenderSession 和多轨 PublisherSinkNode 接入，以及本地真实 FFmpeg 双轨 mux 验收<br>待修复：本地 ZLMediaKit 双轨 600 秒长测中音频 Edge 丢弃 278 个包；后续需完成音频突发容量和调度修复，并重复长测</td></tr>
 </tbody>
 </table>
 
@@ -853,7 +853,7 @@ ctest --test-dir build -C Debug --output-on-failure
 <tr><td>A4-4</td><td>Node Dispatch 视频保护</td><td>保护节点任务队列中的视频和关键帧，并回传直投拒绝结果</td><td>第 21.7.14 节</td><td>已完成第四批修复，A/V 同步仍是后续工作</td></tr>
 <tr><td>A4-5</td><td>轨道入口队列拆分</td><td>Source 和 Router 增加独立音频/视频端口，入口 Edge 分别配置容量、背压和指标</td><td>第 21.7.15 节</td><td>已完成轨道级入口隔离；统一时钟和 A/V 同步仍需后续实施，容量预算已完成 C1-C7 离线实现和回归</td></tr>
 <tr><td>A4-6</td><td>A/V 轨道容量控制</td><td>按消息数、字节数和媒体时间长度建立分轨预算，补充水位、丢弃原因和跨轨时间差指标</td><td>第 21.7.16-21.7.20 节</td><td>容量边界、队列和活跃帧引用已通过两轮单会话双轨 600 秒复验；66.166 当前版本基线和本机双轨初步前后对照已记录；双轨本地 FFmpeg 已验证序号丢包后的关键帧恢复，最终性能验收仍需无坏包媒体源三轮复测</td></tr>
-<tr><td>A4-7</td><td>统一时钟与 PTS/DTS 调度基础</td><td>建立音频 master/system fallback 时钟、PTS/DTS 安全换算、视频 PTS 调度决策和有界 DTS 交织基础组件</td><td>第 21.7.21-21.7.22 节</td><td>基础组件、RenderSession 可中断等待/音频 master 接入、多轨 Publisher DTS 交织及双轨回归已完成；端到端设备/真实网络同步验收仍待后续</td></tr>
+<tr><td>A4-7</td><td>统一时钟与 PTS/DTS 调度基础</td><td>建立音频 master/system fallback 时钟、PTS/DTS 安全换算、视频 PTS 调度决策和有界 DTS 交织基础组件</td><td>第 21.7.21-21.7.24 节</td><td>基础组件、RenderSession 可中断等待/音频 master 接入、多轨 Publisher DTS 交织及本地真实 FFmpeg 双轨 mux 验收已完成；本地实时长测发现音频 Edge 突发丢弃，端到端设备/UDP 同步验收仍待后续</td></tr>
 </tbody>
 </table>
 
@@ -2370,3 +2370,116 @@ timestamp 错误；完整日志如下：
 2. 为音频设备不可用、暂停、EOS、重连和时钟跳变补充系统级测试；
 3. 记录音频 master 与视频实际显示 PTS 的误差分布，再据此调整早到/迟到阈值；
 4. 继续保留现场摄像头“单路 RTSP 会话”约束，不使用第二路拉流规避 A/V 问题。
+
+#### 21.7.23 本地双轨真实 FFmpeg Publisher 验收实验
+
+本阶段开始执行 21.7.22.4 规划的第一项验收。实验不连接现场摄像头，使用仓库内已经
+校验过的 H.264/AAC 双轨 TS 文件，验证 MediaFlow 的真实 `PublisherSinkNode`、真实
+`IPublisher::Create()`、FFmpeg muxer 和输出文件重读链路。实验按输入包数截取确定性片段，
+不把源文件封装 duration 当作实时播放时长。
+
+##### 21.7.23.1 实验实现
+
+新增 `test_mediaflow_ffmpeg_publisher`，主要流程如下：
+
+1. 使用 `FFmpegPuller` 打开双轨 TS，并确认同时存在 H.264 视频和 AAC 音频。
+2. 从第一个视频关键帧开始，把压缩包转换为 `EncodedPacketMessage`，交给
+   `PublisherSinkNode`；Publisher 使用真实 `IPublisher::Create()`，输出格式为 Matroska。
+3. 发送 180 个视频包及其间交织的音频包，然后分别发送视频和音频 EOS，验证多轨节点
+   只在全部轨道结束后刷出 DTS 尾包并写 trailer。
+4. 使用新的 `FFmpegPuller` 重新打开输出文件，读取所有输出包，检查双轨存在、输出
+   DTS 全局单调、每轨包数保持一致，以及每轨相对首包 PTS 保留在 2 ms 误差内。
+
+实现文件和 CMake 目标如下：
+
+| 项目 | 内容 |
+|---|---|
+| 测试源码 | `test/mediaflow/test_mediaflow_ffmpeg_publisher.cpp` |
+| CMake 目标 | `test_mediaflow_ffmpeg_publisher` |
+| 输入媒体 | `third_apps/win32/zlmediakit/www/live/video_pipeline_test/2026-07-19/09/35-46_0.ts` |
+| 输出媒体 | `build/mediaflow_ffmpeg_publisher_acceptance.mkv` |
+
+##### 21.7.23.2 验收结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| 双轨输入 | 通过 | 输入探测到 1 路 H.264 视频和 1 路 AAC 音频，未使用单轨替代 |
+| 真实 Publisher mux | 通过 | `test_mediaflow_ffmpeg_publisher` 通过，真实 FFmpeg mux 输出 Matroska 文件 |
+| 输出可重新打开 | 通过 | 输出文件可由 `FFmpegPuller` 重新打开并读取到双轨包 |
+| DTS 单调性 | 通过 | 测试逐包将输出 DTS 换算为微秒并断言全局非递减 |
+| PTS 保留 | 通过 | 每轨输出 PTS 与输入相对首包 PTS 比较，误差不超过 2 ms |
+| 包数量 | 通过 | 输出 H.264 视频 180 包、AAC 音频 179 包；与本次截取并发送的双轨输入一致 |
+| 独立 ffprobe 复核 | 通过 | 输出格式为 `matroska,webm`，视频 time base `1/1000`、音频 time base `1/1000`，文件大小约 2.27 MB |
+
+##### 21.7.23.3 当前边界
+
+本次实验验证的是本地文件到真实 FFmpeg mux 文件的双轨时序和容器收尾，尚未验证
+RTSP/UDP 网络传输、现场设备时钟、音频设备实际播放位置或长时间实时吞吐。源文件自身
+的封装 duration 与包内 PTS 分布不适合作为墙钟时长指标，因此本结果只能作为确定性
+Publisher 互操作验收，不能替代后续无坏包双轨长测。
+
+下一步继续使用稳定的本地双轨媒体源，补充真实播放端 PTS 误差采集、暂停/EOS/重连
+场景，以及需要网络协议时再单独执行 RTSP/UDP 端到端实验。
+
+#### 21.7.24 本地 FFmpeg + ZLMediaKit 双轨实时拉流长测
+
+本阶段继续执行 21.7.23.3 规划的稳定本地网络验收。实验使用本机 FFmpeg 将长视频的
+H.264 视频复制输出，并使用 `anullsrc` 生成无坏包的 AAC 音频，再通过本机 ZLMediaKit
+发布为双轨 RTSP。这样可以把现场摄像头的不稳定性与 MediaFlow 的队列、Decoder 和
+停止逻辑区分开来。本实验仍只建立一个 RTSP 拉流会话，不使用单轨输入替代双轨结果。
+
+##### 21.7.24.1 实验条件
+
+| 项目 | 配置 |
+|---|---|
+| FFmpeg | `D:\file_mx\aaaaa\learncpp\tools\win32\ffmpeg-2025-05-01-git-707c04fe06-full_build\ffmpeg.exe` |
+| ZLMediaKit | `third_apps/win32/zlmediakit/MediaServer.exe`，RTSP `127.0.0.1:554` |
+| 发布地址 | `rtsp://127.0.0.1:554/mediaflow/clean` |
+| 视频输入 | 长视频文件 H.264 视频，`-re -stream_loop -1`，`-c:v copy` |
+| 音频输入 | `anullsrc=channel_layout=stereo:sample_rate=44100`，AAC LC，128 kbps |
+| 拉流配置 | `test_stream_decode --duration-ms 600000 --url rtsp://127.0.0.1:554/mediaflow/clean` |
+| RTSP 传输 | FFmpeg 发布和 MediaFlow 拉流均使用 TCP；UDP/RTP 互操作另行验收 |
+| 构建环境 | VS 18 Community x64 Developer Command Prompt，Debug |
+
+原始视频文件的 AAC 轨道此前被 FFmpeg 报告过坏包和解码配置错误，因此本轮没有继续
+使用它作为验收音频源。`anullsrc` 只用于排除源音频损坏，不代表最终设备音频格式已经
+验证；视频仍使用原文件 H.264 码流复制，保持真实视频包和关键帧特征。
+
+##### 21.7.24.2 验收结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| ZLMediaKit 双轨注册 | 通过 | 日志报告 H.264 `1920x1242/25` 和 AAC `44100/2` 两路轨道就绪 |
+| MediaFlow 双轨打开 | 通过 | `FFmpegPuller` 检测到 1 路视频和 1 路音频，程序退出码为 `0` |
+| 600 秒 RTSP 会话 | 通过 | ZLMediaKit 记录同一拉流会话持续 `600` 秒，结束时正常收到 teardown/reset |
+| 视频稳定性 | 通过 | `source-video dropped_oldest=0`、`dropped_newest=0`、`rejected=0`；解码输出 `14775` 帧 |
+| 音频解码可用性 | 通过 | Decoder `rejected=0`，解码输出 `25545` 帧，未出现 AAC 解码错误 |
+| 时间戳诊断 | 通过 | 所有 Source/Router/Decoder Edge 的 `timestamp_invalid` 和 `timestamp_discontinuity` 均为 `0` |
+| 停止和帧内存释放 | 通过 | GracefulStop 完成；停止后 `wrappers/packed/AVBuffer=0/0/0` |
+| CPU 与内存 | 通过 | 单核等效 CPU `9.62%`；峰值 packed bytes `3593344`，峰值 AV buffer `3633005` |
+| 音频无损 | 未通过 | `source-audio dropped_oldest=275`、`router-audio dropped_oldest=3`；总丢弃 `278`，约占预期 AAC 包的 `1.08%` |
+
+##### 21.7.24.3 问题定位
+
+本轮音频丢弃发生在 Edge 容量控制，而不是 FFmpeg Decoder：`source-audio` 的最高水位
+为 `21` 帧、时间跨度约 `487619 us`，配置上限为 `500000 us`；触发时使用
+`DropOldest` 丢弃旧音频包。视频 Edge 在同一会话中没有丢包，两个 Decoder 也没有拒绝
+消息，说明当前问题是音频在 ZLMediaKit/RTSP 交付期间出现短时突发后，音频轨道预算过紧，
+而不是双轨混用或视频抢占音频队列。
+
+600 秒内视频吞吐为 `24.62 fps`，接近输入的 25 fps；音频吞吐为 `42.57 fps`，低于
+44100/1024 约 `43.07 fps` 的理论值。该差异与 `source-audio` 和 `router-audio` 的
+丢弃计数一致。当前结果可以证明本地双轨拉流、解码、长时间运行和收尾逻辑稳定，但不能
+宣称 A/V 队列容量控制已经通过无损验收。
+
+##### 21.7.24.4 后续修复要求
+
+1. 保持双轨和单 RTSP 会话约束，先增加音频突发的 PTS 间隔、队列水位和丢弃原因采样，
+   区分 ZLMediaKit 初始缓存、周期性传输突发和 Decoder 消费不足。
+2. 评估音频 `max_span_us=500000` 的容量是否需要按实时播放缓冲目标放宽，不能只提高
+   `max_items` 而继续让媒体时长上限丢包。
+3. 在修复后重复至少一轮 600 秒本地 FFmpeg + ZLMediaKit 双轨测试，验收目标为视频和
+   音频 Edge 丢弃为 `0`、Decoder rejected 为 `0`、时间戳诊断为 `0`，并保持停止后帧
+   内存归零。
+4. 完成本地 TCP 验收后，再单独使用本地 FFmpeg/ZLMediaKit 的 UDP/RTP 配置验证协议
+   差异，最后才考虑现场摄像头。
