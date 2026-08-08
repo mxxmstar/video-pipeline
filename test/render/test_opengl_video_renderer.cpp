@@ -13,10 +13,13 @@
 #include <utility>
 #include <vector>
 
+#include <glad/glad.h>
+
 #include "media/decoder/ffmpeg_decoder.h"
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/puller/ffmpeg_puller.h"
 #include "media/simple_buffer.h"
+#include "render/opengl_video_renderer.h"
 #include "render/playback_profile.h"
 
 namespace {
@@ -247,6 +250,86 @@ MediaFrame MakeRgbFrame() {
     return frame;
 }
 
+MediaFrame MakePaddedYuvFrame(PixelFormat format) {
+    VideoFrameMeta video_meta;
+    video_meta.pixel_format = format;
+    video_meta.width = 2;
+    video_meta.height = 2;
+    video_meta.plane_count = format == PixelFormat::kI420 ? 3 : 2;
+
+    MediaFrame frame;
+    frame.type = MediaType::VIDEO;
+    frame.meta = video_meta;
+
+    if (format == PixelFormat::kNV12) {
+        // Y 平面从偏移 2 开始，每行 stride 为 4；UV 平面同样保留行尾 padding。
+        std::vector<std::uint8_t> data(14, 0);
+        data[2] = 81;
+        data[3] = 81;
+        data[6] = 81;
+        data[7] = 81;
+        data[10] = 90;
+        data[11] = 240;
+        auto& meta = std::get<VideoFrameMeta>(frame.meta);
+        meta.plane_info[0].offset = 2;
+        meta.plane_info[0].stride = 4;
+        meta.plane_info[1].offset = 10;
+        meta.plane_info[1].stride = 4;
+        frame.buffer = std::make_shared<SimpleBuffer>(std::move(data));
+        return frame;
+    }
+
+    // I420 的 Y/U/V 三个平面分别使用不同 stride 和显式 offset。
+    std::vector<std::uint8_t> data(13, 0);
+    data[1] = 16;
+    data[2] = 16;
+    data[5] = 16;
+    data[6] = 16;
+    data[9] = 128;
+    data[11] = 128;
+    auto& meta = std::get<VideoFrameMeta>(frame.meta);
+    meta.plane_info[0].offset = 1;
+    meta.plane_info[0].stride = 4;
+    meta.plane_info[1].offset = 9;
+    meta.plane_info[1].stride = 2;
+    meta.plane_info[2].offset = 11;
+    meta.plane_info[2].stride = 2;
+    frame.buffer = std::make_shared<SimpleBuffer>(std::move(data));
+    return frame;
+}
+
+int TestStaticYuvRenderSmoke(PixelFormat format, const char* format_name) {
+    render::RenderConfig config;
+    config.window_width = 64;
+    config.window_height = 64;
+    config.title = "video-pipeline hidden YUV OpenGL smoke test";
+    config.visible = false;
+    config.vsync = false;
+    config.close_on_escape = false;
+
+    render::OpenGLVideoRenderer renderer;
+    if (!renderer.Init(config)) {
+        std::cerr << "YUV render smoke unavailable; skipping\n";
+        return kSkipTest;
+    }
+
+    const bool rendered = renderer.Render(MakePaddedYuvFrame(format));
+    glFinish();
+    glReadBuffer(GL_FRONT);
+    std::array<std::uint8_t, 4> pixel{};
+    glReadPixels(32, 32, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel.data());
+    const bool no_error = glGetError() == GL_NO_ERROR;
+    const bool expected_color = format == PixelFormat::kNV12
+        ? pixel[0] > 200 && pixel[1] < 20 && pixel[2] < 20
+        : pixel[0] < 20 && pixel[1] < 20 && pixel[2] < 20;
+    renderer.Shutdown();
+    if (!rendered || !no_error || !expected_color) {
+        std::cerr << "YUV render smoke failed for " << format_name << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int TestStaticRgbRenderLoop() {
     render::RenderSessionConfig config;
     config.video.window_width = 640;
@@ -319,6 +402,17 @@ int TestStaticRgbRenderSmoke() {
         std::cerr << "RenderSession did not render the submitted RGB frame: "
                   << session.LastError() << '\n';
         return 1;
+    }
+
+    const int nv12_result =
+        TestStaticYuvRenderSmoke(PixelFormat::kNV12, "NV12");
+    if (nv12_result != 0) {
+        return nv12_result;
+    }
+    const int i420_result =
+        TestStaticYuvRenderSmoke(PixelFormat::kI420, "I420");
+    if (i420_result != 0) {
+        return i420_result;
     }
     return 0;
 }

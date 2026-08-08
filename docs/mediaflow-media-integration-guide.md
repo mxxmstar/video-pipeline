@@ -2993,3 +2993,58 @@ Debug OpenGL 路径只能渲染约 `11.7%` 的输入帧，剩余工作应转向�
 - `build/playback_profile_stable_600_latest.err.log`
 - `build/playback_profile_stable_3000_latestqueue.log`
 - `build/playback_profile_stable_3000_latestqueue.err.log`
+
+#### 21.7.34 高分辨率 YUV 视频的 GPU 直接渲染
+
+21.7.33 已经解决队列保鲜问题，但 `1920x1242` Debug 长测仍只有约 `11.7%` 的输入帧进入
+视频 renderer。继续分析发现，视频 worker 每帧先在 CPU 上执行 YUV420 到 RGBA 的逐像素转换，
+再把完整 RGBA 缓冲上传到 OpenGL；这条路径同时消耗 CPU 转换时间和一份约 `9.5 MB` 的临时
+RGBA 写入带宽，成为当前主要吞吐瓶颈。
+
+##### 21.7.34.1 实施内容
+
+1. `OpenGLVideoRenderer` 增加 NV12、NV21 和 I420 的直接纹理路径：Y 平面使用 `GL_R8`，
+   NV12/NV21 的交错色度平面使用 `GL_RG8`，I420 的 U/V 平面各使用一张 `GL_R8` 纹理。
+2. 使用 `GL_UNPACK_ROW_LENGTH` 直接读取解码器提供的 stride，使用 `VideoFrameMeta` 的
+   plane offset 访问连续 packed buffer，避免为去除 padding 再复制 YUV 平面。
+3. fragment shader 根据输入格式在 GPU 上执行 BT.601 limited-range YUV->RGB 转换；RGB24、
+   BGR24 和 GRAY8 保留原有 CPU RGBA fallback，避免缩小本次改动的格式兼容范围。
+4. CPU fallback 的 `RgbaFrame` 增加 `Resize`，同尺寸帧复用 vector 容量，不再先清零整张
+   RGBA 缓冲；转换路径改为按行写入，去除逐像素通用写入函数的额外索引计算。
+5. OpenGL smoke 增加带 stride 和显式 plane offset 的 NV12/I420 测试，并通过 `glReadPixels`
+   验证 NV12 红色和 I420 黑色输出；同时检查 `glGetError`，覆盖纹理上传、shader 绘制和
+   资源释放路径。
+
+##### 21.7.34.2 阶段性验收
+
+自动回归结果：
+
+| 项目 | 结果 |
+|---|---:|
+| `test_render_frame_converter` | 通过 |
+| `test_render_session` | 通过 |
+| OpenGL RGB smoke | 通过 |
+| OpenGL NV12/I420 padded smoke | 通过 |
+| OpenGL 错误检查 | `GL_NO_ERROR` |
+
+使用本地 FFmpeg/ZLMediaKit 双轨源 `rtsp://127.0.0.1:554/mediaflow/clean` 执行稳定策略 600
+帧测试，输入视频为 `1920x1242@25 fps`，结果如下：
+
+| 指标 | GPU YUV 路径结果 |
+|---|---:|
+| 解码视频帧 | 600 |
+| 渲染视频帧 | 128 |
+| 视频总丢帧 | 470 |
+| 视频队列丢帧 | 470 |
+| AV sync 丢帧 | 0 |
+| 追赶丢帧/事件 | 0 / 0 |
+| A/V 误差范围 | `-25983 / 221181 us` |
+| 平均绝对 A/V 误差 | `10563 us` |
+| 音频 PCM 丢弃 | 0 |
+| 音频 underrun | 61 |
+
+本轮 GPU 路径约渲染 `21.3%` 的输入帧，明显高于 21.7.33 的约 `11.7%`；A/V 平均绝对误差
+从 `117566 us` 降至 `10563 us`。两次测试的帧数和设备 underrun 不完全相同，因此该比例用于
+确认优化方向有效，不能替代 Release 构建下的固定时长基准。当前结论为**阶段性通过**：
+高分辨率 CPU 转换瓶颈已绕开，下一步应补 Release 基线、不同 GPU/驱动验证，以及必要时评估
+PBO 异步上传；不应再通过继续增大音频缓存掩盖视频渲染吞吐问题。

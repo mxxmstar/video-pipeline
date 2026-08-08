@@ -22,21 +22,6 @@ int ClampByte(int value) {
 // 使用 BT.601 limited-range 的常见整数近似公式。
 // 当前解码链路主要面向常规 YUV420 视频帧，后续如需 BT.709/BT.2020，
 // 可以把 color range / matrix 信息扩展到 VideoFrameMeta 后再分支处理。
-void YuvToRgb(std::uint8_t y,
-              std::uint8_t u,
-              std::uint8_t v,
-              std::uint8_t& r,
-              std::uint8_t& g,
-              std::uint8_t& b) {
-    const int c = static_cast<int>(y) - 16;
-    const int d = static_cast<int>(u) - 128;
-    const int e = static_cast<int>(v) - 128;
-
-    r = static_cast<std::uint8_t>(ClampByte((298 * c + 409 * e + 128) >> 8));
-    g = static_cast<std::uint8_t>(ClampByte((298 * c - 100 * d - 208 * e + 128) >> 8));
-    b = static_cast<std::uint8_t>(ClampByte((298 * c + 516 * d + 128) >> 8));
-}
-
 struct PlaneView {
     const std::uint8_t* data{nullptr};
     int stride{0};
@@ -89,23 +74,8 @@ bool ResolvePlane(const MediaFrame& frame,
     return true;
 }
 
-// 将单个 RGB 像素写入 RGBA 输出帧，alpha 固定为 255。
-void WritePixel(RgbaFrame& out,
-                int x,
-                int y,
-                std::uint8_t r,
-                std::uint8_t g,
-                std::uint8_t b) {
-    const std::size_t index =
-        (static_cast<std::size_t>(y) * static_cast<std::size_t>(out.width) +
-         static_cast<std::size_t>(x)) * 4;
-    out.pixels[index + 0] = r;
-    out.pixels[index + 1] = g;
-    out.pixels[index + 2] = b;
-    out.pixels[index + 3] = 255;
-}
-
-// RGB24/BGR24 都是单 plane packed 布局，只差通道顺序。
+// RGB24/BGR24 都是单 plane packed 布局，只差通道顺序；各路径直接写入
+// 当前行的 RGBA 地址，避免在高分辨率帧上反复计算完整输出下标。
 bool ConvertPackedRgb(const MediaFrame& frame,
                       RgbaFrame& out,
                       int width,
@@ -118,14 +88,21 @@ bool ConvertPackedRgb(const MediaFrame& frame,
         return false;
     }
 
-    out.Reset(width, height);
+    out.Resize(width, height);
     for (int y = 0; y < height; ++y) {
         const std::uint8_t* src = plane.data + static_cast<std::size_t>(y) * plane.stride;
+        std::uint8_t* dst = out.pixels.data() +
+                           static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4;
         for (int x = 0; x < width; ++x) {
-            const std::uint8_t c0 = src[x * 3 + 0];
-            const std::uint8_t c1 = src[x * 3 + 1];
-            const std::uint8_t c2 = src[x * 3 + 2];
-            WritePixel(out, x, y, bgr ? c2 : c0, c1, bgr ? c0 : c2);
+            const std::size_t src_index = static_cast<std::size_t>(x) * 3;
+            const std::size_t dst_index = static_cast<std::size_t>(x) * 4;
+            const std::uint8_t c0 = src[src_index + 0];
+            const std::uint8_t c1 = src[src_index + 1];
+            const std::uint8_t c2 = src[src_index + 2];
+            dst[dst_index + 0] = bgr ? c2 : c0;
+            dst[dst_index + 1] = c1;
+            dst[dst_index + 2] = bgr ? c0 : c2;
+            dst[dst_index + 3] = 255;
         }
     }
     return true;
@@ -142,11 +119,18 @@ bool ConvertGray(const MediaFrame& frame,
         return false;
     }
 
-    out.Reset(width, height);
+    out.Resize(width, height);
     for (int y = 0; y < height; ++y) {
         const std::uint8_t* src = plane.data + static_cast<std::size_t>(y) * plane.stride;
+        std::uint8_t* dst = out.pixels.data() +
+                           static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4;
         for (int x = 0; x < width; ++x) {
-            WritePixel(out, x, y, src[x], src[x], src[x]);
+            const std::uint8_t value = src[x];
+            const std::size_t dst_index = static_cast<std::size_t>(x) * 4;
+            dst[dst_index + 0] = value;
+            dst[dst_index + 1] = value;
+            dst[dst_index + 2] = value;
+            dst[dst_index + 3] = 255;
         }
     }
     return true;
@@ -176,21 +160,29 @@ bool ConvertNv(const MediaFrame& frame,
         return false;
     }
 
-    out.Reset(width, height);
+    out.Resize(width, height);
     for (int y = 0; y < height; ++y) {
         const std::uint8_t* y_row =
             y_plane.data + static_cast<std::size_t>(y) * y_plane.stride;
         const std::uint8_t* uv_row =
             uv_plane.data + static_cast<std::size_t>(y / 2) * uv_plane.stride;
+        std::uint8_t* dst = out.pixels.data() +
+                           static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4;
         for (int x = 0; x < width; ++x) {
             const int chroma = (x / 2) * 2;
             const std::uint8_t u = nv21 ? uv_row[chroma + 1] : uv_row[chroma + 0];
             const std::uint8_t v = nv21 ? uv_row[chroma + 0] : uv_row[chroma + 1];
-            std::uint8_t r = 0;
-            std::uint8_t g = 0;
-            std::uint8_t b = 0;
-            YuvToRgb(y_row[x], u, v, r, g, b);
-            WritePixel(out, x, y, r, g, b);
+            const int c = static_cast<int>(y_row[x]) - 16;
+            const int d = static_cast<int>(u) - 128;
+            const int e = static_cast<int>(v) - 128;
+            const std::size_t dst_index = static_cast<std::size_t>(x) * 4;
+            dst[dst_index + 0] = static_cast<std::uint8_t>(
+                ClampByte((298 * c + 409 * e + 128) >> 8));
+            dst[dst_index + 1] = static_cast<std::uint8_t>(
+                ClampByte((298 * c - 100 * d - 208 * e + 128) >> 8));
+            dst[dst_index + 2] = static_cast<std::uint8_t>(
+                ClampByte((298 * c + 516 * d + 128) >> 8));
+            dst[dst_index + 3] = 255;
         }
     }
     return true;
@@ -225,7 +217,7 @@ bool ConvertI420(const MediaFrame& frame,
         return false;
     }
 
-    out.Reset(width, height);
+    out.Resize(width, height);
     for (int y = 0; y < height; ++y) {
         const std::uint8_t* y_row =
             y_plane.data + static_cast<std::size_t>(y) * y_plane.stride;
@@ -233,12 +225,20 @@ bool ConvertI420(const MediaFrame& frame,
             u_plane.data + static_cast<std::size_t>(y / 2) * u_plane.stride;
         const std::uint8_t* v_row =
             v_plane.data + static_cast<std::size_t>(y / 2) * v_plane.stride;
+        std::uint8_t* dst = out.pixels.data() +
+                           static_cast<std::size_t>(y) * static_cast<std::size_t>(width) * 4;
         for (int x = 0; x < width; ++x) {
-            std::uint8_t r = 0;
-            std::uint8_t g = 0;
-            std::uint8_t b = 0;
-            YuvToRgb(y_row[x], u_row[x / 2], v_row[x / 2], r, g, b);
-            WritePixel(out, x, y, r, g, b);
+            const int c = static_cast<int>(y_row[x]) - 16;
+            const int d = static_cast<int>(u_row[x / 2]) - 128;
+            const int e = static_cast<int>(v_row[x / 2]) - 128;
+            const std::size_t dst_index = static_cast<std::size_t>(x) * 4;
+            dst[dst_index + 0] = static_cast<std::uint8_t>(
+                ClampByte((298 * c + 409 * e + 128) >> 8));
+            dst[dst_index + 1] = static_cast<std::uint8_t>(
+                ClampByte((298 * c - 100 * d - 208 * e + 128) >> 8));
+            dst[dst_index + 2] = static_cast<std::uint8_t>(
+                ClampByte((298 * c + 516 * d + 128) >> 8));
+            dst[dst_index + 3] = 255;
         }
     }
     return true;

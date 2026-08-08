@@ -16,6 +16,17 @@ struct RgbaFrame {
     int height{0};
     std::vector<std::uint8_t> pixels;
 
+    /// @brief 只调整输出缓冲区尺寸，不清空已经分配的内容。
+    ///
+    /// FrameConverter 每帧都会覆盖全部 RGBA 像素，因此复用同尺寸缓冲区时
+    /// 不需要先做一次完整 memset。尺寸变化时 vector 仍会按需扩容。
+    void Resize(int new_width, int new_height) {
+        width = new_width;
+        height = new_height;
+        pixels.resize(static_cast<std::size_t>(width) *
+                      static_cast<std::size_t>(height) * 4);
+    }
+
     /// @brief 重置尺寸并清空像素数据。
     ///
     /// pixels 始终按 width * height * 4 分配，每个像素顺序为 R/G/B/A。

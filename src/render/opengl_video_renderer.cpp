@@ -1,6 +1,7 @@
 #include "render/opengl_video_renderer.h"
 
 #include <array>
+#include <cstddef>
 #include <iostream>
 #include <utility>
 
@@ -22,15 +23,46 @@ void main() {
 }
 )";
 
-// 片元 shader 从 RGBA 纹理采样并直接输出。
-// 颜色空间转换已经在 CPU 侧 FrameConverter 完成。
+// 片元 shader 同时支持 RGBA fallback 和 YUV 平面纹理。
+// YUV 路径把颜色转换放到 GPU，避免高分辨率视频每帧在 CPU 上逐像素转换。
 constexpr const char* kFragmentShader = R"(
 #version 330 core
 in vec2 vUV;
 out vec4 FragColor;
-uniform sampler2D uTex;
+uniform sampler2D uTex0;
+uniform sampler2D uTex1;
+uniform sampler2D uTex2;
+uniform int uPixelFormat;
+
+vec3 yuvToRgb(float y, float u, float v) {
+    float luma = (y - 16.0 / 255.0) * (298.0 / 256.0);
+    float chromaU = u - 128.0 / 255.0;
+    float chromaV = v - 128.0 / 255.0;
+    return clamp(vec3(
+        luma + (409.0 / 256.0) * chromaV,
+        luma - (100.0 / 256.0) * chromaU - (208.0 / 256.0) * chromaV,
+        luma + (516.0 / 256.0) * chromaU), 0.0, 1.0);
+}
+
 void main() {
-    FragColor = texture(uTex, vUV);
+    if (uPixelFormat == 0) {
+        FragColor = texture(uTex0, vUV);
+        return;
+    }
+
+    float y = texture(uTex0, vUV).r;
+    if (uPixelFormat == 1 || uPixelFormat == 2) {
+        vec2 uv = texture(uTex1, vUV).rg;
+        if (uPixelFormat == 2) {
+            uv = uv.yx;
+        }
+        FragColor = vec4(yuvToRgb(y, uv.x, uv.y), 1.0);
+        return;
+    }
+
+    float u = texture(uTex1, vUV).r;
+    float v = texture(uTex2, vUV).r;
+    FragColor = vec4(yuvToRgb(y, u, v), 1.0);
 }
 )";
 
@@ -74,17 +106,27 @@ bool OpenGLVideoRenderer::Render(const MediaFrame& frame) {
         return false;
     }
 
-    // 先把业务侧 MediaFrame 统一转换成 RGBA8，OpenGL 上传路径只处理这一种格式。
-    std::string convert_error;
-    if (!converter_.ConvertToRgba(frame, rgba_frame_, &convert_error)) {
-        SetError(std::move(convert_error));
-        return false;
-    }
-
     // GLFW context 是线程相关状态；每次渲染前显式绑定当前窗口更稳妥。
     glfwMakeContextCurrent(window_);
-    if (!UploadTexture(rgba_frame_)) {
-        return false;
+    int shader_format = 0;
+    const auto pixel_format = frame.GetPixelFormat();
+    if (pixel_format == PixelFormat::kNV12 ||
+        pixel_format == PixelFormat::kNV21 ||
+        pixel_format == PixelFormat::kI420) {
+        if (!UploadYuvTextures(frame, shader_format)) {
+            return false;
+        }
+    } else {
+        // RGB/BGR/GRAY 等格式继续走 CPU fallback，保证 renderer 对非 YUV
+        // 输入保持原有兼容范围。
+        std::string convert_error;
+        if (!converter_.ConvertToRgba(frame, rgba_frame_, &convert_error)) {
+            SetError(std::move(convert_error));
+            return false;
+        }
+        if (!UploadTexture(rgba_frame_)) {
+            return false;
+        }
     }
 
     int fb_width = 0;
@@ -96,8 +138,14 @@ bool OpenGLVideoRenderer::Render(const MediaFrame& frame) {
 
     // 绘制覆盖整个窗口的两个三角形，片元 shader 从视频纹理采样。
     glUseProgram(program_);
+    glUniform1i(pixel_format_uniform_, shader_format);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, texture_);
+    glBindTexture(GL_TEXTURE_2D, shader_format == 0 ? texture_ : texture_y_);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, texture_plane1_);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, texture_plane2_);
+    glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(vao_);
     glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, nullptr);
     glBindVertexArray(0);
@@ -140,6 +188,16 @@ void OpenGLVideoRenderer::Shutdown() {
     initialized_ = false;
     texture_width_ = 0;
     texture_height_ = 0;
+    texture_y_width_ = 0;
+    texture_y_height_ = 0;
+    texture_y_internal_format_ = 0;
+    texture_plane1_width_ = 0;
+    texture_plane1_height_ = 0;
+    texture_plane1_internal_format_ = 0;
+    texture_plane2_width_ = 0;
+    texture_plane2_height_ = 0;
+    texture_plane2_internal_format_ = 0;
+    pixel_format_uniform_ = -1;
 }
 
 bool OpenGLVideoRenderer::CreateWindow() {
@@ -207,9 +265,19 @@ bool OpenGLVideoRenderer::CreateProgram() {
         return false;
     }
 
-    // uTex 固定绑定到 texture unit 0，Render() 中每帧只需要绑定纹理对象。
+    // 固定绑定三个纹理单元：RGBA/Y、UV 或 U、V。Render() 只切换格式
+    // 标志和实际存在的纹理对象，不需要重新查询 uniform。
     glUseProgram(program_);
-    glUniform1i(glGetUniformLocation(program_, "uTex"), 0);
+    glUniform1i(glGetUniformLocation(program_, "uTex0"), 0);
+    glUniform1i(glGetUniformLocation(program_, "uTex1"), 1);
+    glUniform1i(glGetUniformLocation(program_, "uTex2"), 2);
+    pixel_format_uniform_ = glGetUniformLocation(program_, "uPixelFormat");
+    if (pixel_format_uniform_ < 0) {
+        SetError("failed to locate YUV format uniform");
+        glDeleteProgram(program_);
+        program_ = 0;
+        return false;
+    }
     return true;
 }
 
@@ -304,10 +372,264 @@ bool OpenGLVideoRenderer::UploadTexture(const RgbaFrame& frame) {
     return true;
 }
 
+namespace {
+
+struct UploadPlaneView {
+    const std::uint8_t* data{nullptr};
+    int stride{0};
+};
+
+bool ResolveUploadPlane(const MediaFrame& frame,
+                        int plane,
+                        std::size_t fallback_offset,
+                        int row_bytes,
+                        int rows,
+                        UploadPlaneView& out,
+                        std::string& error) {
+    const auto* base = frame.buffer ? frame.buffer->Data() : nullptr;
+    const std::size_t size = frame.buffer ? frame.buffer->Size() : 0;
+    if (!base || size == 0) {
+        error = "YUV frame buffer is empty";
+        return false;
+    }
+
+    const int stride = frame.Stride(plane) > 0 ? frame.Stride(plane) : row_bytes;
+    if (row_bytes <= 0 || rows <= 0 || stride < row_bytes) {
+        error = "invalid YUV plane stride";
+        return false;
+    }
+
+    const std::size_t offset = frame.PlaneOffset(plane) > 0
+        ? static_cast<std::size_t>(frame.PlaneOffset(plane))
+        : fallback_offset;
+    if (offset > size) {
+        error = "YUV plane offset exceeds frame buffer";
+        return false;
+    }
+
+    const std::size_t last_row_offset =
+        static_cast<std::size_t>(stride) * static_cast<std::size_t>(rows - 1);
+    const std::size_t remaining = size - offset;
+    if (last_row_offset > remaining ||
+        static_cast<std::size_t>(row_bytes) > remaining - last_row_offset) {
+        error = "YUV plane exceeds frame buffer";
+        return false;
+    }
+
+    out.data = base + offset;
+    out.stride = stride;
+    return true;
+}
+
+} // namespace
+
+bool OpenGLVideoRenderer::UploadPlane(std::uint32_t& texture,
+                                      int& texture_width,
+                                      int& texture_height,
+                                      unsigned int& texture_internal_format,
+                                      int width,
+                                      int height,
+                                      int row_bytes,
+                                      int stride,
+                                      const std::uint8_t* data,
+                                      unsigned int pixel_format,
+                                      unsigned int internal_format,
+                                      const char* plane_name) {
+    const int bytes_per_pixel = internal_format == GL_RG8 ? 2 : 1;
+    if (width <= 0 || height <= 0 || row_bytes <= 0 || stride < row_bytes ||
+        stride % bytes_per_pixel != 0 || !data) {
+        SetError(std::string("invalid ") + plane_name + " upload layout");
+        return false;
+    }
+
+    if (texture == 0) {
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, texture);
+    }
+
+    // GL_UNPACK_ROW_LENGTH 让 GPU 直接读取解码器的 stride，避免为了去除
+    // padding 再复制一份 Y/UV 平面。
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / bytes_per_pixel);
+    if (width != texture_width || height != texture_height ||
+        texture_internal_format != internal_format) {
+        glTexImage2D(GL_TEXTURE_2D,
+                     0,
+                     static_cast<GLint>(internal_format),
+                     width,
+                     height,
+                     0,
+                     pixel_format,
+                     GL_UNSIGNED_BYTE,
+                     data);
+        texture_width = width;
+        texture_height = height;
+        texture_internal_format = internal_format;
+    } else {
+        glTexSubImage2D(GL_TEXTURE_2D,
+                        0,
+                        0,
+                        0,
+                        width,
+                        height,
+                        pixel_format,
+                        GL_UNSIGNED_BYTE,
+                        data);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    return true;
+}
+
+bool OpenGLVideoRenderer::UploadYuvTextures(const MediaFrame& frame,
+                                            int& shader_format) {
+    const int width = frame.Width();
+    const int height = frame.Height();
+    if (width <= 0 || height <= 0) {
+        SetError("invalid YUV frame size");
+        return false;
+    }
+
+    const int chroma_width = (width + 1) / 2;
+    const int chroma_height = (height + 1) / 2;
+    const auto format = frame.GetPixelFormat();
+    std::string error;
+    UploadPlaneView y_plane;
+    if (!ResolveUploadPlane(frame, 0, 0, width, height, y_plane, error)) {
+        SetError(std::move(error));
+        return false;
+    }
+
+    const std::size_t y_size =
+        static_cast<std::size_t>(y_plane.stride) * static_cast<std::size_t>(height);
+    if (!UploadPlane(texture_y_,
+                     texture_y_width_,
+                     texture_y_height_,
+                     texture_y_internal_format_,
+                     width,
+                     height,
+                     width,
+                     y_plane.stride,
+                     y_plane.data,
+                     GL_RED,
+                     GL_R8,
+                     "Y")) {
+        return false;
+    }
+
+    if (format == PixelFormat::kNV12 || format == PixelFormat::kNV21) {
+        UploadPlaneView uv_plane;
+        if (!ResolveUploadPlane(frame,
+                                1,
+                                y_size,
+                                chroma_width * 2,
+                                chroma_height,
+                                uv_plane,
+                                error)) {
+            SetError(std::move(error));
+            return false;
+        }
+        if (!UploadPlane(texture_plane1_,
+                         texture_plane1_width_,
+                         texture_plane1_height_,
+                         texture_plane1_internal_format_,
+                         chroma_width,
+                         chroma_height,
+                         chroma_width * 2,
+                         uv_plane.stride,
+                         uv_plane.data,
+                         GL_RG,
+                         GL_RG8,
+                         "UV")) {
+            return false;
+        }
+        shader_format = format == PixelFormat::kNV21 ? 2 : 1;
+        return true;
+    }
+
+    if (format == PixelFormat::kI420) {
+        UploadPlaneView u_plane;
+        if (!ResolveUploadPlane(frame,
+                                1,
+                                y_size,
+                                chroma_width,
+                                chroma_height,
+                                u_plane,
+                                error)) {
+            SetError(std::move(error));
+            return false;
+        }
+        const std::size_t u_size =
+            static_cast<std::size_t>(u_plane.stride) *
+            static_cast<std::size_t>(chroma_height);
+        UploadPlaneView v_plane;
+        if (!ResolveUploadPlane(frame,
+                                2,
+                                y_size + u_size,
+                                chroma_width,
+                                chroma_height,
+                                v_plane,
+                                error)) {
+            SetError(std::move(error));
+            return false;
+        }
+
+        if (!UploadPlane(texture_plane1_,
+                         texture_plane1_width_,
+                         texture_plane1_height_,
+                         texture_plane1_internal_format_,
+                         chroma_width,
+                         chroma_height,
+                         chroma_width,
+                         u_plane.stride,
+                         u_plane.data,
+                         GL_RED,
+                         GL_R8,
+                         "U") ||
+            !UploadPlane(texture_plane2_,
+                         texture_plane2_width_,
+                         texture_plane2_height_,
+                         texture_plane2_internal_format_,
+                         chroma_width,
+                         chroma_height,
+                         chroma_width,
+                         v_plane.stride,
+                         v_plane.data,
+                         GL_RED,
+                         GL_R8,
+                         "V")) {
+            return false;
+        }
+        shader_format = 3;
+        return true;
+    }
+
+    SetError("unsupported direct YUV format");
+    return false;
+}
+
 void OpenGLVideoRenderer::DestroyGlResources() {
     if (texture_ != 0) {
         glDeleteTextures(1, &texture_);
         texture_ = 0;
+    }
+    if (texture_y_ != 0) {
+        glDeleteTextures(1, &texture_y_);
+        texture_y_ = 0;
+    }
+    if (texture_plane1_ != 0) {
+        glDeleteTextures(1, &texture_plane1_);
+        texture_plane1_ = 0;
+    }
+    if (texture_plane2_ != 0) {
+        glDeleteTextures(1, &texture_plane2_);
+        texture_plane2_ = 0;
     }
     if (ebo_ != 0) {
         glDeleteBuffers(1, &ebo_);
