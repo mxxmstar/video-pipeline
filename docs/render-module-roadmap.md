@@ -147,7 +147,7 @@ struct RenderSessionConfig {
     bool enable_audio{true};
     int max_video_queue_frames{6};
     int max_audio_queue_frames{50};
-    int target_latency_ms{120};
+    int playback_buffer_ms{120};
     bool drop_late_video_frames{true};
 };
 

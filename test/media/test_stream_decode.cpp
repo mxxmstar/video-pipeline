@@ -239,9 +239,11 @@ int main(int argc, char* argv[]) {
         NodeExecutionMode::Serialized,
         4096};
     decode_node_options.prefer_video_keyframes = true;
-    // 队列预算属于 Pipeline 配置。设备适配层可在这里复制默认配置并覆盖轨道
-    // 参数，Graph 连接阶段只接收已经生成好的边配置。
-    const MediaFlowPipelineConfig pipeline_config;
+    // 面向真实 RTSP 拉流验证时，选择稳定播放预设。它保持此前已验收的 1 秒
+    // 压缩包抖动窗口，同时由统一策略生成解码帧队列容量；Graph 连接阶段只接收
+    // 已经生成好的边配置，不再分别维护音频和视频常量。
+    const auto playback_profile = PlaybackProfile::StablePlayback();
+    const auto pipeline_config = playback_profile.MakePipelineConfig();
     const auto video_packet_edge_options =
         pipeline_config.MakePacketEdgeOptions(QueueTrack::Video);
     const auto audio_packet_edge_options =

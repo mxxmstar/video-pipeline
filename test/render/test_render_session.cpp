@@ -1,4 +1,5 @@
 #include "render/render_session.h"
+#include "render/playback_profile.h"
 
 #include <atomic>
 #include <chrono>
@@ -174,6 +175,32 @@ bool WaitUntil(Predicate predicate,
         std::this_thread::sleep_for(2ms);
     }
     return predicate();
+}
+
+bool TestPlaybackProfileMapsToRenderSessionConfig() {
+    const auto low_latency_config = render::MakeRenderSessionConfig(
+        mediaflow::PlaybackProfile::LowLatencyPreview());
+    if (low_latency_config.audio.buffer_duration_ms != 100 ||
+        low_latency_config.audio.queue_capacity_chunks != 19 ||
+        low_latency_config.max_video_queue_frames != 7 ||
+        low_latency_config.max_audio_queue_frames != 50 ||
+        low_latency_config.playback_buffer_ms != 120 ||
+        !low_latency_config.drop_late_video_frames ||
+        !low_latency_config.av_sync.drop_late_video_frames ||
+        low_latency_config.av_sync.late_threshold_ms != 80) {
+        return false;
+    }
+
+    const auto stable_config = render::MakeRenderSessionConfig(
+        mediaflow::PlaybackProfile::StablePlayback());
+    return stable_config.audio.buffer_duration_ms == 200 &&
+           stable_config.audio.queue_capacity_chunks == 38 &&
+           stable_config.max_video_queue_frames == 16 &&
+           stable_config.max_audio_queue_frames == 50 &&
+           stable_config.playback_buffer_ms == 400 &&
+           !stable_config.drop_late_video_frames &&
+           !stable_config.av_sync.drop_late_video_frames &&
+           stable_config.av_sync.late_threshold_ms == 200;
 }
 
 bool TestVideoQueueDropsOldestFrame() {
@@ -481,6 +508,10 @@ bool TestAudioStartupWaitsForSharedTimeline() {
 } // namespace
 
 int main() {
+    if (!TestPlaybackProfileMapsToRenderSessionConfig()) {
+        std::cerr << "TestPlaybackProfileMapsToRenderSessionConfig failed\n";
+        return 1;
+    }
     if (!TestVideoQueueDropsOldestFrame()) {
         std::cerr << "TestVideoQueueDropsOldestFrame failed\n";
         return 1;

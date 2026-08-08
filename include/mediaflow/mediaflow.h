@@ -17,3 +17,4 @@
 #include "mediaflow/media_pipeline_config.h"
 #include "mediaflow/media_timing.h"
 #include "mediaflow/media_nodes.h"
+#include "mediaflow/playback_profile.h"

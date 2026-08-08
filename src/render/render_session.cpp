@@ -49,8 +49,8 @@ bool IsValidConfig(const RenderSessionConfig& config, std::string& error) {
         error = "max_audio_queue_frames must be greater than 0";
         return false;
     }
-    if (config.target_latency_ms < 0) {
-        error = "target_latency_ms must be greater than or equal to 0";
+    if (config.playback_buffer_ms < 0) {
+        error = "playback_buffer_ms must be greater than or equal to 0";
         return false;
     }
     return true;
@@ -724,12 +724,12 @@ private:
                 clock_snapshot = mediaflow_clock_.Snapshot(false);
                 if (audio_master_ready) {
                     // 设备 buffer 只能覆盖硬件正在排队的 PCM；上层还需要预留
-                    // target_latency_ms 吸收解码回调与 WASAPI event 的相位差。
+                    // playback_buffer_ms 吸收解码回调与 WASAPI event 的相位差。
                     // 两者相加仍以“真实已播放 PTS”为基准，不会把输入消费速度
                     // 误当成音频时钟。
                     allowed_lead_us = MillisecondsToUs(
                         config_.audio.buffer_duration_ms) +
-                        MillisecondsToUs(config_.target_latency_ms);
+                        MillisecondsToUs(config_.playback_buffer_ms);
                 }
             }
 

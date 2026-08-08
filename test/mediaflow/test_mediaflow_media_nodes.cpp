@@ -147,6 +147,57 @@ void TestMediaFlowPipelineConfig() {
     assert(video_frame.backpressure == BackpressurePolicy::DropOldest);
 }
 
+void TestPlaybackProfileBuildsPipelineConfig() {
+    const auto low_latency = PlaybackProfile::LowLatencyPreview();
+    assert(low_latency.IsValid());
+    assert(low_latency.EffectivePlaybackBufferMs() == 220);
+    assert(low_latency.ResolveVideoQueueFrames() == 7);
+    assert(low_latency.ResolveAudioQueueFrames() == 50);
+    assert(low_latency.ResolveAudioPcmQueueChunks() == 19);
+
+    const auto low_latency_pipeline = low_latency.MakePipelineConfig();
+    assert(low_latency_pipeline.video_packet.max_span_us == 250'000);
+    assert(low_latency_pipeline.audio_packet.max_span_us == 250'000);
+    assert(low_latency_pipeline.video_frame.max_span_us == 250'000);
+    assert(low_latency_pipeline.video_frame.max_items == 8);
+    assert(low_latency_pipeline.audio_frame.max_span_us == 500'000);
+    assert(low_latency_pipeline.audio_frame.max_items == 64);
+
+    const auto stable = PlaybackProfile::StablePlayback();
+    assert(stable.IsValid());
+    assert(stable.EffectivePlaybackBufferMs() == 600);
+    assert(stable.ResolveVideoQueueFrames() == 16);
+    assert(stable.ResolveAudioQueueFrames() == 50);
+    assert(stable.ResolveAudioPcmQueueChunks() == 38);
+
+    const auto stable_pipeline = stable.MakePipelineConfig();
+    assert(stable_pipeline.video_packet.max_span_us == 1'000'000);
+    assert(stable_pipeline.audio_packet.max_span_us == 1'000'000);
+    assert(stable_pipeline.video_frame.max_span_us == 600'000);
+    assert(stable_pipeline.video_frame.max_items == 16);
+    assert(stable_pipeline.audio_frame.max_span_us == 600'000);
+    assert(stable_pipeline.audio_frame.max_items == 64);
+
+    auto custom = PlaybackProfile::Custom();
+    custom.playback_buffer_ms = 300;
+    custom.network_jitter_buffer_ms = 600;
+    custom.audio_device_buffer_ms = 150;
+    custom.expected_video_frame_rate = 30;
+    custom.max_video_queue_frames = 24;
+    custom.max_audio_queue_frames = 72;
+    assert(custom.IsValid());
+    const auto custom_pipeline = custom.MakePipelineConfig();
+    assert(custom_pipeline.video_packet.max_span_us == 600'000);
+    assert(custom_pipeline.audio_packet.max_span_us == 600'000);
+    assert(custom_pipeline.video_frame.max_span_us == 450'000);
+    assert(custom_pipeline.video_frame.max_items == 24);
+    assert(custom_pipeline.audio_frame.max_span_us == 500'000);
+    assert(custom_pipeline.audio_frame.max_items == 72);
+
+    custom.audio_device_buffer_ms = 0;
+    assert(!custom.IsValid());
+}
+
 class ScriptedPuller final : public IPuller {
 public:
     bool Open(const std::string&) override {
@@ -1356,6 +1407,7 @@ void TestPublisherInterleavesMultipleTracksByDts() {
 int main() {
     TestMediaQueueItemCostTraits();
     TestMediaFlowPipelineConfig();
+    TestPlaybackProfileBuildsPipelineConfig();
     TestSingleVideoChainAndReconnectGeneration();
     TestSourceTrackQueuesAreIndependent();
     TestDecoderRejectsIncompleteStreamInfo();

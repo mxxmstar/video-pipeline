@@ -2665,7 +2665,7 @@ PTS，视频随后被误判为晚帧。当前实现改为以下策略：
    将 PCM 交给 WASAPI。第一次 audio master 因而从真实播放点建立，不会抢跑。
 4. 后续音频提交最多领先实际播放位置一个 WASAPI buffer，并在有无音频输入时都刷新
    `PlayedPtsUs()`；视频调度能持续读取由声卡驱动的 audio master，而不是上一次输入
-   回调的静态快照。`target_latency_ms` 作为设备 buffer 之外的前瞻余量，用于覆盖
+   回调的静态快照。`playback_buffer_ms` 作为设备 buffer 之外的前瞻余量，用于覆盖
    解码回调与 WASAPI event 的相位差。
 5. `test_opengl_video_renderer` 新增 `--no-av-sync`、`--video-queue-frames`、
    `--audio-queue-frames` 和 `--drain-ms`。这些参数只用于稳定源 A/B 验收，默认值仍
@@ -2701,3 +2701,73 @@ PTS，视频随后被误判为晚帧。当前实现改为以下策略：
 5. 下一轮使用本机稳定双轨源执行至少 3000 视频帧，验收 audio master 样本连续增长、
    视频队列不持续满、PCM 丢弃为 `0`，并在起播瞬态与稳态分别设置误差阈值；现场
    摄像头继续遵守单路 RTSP 约束。
+
+#### 21.7.29 对外播放策略配置
+
+此前 `MediaFlowPipelineConfig` 和 `RenderSessionConfig` 分别暴露了队列与渲染参数。
+业务调用方若自行分别设置它们，容易出现“音频允许缓存 600 ms、视频渲染队列却只有
+240 ms”的配置矛盾。本阶段新增 `mediaflow::PlaybackProfile`，以单一策略统一生成
+Pipeline 和渲染侧需要的参数。
+
+##### 21.7.29.1 公开接口与边界
+
+```cpp
+const auto profile = mediaflow::PlaybackProfile::StablePlayback();
+const auto pipeline_config = profile.MakePipelineConfig();
+auto render_config = render::MakeRenderSessionConfig(profile);
+
+render_config.video.window_width = 1920;
+render_config.video.window_height = 1080;
+```
+
+`mediaflow::PlaybackProfile` 只依赖 MediaFlow 核心，并生成四条媒体边的配置；
+`render::MakeRenderSessionConfig()` 单向依赖该策略，生成 WASAPI 和 A/V 调度配置。
+因此 MediaFlow 不依赖渲染模块，业务代码也不需要手工保持两层音视频容量一致。
+
+| 字段 | 含义 | 何时调整 |
+|---|---|---|
+| `playback_buffer_ms` | 设备 buffer 之外允许保留的额外播放缓存 | 允许以更高延迟换取稳定性时增大 |
+| `network_jitter_buffer_ms` | 压缩包入口吸收网络抖动的媒体时间窗口 | 网络短时突发或 RTSP 到包不均匀时增大 |
+| `audio_device_buffer_ms` | WASAPI 设备目标 buffer | 由设备表现决定，通常保持预设值 |
+| `expected_video_frame_rate` | 自动计算视频队列容量的预估帧率 | 已知源帧率明显不是 25 fps 时调整 |
+| `max_video_queue_frames` / `max_audio_queue_frames` | 显式覆盖自动计算结果，`0` 表示自动 | 仅在已测得的特殊设备约束下使用 |
+
+`RenderSessionConfig::target_latency_ms` 同时改名为
+`RenderSessionConfig::playback_buffer_ms`，明确它不是端到端延迟承诺，而是设备
+buffer 之外的额外播放缓存。总的音频前瞻窗口为：
+`audio_device_buffer_ms + playback_buffer_ms`。
+
+##### 21.7.29.2 预设参数和策略
+
+| 模式 | 额外播放缓存 | 网络抖动窗口 | 音频设备 buffer | 有效播放窗口 | 视频晚帧策略 |
+|---|---:|---:|---:|---:|---|
+| `LowLatencyPreview` | 120 ms | 250 ms | 100 ms | 220 ms | 队列满覆盖旧帧，超过 80 ms 的晚帧可丢弃 |
+| `StablePlayback` | 400 ms | 1000 ms | 200 ms | 600 ms | 保留队列内容，不因 200 ms 内的调度偏差主动丢弃 |
+| `Custom` | 继承低延时默认值后由调用方覆盖 | 同左 | 同左 | 由字段计算 | 直接使用底层配置补充特殊策略 |
+
+自动推导时，视频渲染队列按“有效播放窗口 x 预估帧率 + 1 帧”计算，且不小于 6 帧；
+音频帧队列和 PCM chunk 队列按 20 ms 音频帧估算并保留已有最小容量。解码后的
+MediaFlow 视频帧、音频帧队列还分别保持至少 250 ms、500 ms 的媒体时间窗口，避免
+小缓存配置在解码调度抖动时立刻退化。
+
+##### 21.7.29.3 实施与验收
+
+1. 新增 `include/mediaflow/playback_profile.h`，提供低延时、稳定播放和自定义工厂，
+   并生成与策略一致的 `MediaFlowPipelineConfig`。
+2. 新增 `include/render/playback_profile.h` 和转换函数，统一设置音频设备 buffer、
+   PCM 队列、音视频渲染队列、额外播放缓存和晚帧策略。
+3. `test_stream_decode` 已改用 `StablePlayback` 生成 Graph 的四条媒体边；其压缩包
+   预算与此前通过的 1 秒网络验收配置一致。
+4. `test_mediaflow_media_nodes` 覆盖低延时、稳定播放和显式覆盖容量的推导结果；
+   `test_render_session` 覆盖策略到渲染会话配置的映射结果。
+
+##### 21.7.29.4 验收结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| VS 18 x64 Debug 构建 | 通过 | `test_mediaflow_media_nodes`、`test_render_session`、`test_stream_decode` 均重新编译和链接成功 |
+| Profile 到 Pipeline 推导 | 通过 | 低延时预设生成 250 ms 压缩包窗口；稳定播放生成 1 秒压缩包窗口和 600 ms 解码帧窗口；显式容量覆盖也通过回归 |
+| Profile 到渲染映射 | 通过 | 低延时映射为 100 ms 设备 buffer、120 ms 额外缓存；稳定播放映射为 200 ms 设备 buffer、400 ms 额外缓存和 16 帧视频队列 |
+| 既有时序回归 | 通过 | `test_mediaflow`、`test_mediaflow_timing`、`test_mediaflow_media_nodes`、`test_render_session`、`test_audio_render_strategy` 共 5/5 通过 |
+
+本阶段只完成配置契约和确定性回归，不以此替代 21.7.28 所列的 3000 帧真实播放长测。

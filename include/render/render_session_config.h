@@ -32,8 +32,11 @@ struct RenderSessionConfig {
     /// 音频待播放队列的最大帧数。第一版同样丢弃最旧帧，阶段 3 将改为 ring buffer。
     std::size_t max_audio_queue_frames{50};
 
-    /// 目标端到端延迟，暂作为后续 AV sync 和缓冲策略的配置入口。
-    int target_latency_ms{120};
+    /// 设备 buffer 之外允许保留的额外播放缓存。
+    ///
+    /// 该值由上层播放策略决定，用于吸收解码回调和 WASAPI event 的相位差；与
+    /// audio.buffer_duration_ms 相加才是音频允许领先实际播放位置的总窗口。
+    int playback_buffer_ms{120};
 
     /// 是否允许在低延迟场景丢弃过期视频帧；阶段 2 用于控制队列满时的策略。
     bool drop_late_video_frames{true};
