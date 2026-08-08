@@ -104,6 +104,7 @@ public:
         audio_queue_.clear();
         stats_ = {};
         video_catch_up_mode_ = false;
+        video_render_start_announced_ = false;
         initialized_ = true;
         running_ = false;
         paused_ = false;
@@ -508,38 +509,55 @@ private:
                 if (sync_action == VideoFrameSyncAction::Requeued ||
                     sync_action == VideoFrameSyncAction::Drop) {
                     video_frame.reset();
-                } else if (!video_renderer_->Render(*video_frame)) {
-                    FailAndRequestStop("视频帧渲染失败");
                 } else {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    ++stats_.rendered_video_frames;
-                    const auto clock_snapshot =
-                        mediaflow_clock_.Snapshot(audio_available_);
-                    stats_.playback_pts_us = clock_snapshot.position_us;
-                    stats_.playback_clock_source =
-                        clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
-                    // 只有统一时钟已经切换到音频 master 时，误差才代表真实的
-                    // A/V 播放关系。system fallback 阶段不计入，避免把首帧锚点
-                    // 或音频设备尚未出声时的估计值混入验收数据。
-                    if (clock_snapshot.valid &&
-                        clock_snapshot.source == mediaflow::ClockSource::Audio &&
-                        video_frame->time.pts_us != kNoTimestamp) {
-                        const auto error_us =
-                            video_frame->time.pts_us - clock_snapshot.position_us;
-                        const auto abs_error_us =
-                            error_us < 0 ? -error_us : error_us;
-                        if (stats_.video_audio_master_sync_samples == 0) {
-                            stats_.min_video_audio_master_error_us = error_us;
-                            stats_.max_video_audio_master_error_us = error_us;
-                        } else {
-                            stats_.min_video_audio_master_error_us = std::min(
-                                stats_.min_video_audio_master_error_us, error_us);
-                            stats_.max_video_audio_master_error_us = std::max(
-                                stats_.max_video_audio_master_error_us, error_us);
+                    bool announce_video_start = false;
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        if (!video_render_start_announced_) {
+                            // 在 renderer 真正接收首帧前打开音频启动闸门。这样
+                            // 音频不会抢先建立 master clock，但首帧 Render 若
+                            // 因 GPU/窗口短暂阻塞，音频仍可独立继续工作。
+                            video_render_start_announced_ = true;
+                            announce_video_start = true;
                         }
-                        ++stats_.video_audio_master_sync_samples;
-                        stats_.last_video_audio_master_error_us = error_us;
-                        stats_.total_abs_video_audio_master_error_us += abs_error_us;
+                    }
+                    if (announce_video_start) {
+                        queue_cv_.notify_all();
+                    }
+
+                    if (!video_renderer_->Render(*video_frame)) {
+                        FailAndRequestStop("视频帧渲染失败");
+                    } else {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        ++stats_.rendered_video_frames;
+                        const auto clock_snapshot =
+                            mediaflow_clock_.Snapshot(audio_available_);
+                        stats_.playback_pts_us = clock_snapshot.position_us;
+                        stats_.playback_clock_source =
+                            clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
+                        // 只有统一时钟已经切换到音频 master 时，误差才代表真实的
+                        // A/V 播放关系。system fallback 阶段不计入，避免把首帧锚点
+                        // 或音频设备尚未出声时的估计值混入验收数据。
+                        if (clock_snapshot.valid &&
+                            clock_snapshot.source == mediaflow::ClockSource::Audio &&
+                            video_frame->time.pts_us != kNoTimestamp) {
+                            const auto error_us =
+                                video_frame->time.pts_us - clock_snapshot.position_us;
+                            const auto abs_error_us =
+                                error_us < 0 ? -error_us : error_us;
+                            if (stats_.video_audio_master_sync_samples == 0) {
+                                stats_.min_video_audio_master_error_us = error_us;
+                                stats_.max_video_audio_master_error_us = error_us;
+                            } else {
+                                stats_.min_video_audio_master_error_us = std::min(
+                                    stats_.min_video_audio_master_error_us, error_us);
+                                stats_.max_video_audio_master_error_us = std::max(
+                                    stats_.max_video_audio_master_error_us, error_us);
+                            }
+                            ++stats_.video_audio_master_sync_samples;
+                            stats_.last_video_audio_master_error_us = error_us;
+                            stats_.total_abs_video_audio_master_error_us += abs_error_us;
+                        }
                     }
                 }
             }
@@ -721,12 +739,17 @@ private:
             RefreshAudioClockPosition();
             mediaflow::ClockSnapshot clock_snapshot;
             bool audio_master_ready = false;
+            bool wait_for_video_start = false;
             std::int64_t allowed_lead_us = 0;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (stop_requested_) {
                     return AudioFrameSyncAction::Stop;
                 }
+                wait_for_video_start =
+                    config_.av_sync.wait_audio_for_video_start &&
+                    config_.enable_video &&
+                    !video_render_start_announced_;
                 audio_master_ready = mediaflow_clock_.HasAudioPosition();
                 clock_snapshot = mediaflow_clock_.Snapshot(false);
                 if (audio_master_ready) {
@@ -738,6 +761,25 @@ private:
                         config_.audio.buffer_duration_ms) +
                         MillisecondsToUs(config_.playback_buffer_ms);
                 }
+            }
+
+            if (wait_for_video_start) {
+                // 音频帧留在当前 worker 中等待，避免首个音频 PTS 抢先推动
+                // WASAPI；SubmitFrame/首帧视频通知会唤醒下一轮检查。
+                if (WaitForVideoSync(std::chrono::milliseconds(20))) {
+                    continue;
+                }
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stop_requested_) {
+                    return AudioFrameSyncAction::Stop;
+                }
+                if (paused_) {
+                    audio_queue_.push_front(std::move(audio_frame));
+                    stats_.audio_queue_size = audio_queue_.size();
+                    return AudioFrameSyncAction::Requeued;
+                }
+                continue;
             }
 
             const auto render_before_us =
@@ -996,6 +1038,7 @@ private:
     std::deque<std::shared_ptr<MediaFrame>> video_queue_;
     std::deque<std::shared_ptr<MediaFrame>> audio_queue_;
     bool video_catch_up_mode_{false};
+    bool video_render_start_announced_{false};
     bool media_pts_origin_ready_{false};
     bool first_video_pts_seen_{false};
     bool first_audio_pts_seen_{false};

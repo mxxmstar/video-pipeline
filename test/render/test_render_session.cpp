@@ -506,6 +506,65 @@ bool TestAudioStartupWaitsForSharedTimeline() {
            audio_state->rendered_pts.front() == 80'000;
 }
 
+bool TestAudioStartupWaitsForVideoRenderStart() {
+    auto video_state = std::make_shared<FakeVideoState>();
+    auto audio_state = std::make_shared<FakeAudioState>();
+    video_state->block_first_render = true;
+    render::RenderSession session(
+        std::make_unique<FakeVideoRenderer>(video_state),
+        std::make_unique<FakeAudioRenderer>(audio_state));
+
+    render::RenderSessionConfig config;
+    config.enable_video = true;
+    config.enable_audio = true;
+    config.av_sync.enabled = false;
+    config.av_sync.wait_audio_for_video_start = true;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "video render start gate session start failed: "
+                  << session.LastError() << '\n';
+        return false;
+    }
+
+    // 音频可以先到达，但在视频 renderer 接收首帧之前不能建立硬件播放进度。
+    if (!session.SubmitFrame(MakeFrame(MediaType::AUDIO, 0))) {
+        session.Stop();
+        return false;
+    }
+    std::this_thread::sleep_for(40ms);
+    if (session.GetStats().rendered_audio_frames != 0) {
+        session.Stop();
+        return false;
+    }
+
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 0))) {
+        session.Stop();
+        return false;
+    }
+    {
+        std::unique_lock<std::mutex> lock(video_state->mutex);
+        if (!video_state->cv.wait_for(
+                lock, 1s, [&] { return video_state->first_render_entered; })) {
+            session.Stop();
+            return false;
+        }
+    }
+
+    // 首帧已经进入 renderer，即使 renderer 尚未返回，音频也应恢复独立推进。
+    const bool audio_rendered = WaitUntil([&] {
+        return session.GetStats().rendered_audio_frames == 1;
+    });
+    {
+        std::lock_guard<std::mutex> lock(video_state->mutex);
+        video_state->release_first_render = true;
+        video_state->cv.notify_all();
+    }
+    const bool video_rendered = WaitUntil([&] {
+        return session.GetStats().rendered_video_frames == 1;
+    });
+    session.Stop();
+    return audio_rendered && video_rendered;
+}
+
 bool TestVideoCatchUpRespectsLagLimit() {
     auto video_state = std::make_shared<FakeVideoState>();
     auto audio_state = std::make_shared<FakeAudioState>();
@@ -584,6 +643,10 @@ int main() {
     }
     if (!TestAudioStartupWaitsForSharedTimeline()) {
         std::cerr << "TestAudioStartupWaitsForSharedTimeline failed\n";
+        return 1;
+    }
+    if (!TestAudioStartupWaitsForVideoRenderStart()) {
+        std::cerr << "TestAudioStartupWaitsForVideoRenderStart failed\n";
         return 1;
     }
     if (!TestVideoCatchUpRespectsLagLimit()) {

@@ -2896,3 +2896,49 @@ MediaFlow 视频帧、音频帧队列还分别保持至少 250 ms、500 ms 的�
 - `build/playback_profile_stable_3000_lagcap.err.log`
 - `build/playback_profile_low_3000_lagcap.log`
 - `build/playback_profile_low_3000_lagcap.err.log`
+
+#### 21.7.32 音频首帧启动闸门与固定偏移定位
+
+21.7.31 的追赶丢帧可以限制旧视频继续堆积，但稳定策略第一轮长测只显示了
+`18/3000` 个视频帧，说明音频设备可能在视频首帧实际进入 renderer 前已经建立了
+播放进度。本阶段先治理这个启动时序问题，同时保留音频、视频 worker 的独立性；
+本阶段不把“丢更多视频帧”当作固定 PTS 偏移的解决方案。
+
+##### 21.7.32.1 实施步骤
+
+1. 在 `AvSyncConfig` 增加 `wait_audio_for_video_start`，默认开启；音频首帧在视频
+   renderer 尚未接收首帧前暂不提交，避免音频先建立 audio master。
+2. 视频线程在首帧即将调用 renderer 时打开启动闸门并通知音频线程。闸门不等待
+   `Render()` 返回，因此视频 renderer 短时阻塞时音频仍可独立推进，保留 21.7.14
+   的跨线程解耦语义。
+3. 增加“音频先到不能抢跑、视频首帧进入 renderer 后音频恢复”的确定性测试，并保留
+   原有慢视频 renderer 不阻塞音频的回归。
+4. 使用同一台本地 FFmpeg/ZLMediaKit 双轨源重新执行稳定和低延时 3000 帧长测，
+   对比渲染量、A/V 误差、追赶行为和音频连续性。
+
+##### 21.7.32.2 实施结果
+
+代码和确定性测试已经完成。Debug 目标构建以及 `test_render_session` 均通过。
+本地双轨长测结果如下：
+
+| 策略 | 渲染视频 | 丢弃视频 | 普通 AV sync 丢帧 | 追赶丢帧/事件 | A/V 误差范围 | 平均绝对误差 | 音频 PCM 丢弃 | 音频 underrun |
+|---|---:|---:|---:|---:|---|---:|---:|---:|
+| 稳定播放，启动闸门开启 | 942 | 2052 | 628 | 628 / 457 | -527083 / 12965 us | 423506 us | 0 | 63 |
+| 低延时，启动闸门开启 | 201 | 2792 | 0 | 0 / 0 | -156615 / -74662 us | 114654 us | 0 | 67 |
+
+与 21.7.31 的稳定策略结果相比，视频渲染量由 `18` 提升到 `942`，说明启动闸门
+改善了音频先行造成的起播竞争；但稳定策略的平均绝对误差仍约 `424 ms`，误差下界
+约 `-527 ms`，不能宣称已经满足 `350 ms` 稳态上限。低延时策略的平均误差约
+`115 ms`，未触发新的追赶分支，PCM 丢弃仍为 `0`。
+
+因此本阶段结论为**部分通过**：启动时序约束有效，但当前源或播放链路仍存在约
+`400 ms` 的固定视频 PTS 偏移。下一阶段必须分别采集“解码视频 PTS、解码音频 PTS、
+首帧进入 renderer 时间、首个有效 audio device PTS、设备 padding/软件队列时间”，
+再决定采用启动延迟补偿还是统一 PTS 原点修正；不应继续单纯扩大队列或增加追赶丢帧。
+
+原始日志：
+
+- `build/playback_profile_stable_3000_startgate.log`
+- `build/playback_profile_stable_3000_startgate.err.log`
+- `build/playback_profile_low_3000_startgate.log`
+- `build/playback_profile_low_3000_startgate.err.log`

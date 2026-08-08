@@ -7,6 +7,11 @@ struct AvSyncConfig {
     /// 是否启用视频 PTS 调度。关闭后视频线程取到帧就立即渲染。
     bool enabled{true};
 
+    /// 启用音视频时，音频首帧是否等待视频首帧进入 renderer。
+    /// 默认开启，避免音频设备先建立播放进度造成固定起播偏移；视频 renderer
+    /// 开始处理首帧后，音频线程仍可独立继续提交，不会被慢视频帧长期阻塞。
+    bool wait_audio_for_video_start{true};
+
     /// 视频帧落后 master clock 超过该阈值时，认为已经过期。
     int late_threshold_ms{80};
 
