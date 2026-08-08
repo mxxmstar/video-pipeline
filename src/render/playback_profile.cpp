@@ -22,6 +22,7 @@ RenderSessionConfig MakeRenderSessionConfig(
         config.drop_late_video_frames = false;
         config.av_sync.drop_late_video_frames = false;
         config.av_sync.late_threshold_ms = 200;
+        config.av_sync.max_video_lag_ms = 350;
     }
     return config;
 }

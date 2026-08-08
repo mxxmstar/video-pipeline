@@ -200,7 +200,8 @@ bool TestPlaybackProfileMapsToRenderSessionConfig() {
            stable_config.playback_buffer_ms == 400 &&
            !stable_config.drop_late_video_frames &&
            !stable_config.av_sync.drop_late_video_frames &&
-           stable_config.av_sync.late_threshold_ms == 200;
+           stable_config.av_sync.late_threshold_ms == 200 &&
+           stable_config.av_sync.max_video_lag_ms == 350;
 }
 
 bool TestVideoQueueDropsOldestFrame() {
@@ -505,6 +506,59 @@ bool TestAudioStartupWaitsForSharedTimeline() {
            audio_state->rendered_pts.front() == 80'000;
 }
 
+bool TestVideoCatchUpRespectsLagLimit() {
+    auto video_state = std::make_shared<FakeVideoState>();
+    auto audio_state = std::make_shared<FakeAudioState>();
+    render::RenderSession session(
+        std::make_unique<FakeVideoRenderer>(video_state),
+        std::make_unique<FakeAudioRenderer>(audio_state));
+
+    render::RenderSessionConfig config;
+    config.enable_video = true;
+    config.enable_audio = true;
+    config.normalize_track_pts = false;
+    config.av_sync.drop_late_video_frames = false;
+    config.av_sync.max_video_lag_ms = 100;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "video catch-up session start failed: "
+                  << session.LastError() << '\n';
+        return false;
+    }
+
+    // 先让 fake audio 建立 1 秒 audio master，再提交一个落后 200 ms 的视频帧。
+    if (!session.SubmitFrame(MakeFrame(MediaType::AUDIO, 1'000'000)) ||
+        !WaitUntil([&] {
+            return session.GetStats().rendered_audio_frames == 1;
+        })) {
+        session.Stop();
+        return false;
+    }
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 800'000)) ||
+        !WaitUntil([&] {
+            return session.GetStats().video_catch_up_dropped_frames == 1;
+        })) {
+        session.Stop();
+        return false;
+    }
+
+    // 误差回到上限以内后应恢复渲染并退出追赶状态。
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 950'000)) ||
+        !WaitUntil([&] {
+            return session.GetStats().rendered_video_frames == 1;
+        })) {
+        session.Stop();
+        return false;
+    }
+
+    session.Stop();
+    const auto stats = session.GetStats();
+    return stats.video_catch_up_events == 1 &&
+           stats.video_catch_up_dropped_frames == 1 &&
+           stats.av_sync_dropped_video_frames == 1 &&
+           !stats.video_catch_up_active &&
+           stats.rendered_video_frames == 1;
+}
+
 } // namespace
 
 int main() {
@@ -530,6 +584,10 @@ int main() {
     }
     if (!TestAudioStartupWaitsForSharedTimeline()) {
         std::cerr << "TestAudioStartupWaitsForSharedTimeline failed\n";
+        return 1;
+    }
+    if (!TestVideoCatchUpRespectsLagLimit()) {
+        std::cerr << "TestVideoCatchUpRespectsLagLimit failed\n";
         return 1;
     }
 

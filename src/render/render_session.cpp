@@ -30,6 +30,7 @@ mediaflow::VideoScheduleConfig ToMediaFlowScheduleConfig(
     mediaflow::VideoScheduleConfig result;
     result.enabled = config.enabled;
     result.late_threshold_us = MillisecondsToUs(config.late_threshold_ms);
+    result.max_video_lag_us = MillisecondsToUs(config.max_video_lag_ms);
     result.early_threshold_us = MillisecondsToUs(config.early_threshold_ms);
     result.max_wait_us = MillisecondsToUs(config.max_wait_ms);
     result.drop_late_video_frames = config.drop_late_video_frames;
@@ -51,6 +52,10 @@ bool IsValidConfig(const RenderSessionConfig& config, std::string& error) {
     }
     if (config.playback_buffer_ms < 0) {
         error = "playback_buffer_ms must be greater than or equal to 0";
+        return false;
+    }
+    if (config.av_sync.max_video_lag_ms < 0) {
+        error = "max_video_lag_ms must be greater than or equal to 0";
         return false;
     }
     return true;
@@ -98,6 +103,7 @@ public:
         video_queue_.clear();
         audio_queue_.clear();
         stats_ = {};
+        video_catch_up_mode_ = false;
         initialized_ = true;
         running_ = false;
         paused_ = false;
@@ -338,6 +344,7 @@ public:
     RenderStats GetStats() const {
         std::lock_guard<std::mutex> lock(mutex_);
         RenderStats snapshot = stats_;
+        snapshot.video_catch_up_active = video_catch_up_mode_;
         snapshot.video_queue_size = video_queue_.size();
         snapshot.audio_queue_size = audio_queue_.size();
         if (audio_renderer_ && audio_available_) {
@@ -829,6 +836,9 @@ private:
                 video_pts_us, false, 1, clock_snapshot);
 
             if (decision.action == mediaflow::VideoScheduleAction::Render) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                video_catch_up_mode_ = false;
+                stats_.video_catch_up_active = false;
                 return VideoFrameSyncAction::Render;
             }
 
@@ -839,6 +849,14 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 ++stats_.dropped_video_frames;
                 ++stats_.av_sync_dropped_video_frames;
+                if (decision.catch_up) {
+                    if (!video_catch_up_mode_) {
+                        ++stats_.video_catch_up_events;
+                    }
+                    video_catch_up_mode_ = true;
+                    stats_.video_catch_up_active = true;
+                    ++stats_.video_catch_up_dropped_frames;
+                }
                 stats_.playback_pts_us = clock_snapshot.position_us;
                 stats_.playback_clock_source =
                     clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
@@ -977,6 +995,7 @@ private:
     VideoPtsNormalizer video_pts_normalizer_;
     std::deque<std::shared_ptr<MediaFrame>> video_queue_;
     std::deque<std::shared_ptr<MediaFrame>> audio_queue_;
+    bool video_catch_up_mode_{false};
     bool media_pts_origin_ready_{false};
     bool first_video_pts_seen_{false};
     bool first_audio_pts_seen_{false};

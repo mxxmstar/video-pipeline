@@ -569,6 +569,9 @@ int TestCameraAudioVideoDecodeEncodeRender(
                       << ", rendered_audio=" << stats.rendered_audio_frames
                       << ", dropped_video=" << stats.dropped_video_frames
                       << ", avsync_dropped_video=" << stats.av_sync_dropped_video_frames
+                      << ", catch_up_dropped_video="
+                      << stats.video_catch_up_dropped_frames
+                      << ", catch_up_events=" << stats.video_catch_up_events
                       << ", avsync_waits=" << stats.av_sync_video_waits
                       << ", avsync_wait_ms=" << stats.av_sync_video_wait_us / 1000
                       << ", clock=" << (stats.playback_clock_source == 1 ? "audio" : "system")
@@ -648,6 +651,9 @@ int TestCameraAudioVideoDecodeEncodeRender(
               << ", rendered_audio=" << render_stats.rendered_audio_frames
               << ", dropped_video=" << render_stats.dropped_video_frames
               << ", avsync_dropped_video=" << render_stats.av_sync_dropped_video_frames
+              << ", catch_up_dropped_video="
+              << render_stats.video_catch_up_dropped_frames
+              << ", catch_up_events=" << render_stats.video_catch_up_events
               << ", avsync_waits=" << render_stats.av_sync_video_waits
               << ", avsync_wait_ms=" << render_stats.av_sync_video_wait_us / 1000
               << ", clock=" << (render_stats.playback_clock_source == 1 ? "audio" : "system")

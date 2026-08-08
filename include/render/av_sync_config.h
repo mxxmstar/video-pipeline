@@ -10,6 +10,10 @@ struct AvSyncConfig {
     /// 视频帧落后 master clock 超过该阈值时，认为已经过期。
     int late_threshold_ms{80};
 
+    /// 视频相对 audio master 允许的最大滞后。超过后进入追赶，连续丢弃旧视频帧；
+    /// 0 表示关闭该保护。该值通常大于 late_threshold_ms，给稳定播放保留短时抖动。
+    int max_video_lag_ms{0};
+
     /// 视频帧领先 master clock 超过该阈值时，短暂等待。
     int early_threshold_ms{20};
 

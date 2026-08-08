@@ -25,6 +25,12 @@ struct RenderStats {
     std::int64_t normalized_video_pts_frames{0};
     /// AV sync 因视频帧严重晚到而主动丢弃的帧数。
     std::int64_t av_sync_dropped_video_frames{0};
+    /// 超过最大视频滞后上限后，为追赶 audio master 丢弃的帧数。
+    std::int64_t video_catch_up_dropped_frames{0};
+    /// 进入视频追赶状态的次数。
+    std::int64_t video_catch_up_events{0};
+    /// 当前是否正在连续丢弃滞后视频帧。
+    bool video_catch_up_active{false};
     /// AV sync 因视频帧早到而等待的次数。
     std::int64_t av_sync_video_waits{0};
     /// AV sync 累计等待时长，单位微秒。

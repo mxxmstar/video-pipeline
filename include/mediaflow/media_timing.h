@@ -127,6 +127,8 @@ enum class VideoScheduleAction {
 struct VideoScheduleConfig {
     bool enabled{true};
     std::int64_t late_threshold_us{80'000};
+    /// 视频相对统一时钟允许的最大滞后；0 表示不启用硬上限。
+    std::int64_t max_video_lag_us{0};
     std::int64_t early_threshold_us{20'000};
     std::int64_t max_wait_us{20'000};
     bool drop_late_video_frames{true};
@@ -139,6 +141,8 @@ struct VideoScheduleDecision {
     std::int64_t wait_us{0};
     bool keyframe{false};
     bool clock_reset{false};
+    /// true 表示因触发最大滞后保护而丢帧，调用方可单独统计追赶行为。
+    bool catch_up{false};
 };
 
 /**

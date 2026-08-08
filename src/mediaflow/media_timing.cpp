@@ -228,10 +228,20 @@ VideoScheduleDecision VideoPtsScheduler::Decide(
     }
 
     decision.delta_us = SaturatingSubtract(video_pts_us, clock.position_us);
+    const auto max_video_lag_us = NonNegative(config_.max_video_lag_us);
     const auto late_threshold_us = NonNegative(config_.late_threshold_us);
     const auto early_threshold_us = NonNegative(config_.early_threshold_us);
     if (keyframe) {
         // 关键帧是恢复窗口的锚点，不能因为视频比音频晚就直接丢掉。
+        return decision;
+    }
+
+    if (max_video_lag_us > 0 &&
+        decision.delta_us < -max_video_lag_us) {
+        // 最大滞后保护独立于普通 late_threshold：稳定播放可以保留短时抖动，
+        // 但不能无限保留旧视频。上层连续处理 Drop 决策即可完成追赶。
+        decision.action = VideoScheduleAction::Drop;
+        decision.catch_up = true;
         return decision;
     }
 

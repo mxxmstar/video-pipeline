@@ -104,6 +104,20 @@ void TestVideoPtsScheduling() {
     decision = scheduler.Decide(1'010'000, false, 2, master);
     assert(decision.clock_reset);
     assert(decision.action == VideoScheduleAction::Render);
+
+    VideoScheduleConfig catch_up_config;
+    catch_up_config.drop_late_video_frames = false;
+    catch_up_config.max_video_lag_us = 350'000;
+    VideoPtsScheduler catch_up_scheduler(catch_up_config);
+    decision = catch_up_scheduler.Decide(640'000, false, 3, master);
+    assert(decision.action == VideoScheduleAction::Drop);
+    assert(decision.catch_up);
+    assert(decision.delta_us == -360'000);
+
+    // 回到上限以内后恢复渲染；稳定策略不需要打开普通晚帧丢弃。
+    decision = catch_up_scheduler.Decide(650'000, false, 3, master);
+    assert(decision.action == VideoScheduleAction::Render);
+    assert(!decision.catch_up);
 }
 
 void TestDtsInterleavingUsesDecodeOrder() {
