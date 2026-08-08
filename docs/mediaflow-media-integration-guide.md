@@ -2771,3 +2771,57 @@ MediaFlow 视频帧、音频帧队列还分别保持至少 250 ms、500 ms 的�
 | 既有时序回归 | 通过 | `test_mediaflow`、`test_mediaflow_timing`、`test_mediaflow_media_nodes`、`test_render_session`、`test_audio_render_strategy` 共 5/5 通过 |
 
 本阶段只完成配置契约和确定性回归，不以此替代 21.7.28 所列的 3000 帧真实播放长测。
+
+#### 21.7.30 两种播放策略 3000 帧长测
+
+为验证公开策略的实际取舍，使用同一台本机 FFmpeg/ZLMediaKit 双轨 RTSP 源进行
+两组 3000 视频帧长测。测试入口为 `test_opengl_video_renderer`，使用
+`--render-only --frames 3000 --drain-ms 5000`，只改变
+`--playback-profile low-latency|stable`，没有建立现场摄像头第二路 RTSP 会话。
+源视频为 `1920x1242@25 fps` H.264，音频为 `44100 Hz/2 ch AAC`。
+
+##### 21.7.30.1 实验结果
+
+| 指标 | `LowLatencyPreview` | `StablePlayback` |
+|---|---:|---:|
+| Profile 参数 | 设备 100 ms，额外缓存 120 ms，视频队列 7 | 设备 200 ms，额外缓存 400 ms，视频队列 16 |
+| 解码视频帧 | 3000 | 3000 |
+| 解码音频帧 | 5549 | 5548 |
+| 显示视频帧 | 196 | 1039 |
+| 视频丢弃帧 | 2796 | 1956 |
+| AV sync 主动丢弃 | 9 | 0 |
+| 音频送入 renderer | 5146 | 5141 |
+| `dropped_audio` | 0 | 5 |
+| PCM 丢弃帧 | 5556 | 0 |
+| audio underrun | 83 | 20 |
+| A/V master 样本 | 191 | 1037 |
+| A/V 误差范围 | `-150801 / +353622 us` | `-1280885 / -68527 us` |
+| 平均绝对 A/V 误差 | `111986 us` | `1088705 us` |
+
+`rendered_video + dropped_video` 未达到 3000 的部分，是受控停止时仍在队列或正在
+排空的在途视频帧，不能直接当作额外解码失败。低延时测试结束时约有 8 帧，稳定播放
+结束时约有 5 帧处于该状态。
+
+##### 21.7.30.2 结论与问题记录
+
+1. 低延时策略确实将平均误差控制在约 `112 ms`，但当前高分辨率源在突发读取和
+   OpenGL/WASAPI 并行负载下无法承接输入速度：视频队列持续满，PCM 队列累计丢弃
+   `5556` 帧。它适合“允许丢旧帧、优先追赶实时位置”的预览，不适合作为本次源的
+   无损播放配置。
+2. 稳定播放策略成功避免 PCM 丢弃，AV sync 也没有主动丢视频，但“队列满时保留旧帧、
+   拒绝新帧”的策略使视频相对音频持续落后约 `1.09 s`。这说明仅扩大容量并关闭晚帧
+   丢弃不能得到可接受的稳定播放，还需要后续定义“最大允许累计延迟”和超限后的追赶
+   策略，否则延迟会被持续保留。
+3. 两组测试的 stderr 均出现 `co located POCs unavailable`、`mmco: unref short
+   failure` 和参考帧缺失警告。它们来自本地测试源的 H.264 参考帧恢复过程，后续需要
+   使用更干净的本地发布源复测，才能把解码源异常与播放策略影响完全分离。
+4. 本次结果证明两种策略已经能够被统一配置和观测，但不能宣称当前两个预设已经通过
+   端到端播放验收。下一步应在稳定源上增加“延迟上限 + 超限追赶”规则，并重新做
+   3000 帧长测。
+
+原始日志：
+
+- `build/playback_profile_low_3000.log`
+- `build/playback_profile_low_3000.err.log`
+- `build/playback_profile_stable_3000_retry.log`
+- `build/playback_profile_stable_3000_retry.err.log`

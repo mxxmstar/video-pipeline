@@ -17,6 +17,7 @@
 #include "media/encoder/ffmpeg_encoder.h"
 #include "media/puller/ffmpeg_puller.h"
 #include "media/simple_buffer.h"
+#include "render/playback_profile.h"
 
 namespace {
 
@@ -53,6 +54,8 @@ struct CameraAvRenderState {
     std::size_t max_video_queue_frames{6};
     /// 音频启动等待期间保留的解码帧数量，用于覆盖 RTSP 的首批音频突发。
     std::size_t max_audio_queue_frames{50};
+    mediaflow::PlaybackMode playback_mode{mediaflow::PlaybackMode::Custom};
+    mediaflow::PlaybackProfile playback_profile{};
     bool initialized{false};
     bool failed{false};
     bool closed{false};
@@ -164,16 +167,29 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
     render_config.video.visible = true;
     render_config.video.vsync = false;
     render_config.video.close_on_escape = true;
-    // 真实 RTSP 摄像头的音频包不是严格按 20ms 匀速到达，当前手动测试还保留
-    // H264/AAC 编码覆盖，会额外制造 CPU 抖动。这里给 WASAPI shared buffer 和
-    // renderer 内部 PCM 队列多留一些余量，避免短时突发导致“刚满就丢、刚空就补静音”。
-    render_config.audio.buffer_duration_ms = 200;
-    render_config.audio.queue_capacity_chunks = 64;
+    if (state.playback_mode != mediaflow::PlaybackMode::Custom) {
+        // 长测使用公开 PlaybackProfile 生成的完整渲染配置，确保两组结果不只是
+        // 手工修改 RenderSession 的视频队列，而是同时覆盖设备 buffer、PCM 队列、
+        // A/V 队列和晚帧策略。
+        render_config = render::MakeRenderSessionConfig(state.playback_profile);
+        render_config.video.window_width = width;
+        render_config.video.window_height = height;
+        render_config.video.title = "video-pipeline camera render test";
+        render_config.video.visible = true;
+        render_config.video.vsync = false;
+        render_config.video.close_on_escape = true;
+    } else {
+        // 兼容原有手动摄像头测试：保留其较大的设备 buffer 和 PCM 队列。
+        render_config.audio.buffer_duration_ms = 200;
+        render_config.audio.queue_capacity_chunks = 64;
+    }
     render_config.audio.fail_if_device_unavailable = true;
     render_config.enable_video = true;
     render_config.enable_audio = true;
-    render_config.max_video_queue_frames = state.max_video_queue_frames;
-    render_config.max_audio_queue_frames = state.max_audio_queue_frames;
+    if (state.playback_mode == mediaflow::PlaybackMode::Custom) {
+        render_config.max_video_queue_frames = state.max_video_queue_frames;
+        render_config.max_audio_queue_frames = state.max_audio_queue_frames;
+    }
     render_config.av_sync.enabled = state.av_sync_enabled;
 
     // OpenGL context 与 WASAPI/COM 都由 RenderSession 的工作线程创建和释放。
@@ -191,8 +207,18 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
               << width << "x" << height << " @" << state.fps
               << "fps, audio=" << audio_info.sample_rate
               << "Hz/" << audio_info.channels << "ch, queues=video/"
-              << state.max_video_queue_frames << ", audio/"
-              << state.max_audio_queue_frames << "\n";
+              << render_config.max_video_queue_frames << ", audio/"
+              << render_config.max_audio_queue_frames
+              << ", profile="
+              << (state.playback_mode == mediaflow::PlaybackMode::LowLatencyPreview
+                      ? "low-latency"
+                      : state.playback_mode == mediaflow::PlaybackMode::StablePlayback
+                            ? "stable"
+                            : "manual")
+              << ", device_buffer_ms="
+              << render_config.audio.buffer_duration_ms
+              << ", playback_buffer_ms=" << render_config.playback_buffer_ms
+              << "\n";
     std::cout << "Rendering camera stream. Press ESC or close the window to stop.\n"
               << std::flush;
     return true;
@@ -304,7 +330,8 @@ int TestCameraAudioVideoDecodeEncodeRender(
     bool av_sync_enabled = true,
     std::size_t max_video_queue_frames = 6,
     std::size_t max_audio_queue_frames = 50,
-    int drain_after_input_ms = 1500) {
+    int drain_after_input_ms = 1500,
+    mediaflow::PlaybackMode playback_mode = mediaflow::PlaybackMode::Custom) {
     FFmpegPuller puller;
     puller.SetConnectTimeoutMs(kManualConnectTimeoutMs);
     puller.SetReadTimeoutMs(kManualReadTimeoutMs);
@@ -359,8 +386,17 @@ int TestCameraAudioVideoDecodeEncodeRender(
     state.av_sync_enabled = av_sync_enabled;
     state.max_video_queue_frames = max_video_queue_frames;
     state.max_audio_queue_frames = max_audio_queue_frames;
+    state.playback_mode = playback_mode;
+    if (playback_mode == mediaflow::PlaybackMode::LowLatencyPreview) {
+        state.playback_profile = mediaflow::PlaybackProfile::LowLatencyPreview();
+    } else if (playback_mode == mediaflow::PlaybackMode::StablePlayback) {
+        state.playback_profile = mediaflow::PlaybackProfile::StablePlayback();
+    }
     state.fps = ResolveManualFps(video_detail);
     state.frame_duration_us = 1'000'000 / state.fps;
+    if (state.playback_mode != mediaflow::PlaybackMode::Custom) {
+        state.playback_profile.expected_video_frame_rate = state.fps;
+    }
 
     FFmpegDecoder video_decoder;
     FFmpegDecoder audio_decoder;
@@ -384,6 +420,12 @@ int TestCameraAudioVideoDecodeEncodeRender(
         }
 
         if (!state.render_session || !state.render_session->SubmitFrame(frame)) {
+            if (state.playback_mode == mediaflow::PlaybackMode::StablePlayback &&
+                state.render_session && state.render_session->IsRunning()) {
+                // StablePlayback 在视频队列满时保留旧帧、拒绝新帧；这属于有界
+                // 队列的背压结果，不是设备或 RenderSession 生命周期故障。
+                return;
+            }
             state.failed = true;
             state.error = state.render_session
                 ? "failed to submit decoded video frame: " +
@@ -652,7 +694,8 @@ int main(int argc, char* argv[]) {
     if (mode == "--rtsp-url") {
         if (argc < 3) {
             std::cerr << "Usage: test_opengl_video_renderer --rtsp-url <url> "
-                         "[--frames <count>] [--render-only]\n";
+                         "[--frames <count>] [--render-only] "
+                         "[--playback-profile low-latency|stable]\n";
             return 1;
         }
         const std::string source_url = argv[2];
@@ -666,6 +709,8 @@ int main(int argc, char* argv[]) {
         std::size_t max_video_queue_frames = 6;
         std::size_t max_audio_queue_frames = 50;
         int drain_after_input_ms = 1500;
+        mediaflow::PlaybackMode playback_mode =
+            mediaflow::PlaybackMode::Custom;
         for (int index = 3; index < argc; ++index) {
             const std::string option = argv[index];
             if (option == "--frames" && index + 1 < argc) {
@@ -710,6 +755,17 @@ int main(int argc, char* argv[]) {
                     std::cerr << "Invalid --drain-ms value\n";
                     return 1;
                 }
+            } else if (option == "--playback-profile" && index + 1 < argc) {
+                const std::string profile = argv[++index];
+                if (profile == "low-latency") {
+                    playback_mode = mediaflow::PlaybackMode::LowLatencyPreview;
+                } else if (profile == "stable") {
+                    playback_mode = mediaflow::PlaybackMode::StablePlayback;
+                } else {
+                    std::cerr << "Invalid --playback-profile value, expected "
+                                 "low-latency or stable\n";
+                    return 1;
+                }
             } else {
                 std::cerr << "Invalid --rtsp-url option\n";
                 return 1;
@@ -717,7 +773,8 @@ int main(int argc, char* argv[]) {
         }
         return TestCameraAudioVideoDecodeEncodeRender(
             source_url, max_frames, !render_only, av_sync_enabled,
-            max_video_queue_frames, max_audio_queue_frames, drain_after_input_ms);
+            max_video_queue_frames, max_audio_queue_frames, drain_after_input_ms,
+            playback_mode);
     }
 
     if (mode == "--smoke") {
@@ -732,6 +789,7 @@ int main(int argc, char* argv[]) {
                  "[--camera|--camera-frames <count>|--rtsp-url <url> "
                  "[--frames <count>] [--render-only] [--no-av-sync] "
                  "[--video-queue-frames <count>] [--audio-queue-frames <count>] "
-                 "[--drain-ms <count>]|--smoke|--loop]\n";
+                 "[--drain-ms <count>] "
+                 "[--playback-profile low-latency|stable]|--smoke|--loop]\n";
     return 1;
 }
