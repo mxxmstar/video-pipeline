@@ -497,8 +497,8 @@ Immediate Stop 可直接关闭入口、取消任务并丢弃队列，但必须�
 <tr><td>M-P1-09</td><td><code>PublisherResult</code></td><td>增加 recoverable、connection state、packet disposition，避免节点通过错误码字符串推断状态</td><td>部分完成<br>目录：A2<br>详情：第 19.1 节</td></tr>
 <tr><td>M-P1-10</td><td><code>MultiStreamInfo</code></td><td>提供按 stream index 查找和显式 selected tracks；减少“vector 下标”和“源 stream 编号”混淆</td><td>部分完成<br>目录：A1、A3<br>详情：第 18.1、20.2 节</td></tr>
 <tr><td>MF-P1-01</td><td>MediaFlow metrics</td><td>增加节点业务错误、处理时延、最后错误、生命周期状态和 Pipeline 级统计</td><td>部分完成<br>目录：A4-4<br>详情：第 21.7.14 节</td></tr>
-<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>后续：使用无坏包双轨媒体源完成三轮性能复测</td></tr>
-<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6、A4-7<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20、21.7.21、21.7.22、21.7.23、21.7.24 节<br>已完成：轨道隔离、容量基础、Source 轨道序号、Decoder 关键帧恢复、统一时钟/PTS/DTS 基础组件、RenderSession 和多轨 PublisherSinkNode 接入，以及本地真实 FFmpeg 双轨 mux 验收<br>待修复：本地 ZLMediaKit 双轨 600 秒长测中音频 Edge 丢弃 278 个包；后续需完成音频突发容量和调度修复，并重复长测</td></tr>
+<tr><td>MF-P1-02</td><td>Queue/Dispatch</td><td>当前 Edge 队列与 Node pending tasks 形成双层缓存；配置和指标应展示总在途数量，后续增加按字节上限</td><td>部分完成<br>目录：A4-3、A4-4、A4-5、A4-6<br>详情：第 21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.19 节<br>已完成：本地 TCP、ZLMediaKit UDP 拉流、FFmpeg UDP 发布三轮双轨复测<br>后续：继续补充真实播放端和设备级指标</td></tr>
+<tr><td>MF-P1-03</td><td>Source 音视频独立 Edge、TrackRouterNode 及下游调度</td><td>入口队列已经分轨，但仍需按时间长度/字节数进行轨道级容量控制，并基于 PTS/DTS、time base、统一时钟和 generation 设计音视频调度，不能按音频帧数与视频帧数配对</td><td>部分完成<br>目录：A4-2、A4-3、A4-4、A4-5、A4-6、A4-7<br>详情：第 21.6.7、21.7.12、21.7.14、21.7.15、21.7.16、21.7.18、21.7.20、21.7.21、21.7.22、21.7.23、21.7.24、21.7.25、21.7.26、21.7.27、21.7.28 节<br>已完成：轨道隔离、容量基础、Source 轨道序号、Decoder 关键帧恢复、统一时钟/PTS/DTS 基础组件、RenderSession 和多轨 PublisherSinkNode 接入、本地真实 FFmpeg 双轨 mux 验收、压缩音频入口突发保护、TCP/UDP 双轨网络复测、Pipeline 级轨道队列配置，以及真实播放端的共同 PTS 原点、音频启动闸门和误差采集<br>后续：补齐 PCM 分块 PTS 连续性统计，完成 3000 帧稳定源和设备级验收</td></tr>
 </tbody>
 </table>
 
@@ -2483,3 +2483,221 @@ H.264 视频复制输出，并使用 `anullsrc` 生成无坏包的 AAC 音频，
    内存归零。
 4. 完成本地 TCP 验收后，再单独使用本地 FFmpeg/ZLMediaKit 的 UDP/RTP 配置验证协议
    差异，最后才考虑现场摄像头。
+
+#### 21.7.25 压缩音频入口突发容量修复
+
+本阶段针对 21.7.24 长测发现的音频问题实施第一批修复。问题并非 `QueueTransport`
+的计数错误：当音频队列的媒体时间跨度超过 `500 ms` 时，队列按设计使用
+`DropOldest` 淘汰旧包。修复前本地 600 秒双轨长测中 `source-audio` 丢弃 275 个包、
+`router-audio` 丢弃 3 个包，且 `limit_span` 与丢弃计数一致。
+
+##### 21.7.25.1 实施内容
+
+1. 为 `test_stream_decode` 增加明确的音频预算常量。压缩音频包入口的
+   `max_span_us` 从 `500000` 调整为 `1000000`，用于吸收 RTSP 接收线程约 1 秒的
+   短时交付突发；`max_items=512` 和码率字节预算保持不变。
+2. 解码后的 `MediaFrameMessage` 音频队列继续使用 `500000 us`，避免入口突发直接
+   转化为播放端延迟。视频包和视频帧预算均未改变。
+3. 在 `test_mediaflow` 增加 42 个 AAC 包、每包 23 ms、总跨度 966 ms 的队列回归，
+   验证新预算不会只依赖增大 `max_items`，且 `limit_span=0`、字节统计和队列条数准确。
+4. 在配置处补充中文注释，说明压缩包入口预算和解码帧低延迟预算的职责边界。
+
+##### 21.7.25.2 回归与长测结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| VS Debug 构建 | 通过 | `test_mediaflow`、`test_stream_decode` 在 VS 18 Community x64 环境构建成功 |
+| 压缩音频突发单元测试 | 通过 | 42 个包覆盖 966 ms，全部入队，`limit_span=0`，`items=42`、`bytes=4200` |
+| MediaFlow 回归 | 通过 | `test_mediaflow`、`test_mediaflow_timing`、`test_mediaflow_media_nodes`、`test_mediaflow_ffmpeg_publisher`、`test_render_session` 共 5/5 通过 |
+| 120 秒本地双轨复测 | 通过 | 音频和视频 Edge 的 dropped/limit 均为 `0`，Decoder rejected 和时间戳诊断均为 `0` |
+| 600 秒本地双轨长测 | 通过 | `source-video`、`source-audio`、`router-video`、`router-audio` 的 dropped/limit 全部为 `0` |
+| 长测音频水位 | 通过 | `source-audio` 最高 `39` 项、`905578 us`；低于新的 `1000000 us` 上限 |
+| 长测吞吐 | 通过 | 视频 `24.77 fps`，音频 `43.34 fps`；Decoder rejected 为 `0` |
+| 长测资源释放 | 通过 | 停止后 `wrappers/packed/AVBuffer=0/0/0`，单核等效 CPU `10.06%` |
+
+修复后的 600 秒日志为 `build/mediaflow_local_zlm_600s_after_audio_burst_fix.log`。
+ZLMediaKit 同一拉流会话持续 600 秒后结束，发布端和拉流端仍使用双轨 TCP RTSP；本轮
+未改变 UDP/RTP 协议配置，也未使用现场摄像头。
+
+##### 21.7.25.3 当前边界与下一阶段
+
+本批修复证明音频入口的 500 ms 时间预算过紧是本地双轨丢包的直接触发条件，并在不改变
+解码帧延迟预算的情况下消除了本地 TCP 长测中的音频丢弃。1 秒是针对当前 ZLMediaKit
+和 FFmpeg 交付突发测得的工程配置，不应直接作为所有设备的永久默认值。
+
+下一阶段需要：
+
+1. 将压缩包入口的音频突发预算从测试配置抽取为 Pipeline/设备级可配置项，并保留
+   500 ms 解码帧播放预算；
+2. 增加 UDP/RTP 本地互操作复测，确认传输方式变化不会再次产生超过 1 秒的音频突发；
+3. 采集音频 master 与视频显示 PTS 的实际误差，再决定是否需要对入口突发预算和播放
+   端延迟预算分别调节；
+4. 在本地 TCP/UDP 双轨结果稳定后，再恢复现场摄像头单路 RTSP 验收。
+
+#### 21.7.26 本地 ZLMediaKit 到 MediaFlow 的 UDP/RTP 验收
+
+本阶段继续执行 21.7.25.3 的 UDP/RTP 计划，为 `test_stream_decode` 增加显式传输方式
+参数，并使用同一条本地双轨 RTSP 流验证 UDP 拉流。默认值仍为 TCP，只有显式传入
+`--rtsp-transport udp` 才使用 UDP；同时关闭 `FFmpegPuller` 的 TCP 自动回退，确保
+UDP 失败时不会被错误统计为 UDP 通过。
+
+##### 21.7.26.1 实施内容
+
+1. `test_stream_decode` 新增 `--rtsp-transport tcp|udp` 参数，并对非法值直接报错。
+2. 传输参数透传到 `FFmpegPuller::SetRtspTransport()`；`SetRtspAutoSwitchToTcp(false)`
+   保持不变，TCP 和 UDP 测试使用同一套 MediaFlow Graph、队列预算和 Decoder。
+3. 先使用 ZLMediaKit 向 MediaFlow 的 UDP 拉流验证，再将本地 FFmpeg 发布端切换为
+   `-rtsp_transport udp`，覆盖发布侧和拉流侧同时使用 UDP 的完整路径。
+
+##### 21.7.26.2 验收结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| 参数边界 | 通过 | `--rtsp-transport invalid` 明确返回 `expected tcp or udp`，不会静默回退 |
+| UDP 双轨打开 | 通过 | `FFmpegPuller` 检测到 H.264 视频和 AAC 音频两路轨道 |
+| UDP 120 秒复测 | 通过 | 视频 `2871` 帧、音频 `5331` 帧，四条 Edge dropped/limit 全为 `0` |
+| UDP 600 秒长测 | 通过 | 视频 `14775` 帧、音频 `25823` 帧，四条 Edge dropped/limit 全为 `0` |
+| UDP Decoder 稳定性 | 通过 | UDP 600 秒 Decoder rejected 为 `0`，时间戳诊断为 `0` |
+| UDP 资源释放 | 通过 | 停止后 `wrappers/packed/AVBuffer=0/0/0`，单核等效 CPU `9.70%` |
+| UDP 传输完整覆盖 | 通过 | FFmpeg 以 `-rtsp_transport udp` 发布到 ZLMediaKit，再由 MediaFlow 使用 UDP 拉流，双轨长测四条 Edge dropped/limit 均为 `0` |
+
+本轮 120 秒日志为 `build/mediaflow_local_zlm_udp_120s.log`，600 秒日志为
+`build/mediaflow_local_zlm_udp_600s.log`；FFmpeg UDP 发布后的 120 秒和 600 秒日志分别为
+`build/mediaflow_local_zlm_udp_publish_120s.log` 和
+`build/mediaflow_local_zlm_udp_publish_600s.log`。实验仍使用本地 FFmpeg 的干净 AAC
+生成方式，没有使用现场摄像头，也没有建立第二路 RTSP 会话。
+
+##### 21.7.26.3 下一步
+
+UDP 双向互操作已经完成，下一阶段进入 Pipeline 级容量配置和真实播放端 PTS 误差采集；
+现场摄像头仍保持单路 RTSP 约束。
+
+#### 21.7.27 Pipeline 级轨道队列容量配置
+
+21.7.25 将 1 秒压缩音频突发预算直接写在 `test_stream_decode` 中，只能证明测试
+配置有效，不能作为不同设备复用的配置契约。本阶段把四条媒体边的默认预算、背压策略和
+批处理大小提升为 `MediaFlowPipelineConfig`，由 Pipeline 构建方统一生成 `EdgeOptions`。
+
+##### 21.7.27.1 实施内容
+
+1. 新增 `include/mediaflow/media_pipeline_config.h`，提供
+   `MediaFlowTrackQueueConfig` 和 `MediaFlowPipelineConfig`。
+2. 压缩视频、压缩音频、视频帧、音频帧分别拥有独立配置；默认值保持上一阶段已通过的
+   256/512/8/64 条数、1 秒/1 秒/250 ms/500 ms 媒体时间窗口和原有背压策略。
+3. `MediaFlowTrackQueueConfig::MakeBudget()` 根据当前媒体时长、码率和突发安全系数
+   重新计算字节上限，避免设备只调整时间窗口后遗留旧的 bytes 上限。
+4. `test_stream_decode` 改为从 `MediaFlowPipelineConfig` 生成四条边配置，删除测试
+   程序内的队列预算常量和通用构造函数。
+5. 增加配置回归测试，覆盖默认音频入口预算、设备级调整到 2 秒后的字节预算联动，
+   以及原始视频帧无字节预算的约束。
+
+##### 21.7.27.2 验收标准
+
+| 验收项 | 目标 |
+|---|---|
+| 配置默认值 | 与 21.7.25/21.7.26 已验证的双轨 TCP/UDP 参数一致 |
+| 设备覆盖 | 修改单条轨道配置即可生成对应 Edge，其他轨道配置不变 |
+| 预算联动 | 修改媒体时间窗口后，`max_items`、`max_bytes`、`max_span_us` 的关系可预测 |
+| 代码回归 | MediaFlow 核心、媒体节点、时序和渲染测试全部通过 |
+| 网络回归 | 不改变默认配置下，UDP 双轨 600 秒结果保持四条 Edge 丢弃为 `0` |
+
+##### 21.7.27.3 实施与回归结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| Pipeline 配置编译 | 通过 | VS 18 Community x64 Debug 下 `video_pipeline_lib`、`test_mediaflow_media_nodes`、`test_stream_decode` 构建成功 |
+| 默认预算 | 通过 | 音频压缩包 `max_items=512`、`max_span_us=1000000`、`max_bytes=96000`，视频帧 `max_span_us=250000` 且不启用字节预算 |
+| 设备覆盖联动 | 通过 | 音频入口调整到 2 秒后，`max_span_us=2000000`、`max_bytes=192000` 同步更新 |
+| 核心回归 | 通过 | `test_mediaflow`、`test_mediaflow_timing`、`test_mediaflow_media_nodes`、`test_mediaflow_ffmpeg_publisher`、`test_render_session` 共 5/5 通过 |
+
+Pipeline 级预算配置已完成，下一阶段进入真实播放端的音频 master PTS 与视频显示
+PTS 误差采集；不再把配置级回归误认为端到端播放同步通过。
+
+#### 21.7.28 真实播放端 PTS 误差采集
+
+本阶段在 `RenderStats` 中增加带方向的 A/V 误差统计，并在 OpenGL/WASAPI 渲染测试中
+增加本地 URL、自动帧数和 `--render-only` 参数。误差定义为：
+`video_display_pts_us - audio_played_pts_us`；正值表示视频领先，负值表示视频落后。
+只有时钟来源已经是音频 master、且视频帧真正调用 renderer 成功时才记录样本，
+system fallback 和视频队列丢帧不进入误差样本。
+
+##### 21.7.28.1 实施内容
+
+1. `RenderStats` 增加 audio master 样本数、最近误差、误差最小/最大值和绝对误差总和，
+   调用方可以直接计算平均绝对误差。
+2. `RenderSession` 在视频 renderer 成功返回后读取统一时钟快照，按音频 master
+   记录实际显示点误差；错误值保留正负方向，不把它转换成无方向的延迟数。
+3. `test_opengl_video_renderer` 保留 FFmpeg 解码得到的有效 PTS/DTS，仅在时间戳缺失时
+   使用帧率/音频 duration 兜底；支持 `--rtsp-url <url> --frames <count>` 和
+   `--render-only`，后者跳过额外 H.264/AAC 编码负载。
+4. `test_render_session` 增加确定性音频 master 误差回归：原始视频 PTS `100 ms`、
+   音频 PTS `130 ms` 经视频锚点归一化后，视频显示相对音频 master 的方向误差必须为
+   `-30 ms`。
+
+##### 21.7.28.2 本地播放验收结果
+
+| 验收项 | 结果 | 证据 |
+|---|---|---|
+| 统计编译与确定性回归 | 通过 | `test_render_session` 退出码 `0`，误差字段和 audio master 采样通过 |
+| 高分辨率本地双轨 render-only | 未通过 | `1920x1242`，输入 300 帧，仅渲染 3 帧，`dropped_video=290`，误差样本 1，误差 `+184543 us` |
+| 高分辨率编码基线 | 未通过 | 输入 300 帧，渲染 10 帧，`dropped_video=290`，误差范围 `-745908/253092 us`，平均绝对误差 `354626 us`；编码负载仅作为问题对照，不作为同步结论 |
+| 低分辨率干净双轨 render-only | 未通过 | 独立 `640x414`、AAC 双轨流，输入 300 帧，渲染 5 帧，`dropped_video=288`，误差样本 1，误差 `+478544 us` |
+| 关闭 PTS 调度的低分辨率对照 | 未通过 | `299/300` 帧可显示，但平均绝对误差约 `617248 us`；证明图像转换和 OpenGL 吞吐不是主因，直接显示不能作为同步方案 |
+| 修复后默认 6/50 帧队列 | 未通过 | 误差平均约 `17223 us`，但视频窗口只覆盖约 `240 ms`，无法承接 WASAPI 播放前瞻，出现大量队列覆盖；默认低延迟配置不能用于当前稳定源验收 |
+| 分块 PCM PTS 修复后的 128/128 队列和 3 秒排空 | 部分通过 | `291/300` 视频显示，`8` 个 AV sync 晚帧丢弃，另有 1 帧在受控 Stop 时尚未显示；audio master 样本 `283`，误差范围 `-62027/194537 us`，平均绝对误差 `13052 us`；`dropped_audio=0`、`audio_pcm_dropped=0`，短 underrun 降至 `28`。仍需长测确认起播阶段的最大正误差和剩余晚帧 |
+| 资源收尾 | 通过 | 临时低分辨率 FFmpeg 发布进程已停止，未建立第二路现场摄像头 RTSP 会话 |
+
+证据来自本机 ZLMediaKit `rtsp://127.0.0.1:554/mediaflow/clean` 以及临时低分辨率
+`mediaflow/low` 流。两次测试均确认视频和 AAC 音频双轨可以打开，但不能宣称真实
+播放端同步已经通过。
+
+##### 21.7.28.3 PTS 原点与音频启动修复
+
+原先使用“两轨首个 PTS 的较小值”作为原点的思路不适用于 RTSP 直播加入：音频可能在
+首个可解码视频关键帧之前或之后到达，直接开始音频播放会使 audio master 跳到未来
+PTS，视频随后被误判为晚帧。当前实现改为以下策略：
+
+1. 双轨预览以首个可显示视频帧 PTS 作为共同原点；已经入队或随后迟到、且原始 PTS
+   小于该原点的音频均作为无画面 preroll 丢弃。纯音频会话仍以首个音频 PTS 为原点。
+2. 原点确定时将 fallback system clock 重置到归一化后的 `0`；RTSP 等待关键帧的墙钟
+   时长不再污染新一代媒体时间轴。
+3. 首个音频帧若 PTS 晚于视频起点，audio worker 先等待 system clock 到达该 PTS，再
+   将 PCM 交给 WASAPI。第一次 audio master 因而从真实播放点建立，不会抢跑。
+4. 后续音频提交最多领先实际播放位置一个 WASAPI buffer，并在有无音频输入时都刷新
+   `PlayedPtsUs()`；视频调度能持续读取由声卡驱动的 audio master，而不是上一次输入
+   回调的静态快照。`target_latency_ms` 作为设备 buffer 之外的前瞻余量，用于覆盖
+   解码回调与 WASAPI event 的相位差。
+5. `test_opengl_video_renderer` 新增 `--no-av-sync`、`--video-queue-frames`、
+   `--audio-queue-frames` 和 `--drain-ms`。这些参数只用于稳定源 A/B 验收，默认值仍
+   保持低延迟队列，不构成生产参数替换。
+6. `AudioPcmQueue` 不再以“首个 PCM PTS + 累计帧数”估算时钟。WASAPI 在每次
+   `ReleaseBuffer()` 成功后记录真实 PCM 或补静音的分块时间线；`PlayedPtsUs()` 根据
+   device padding 定位实际播放分块，在媒体 PCM 尚未开始或正处于纯静音时返回
+   `kNoTimestamp`，不会伪造 audio master。
+
+`test_render_session` 新增“连接等待 120 ms 后首个视频建立原点、首音频 PTS 为 80 ms”
+的确定性回归，验证音频不会因连接阶段已经经过的墙钟而提前送入 renderer。
+`test_audio_render_strategy` 额外覆盖设备 padding、补静音和后续 PCM PTS 跳变，验证
+音频时钟不会跨分块错误连续。
+
+##### 21.7.28.4 当前结论与剩余问题
+
+本阶段已完成共同 PTS 原点、音频启动时序和声卡驱动时钟的第一轮实现。低分辨率稳定源的
+128/128 帧验收表明，同步器可以在持续 audio master 样本下将平均绝对误差控制在约
+`13 ms`，并避免音频/PCM 队列丢弃；这与关闭同步时约 `617 ms` 的误差形成直接对照。
+
+但该结果不是最终通过结论：
+
+1. 128/128 是针对当前本机 FFmpeg/ZLMediaKit/WASAPI 组合的验收窗口，不能直接替换
+   `RenderSession` 的低延迟默认 `6/50`。后续应由设备/播放 profile 根据音频设备缓冲、
+   帧率和允许延迟生成容量。
+2. 分块 PTS 映射已替换旧近似算法，但只完成了 300 帧短测。首次音频可听点附近仍出现
+   最大 `194537 us` 的正误差，需要通过 3000 帧稳定源长测确认它是起播瞬态而非持续漂移。
+3. `dropped_audio` 仍未拆分为“视频原点之前的预滚丢弃”和“RenderSession 音频队列
+   满丢弃”。当前复测为 `0`，但仍应补充原因计数，避免后续设备问题难以归因。
+4. 8 个 AV sync 晚帧说明当前 `80 ms` 晚帧阈值与 128/128 验收窗口下仍会做低延迟
+   取舍。下一阶段需要记录每次丢弃的 PTS 偏差，再依据实时预览或完整播放 profile
+   选择阈值，而不是简单放宽全局常量。
+5. 下一轮使用本机稳定双轨源执行至少 3000 视频帧，验收 audio master 样本连续增长、
+   视频队列不持续满、PCM 丢弃为 `0`，并在起播瞬态与稳态分别设置误差阈值；现场
+   摄像头继续遵守单路 RTSP 约束。

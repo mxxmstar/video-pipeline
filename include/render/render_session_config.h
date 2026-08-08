@@ -41,6 +41,12 @@ struct RenderSessionConfig {
     /// 音视频同步策略配置。阶段 4 第一版用于控制视频帧的早到等待和晚到丢弃。
     AvSyncConfig av_sync;
 
+    /// 是否在双轨进入渲染队列前使用同一个媒体 PTS 原点。
+    ///
+    /// 开启后双轨直播以首个可显示视频帧作为共同原点，并丢弃该点之前的音频
+    /// preroll；这样不会在等待首个视频关键帧时先播放一段没有画面的音频。
+    bool normalize_track_pts{true};
+
     /// 视频 PTS 归一化配置。阶段 4 后续小步用于处理缺失、倒退和大跳变 PTS。
     VideoPtsNormalizerConfig video_pts;
 };

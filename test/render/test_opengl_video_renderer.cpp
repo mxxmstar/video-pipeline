@@ -4,6 +4,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -23,7 +24,8 @@ constexpr int kSkipTest = 77;
 
 // 摄像头端到端手动渲染测试配置，与 test_rtsp_server_publisher.cpp 中的
 // TestCameraAudioVideoDecodeEncodePublish 使用同一路 RTSP 源。
-constexpr const char* kManualCameraSourceUrl = "rtsp://192.168.66.83/live/mainstream";
+constexpr const char* kDefaultRtspSourceUrl =
+    "rtsp://192.168.66.83/live/mainstream";
 constexpr int kManualConnectTimeoutMs = 5000;
 constexpr int kManualReadTimeoutMs = 5000;
 constexpr int kManualFallbackFps = 30;
@@ -44,6 +46,13 @@ struct CameraAvRenderState {
     int read_video_packets{0};
     int read_audio_packets{0};
     int reported_video_frames{0};
+    bool encode_frames{true};
+    /// 仅供本地验收 A/B 对照：关闭时视频不按 audio master 做 PTS 等待/丢帧。
+    bool av_sync_enabled{true};
+    /// 真实流的音频播放缓冲可能领先视频显示；该值用于验收不同视频缓冲窗口。
+    std::size_t max_video_queue_frames{6};
+    /// 音频启动等待期间保留的解码帧数量，用于覆盖 RTSP 的首批音频突发。
+    std::size_t max_audio_queue_frames{50};
     bool initialized{false};
     bool failed{false};
     bool closed{false};
@@ -57,7 +66,20 @@ int ResolveManualFps(const VideoStreamInfo& video_info) {
     return kManualFallbackFps;
 }
 
-void NormalizeCameraVideoFrameTime(CameraAvRenderState& state, MediaFrame& frame) {
+void EnsureVideoFrameTime(CameraAvRenderState& state, MediaFrame& frame) {
+    // FFmpegDecoder 已经把容器时间基换算为微秒。有效的源 PTS/DTS 必须保留，
+    // 否则后续记录到的“音频 master 对视频显示误差”只是人工帧率时间轴的误差，
+    // 不能反映真实 RTSP 传输和解码链路。只有源缺失时间戳时才生成兜底值。
+    if (frame.time.pts_us != kNoTimestamp) {
+        if (frame.time.dts_us == kNoTimestamp) {
+            frame.time.dts_us = frame.time.pts_us;
+        }
+        if (frame.time.duration_us <= 0) {
+            frame.time.duration_us = state.frame_duration_us;
+        }
+        return;
+    }
+
     const auto frame_index =
         static_cast<int64_t>(std::max(0, state.decoded_video_frames - 1));
     const auto pts_us = frame_index * state.frame_duration_us;
@@ -87,8 +109,10 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
         return false;
     }
 
+    const auto& audio_info = audio_stream_info.get_detail<AudioStreamInfo>();
+    if (state.encode_frames) {
     // 保留原 DecodeEncodePublish 测试里的编码链路：视频帧仍会编码成 H264，
-    // 只是编码结果不再发布到 RTSP，而是把 decoded frame 直接交给 renderer 显示。
+    // 真实播放同步验收可以关闭这段额外负载，避免把编码性能误判为渲染同步问题。
     EncoderConfig encoder_config;
     encoder_config.media_type = MediaType::VIDEO;
     encoder_config.codec_type = CodecType::H264;
@@ -113,7 +137,6 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
         return false;
     }
 
-    const auto& audio_info = audio_stream_info.get_detail<AudioStreamInfo>();
     EncoderConfig audio_encoder_config;
     audio_encoder_config.media_type = MediaType::AUDIO;
     audio_encoder_config.codec_type = CodecType::AAC;
@@ -132,6 +155,7 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
         state.error = "failed to open AAC audio encoder";
         return false;
     }
+    }
 
     render::RenderSessionConfig render_config;
     render_config.video.window_width = width;
@@ -148,8 +172,9 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
     render_config.audio.fail_if_device_unavailable = true;
     render_config.enable_video = true;
     render_config.enable_audio = true;
-    render_config.max_video_queue_frames = 6;
-    render_config.max_audio_queue_frames = 50;
+    render_config.max_video_queue_frames = state.max_video_queue_frames;
+    render_config.max_audio_queue_frames = state.max_audio_queue_frames;
+    render_config.av_sync.enabled = state.av_sync_enabled;
 
     // OpenGL context 与 WASAPI/COM 都由 RenderSession 的工作线程创建和释放。
     // decoder callback 从这里开始只负责投递 shared_ptr，不再直接碰窗口和声卡。
@@ -165,7 +190,9 @@ bool InitializeCameraAvRender(CameraAvRenderState& state,
     std::cout << "Camera decode/encode/render initialized: video="
               << width << "x" << height << " @" << state.fps
               << "fps, audio=" << audio_info.sample_rate
-              << "Hz/" << audio_info.channels << "ch\n";
+              << "Hz/" << audio_info.channels << "ch, queues=video/"
+              << state.max_video_queue_frames << ", audio/"
+              << state.max_audio_queue_frames << "\n";
     std::cout << "Rendering camera stream. Press ESC or close the window to stop.\n"
               << std::flush;
     return true;
@@ -270,7 +297,14 @@ int TestStaticRgbRenderSmoke() {
     return 0;
 }
 
-int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
+int TestCameraAudioVideoDecodeEncodeRender(
+    const std::string& source_url = kDefaultRtspSourceUrl,
+    int max_decoded_video_frames = 0,
+    bool encode_frames = true,
+    bool av_sync_enabled = true,
+    std::size_t max_video_queue_frames = 6,
+    std::size_t max_audio_queue_frames = 50,
+    int drain_after_input_ms = 1500) {
     FFmpegPuller puller;
     puller.SetConnectTimeoutMs(kManualConnectTimeoutMs);
     puller.SetReadTimeoutMs(kManualReadTimeoutMs);
@@ -278,8 +312,8 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
     puller.SetRtspAutoSwitchToTcp(false);
     puller.SetLowLatency(true);
 
-    std::cout << "Opening source: " << kManualCameraSourceUrl << "\n";
-    if (!puller.Open(kManualCameraSourceUrl)) {
+    std::cout << "Opening source: " << source_url << "\n";
+    if (!puller.Open(source_url)) {
         std::cerr << "Failed to open source RTSP.\n";
         return 1;
     }
@@ -305,8 +339,9 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
         return 1;
     }
     if (audio_stream_info.codec_type != CodecType::G711A &&
-        audio_stream_info.codec_type != CodecType::G711U) {
-        std::cerr << "Expected G711 audio source, got codec="
+        audio_stream_info.codec_type != CodecType::G711U &&
+        audio_stream_info.codec_type != CodecType::AAC) {
+        std::cerr << "Expected G711 or AAC audio source, got codec="
                   << static_cast<int>(audio_stream_info.codec_type) << "\n";
         puller.Close();
         return 1;
@@ -320,6 +355,10 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
               << ", channels=" << audio_detail.channels << "\n" << std::flush;
 
     CameraAvRenderState state;
+    state.encode_frames = encode_frames;
+    state.av_sync_enabled = av_sync_enabled;
+    state.max_video_queue_frames = max_video_queue_frames;
+    state.max_audio_queue_frames = max_audio_queue_frames;
     state.fps = ResolveManualFps(video_detail);
     state.frame_duration_us = 1'000'000 / state.fps;
 
@@ -331,7 +370,7 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
         }
 
         ++state.decoded_video_frames;
-        NormalizeCameraVideoFrameTime(state, *frame);
+        EnsureVideoFrameTime(state, *frame);
 
         if (!state.initialized &&
             !InitializeCameraAvRender(state, *frame, video_detail, audio_stream_info)) {
@@ -353,14 +392,17 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
             return;
         }
 
-        // 编码只用于沿用原函数的 DecodeEncode 覆盖面，编码后的 packet 不再发布。
-        std::vector<PacketPtr> encoded;
-        if (!state.video_encoder->Encode(std::move(frame), encoded)) {
-            state.failed = true;
-            state.error = "failed to encode H264 video frame";
-            return;
+        // 编码模式保留原 DecodeEncodeRender 覆盖面；render-only 模式只验证
+        // 解码后的真实 PTS、RenderSession 和音频设备，不引入编码 CPU 压力。
+        if (state.video_encoder) {
+            std::vector<PacketPtr> encoded;
+            if (!state.video_encoder->Encode(std::move(frame), encoded)) {
+                state.failed = true;
+                state.error = "failed to encode H264 video frame";
+                return;
+            }
+            state.encoded_video_packets += static_cast<int>(encoded.size());
         }
-        state.encoded_video_packets += static_cast<int>(encoded.size());
     });
 
     audio_decoder.SetFrameCallback([&](std::shared_ptr<MediaFrame> frame) {
@@ -369,7 +411,7 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
         }
 
         ++state.decoded_audio_frames;
-        if (!state.initialized || !state.audio_encoder) {
+        if (!state.initialized) {
             return;
         }
 
@@ -382,10 +424,16 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
         const int64_t duration_us = sample_rate > 0
             ? static_cast<int64_t>(nb_samples) * 1'000'000LL / sample_rate
             : 20'000;
-        frame->time.pts_us = state.next_audio_pts_us;
-        frame->time.dts_us = frame->time.pts_us;
+        // 音频同样优先保留 Decoder 的实际 PTS。缺失时才沿用上一个音频帧
+        // 的结束位置，保证没有源 PTS 的旧摄像头仍可完成手动渲染验证。
+        if (frame->time.pts_us == kNoTimestamp) {
+            frame->time.pts_us = state.next_audio_pts_us;
+        }
+        if (frame->time.dts_us == kNoTimestamp) {
+            frame->time.dts_us = frame->time.pts_us;
+        }
         frame->time.duration_us = duration_us;
-        state.next_audio_pts_us += duration_us;
+        state.next_audio_pts_us = frame->time.pts_us + duration_us;
 
         if (!state.render_session || !state.render_session->SubmitFrame(frame)) {
             state.failed = true;
@@ -396,13 +444,15 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
             return;
         }
 
-        std::vector<PacketPtr> encoded;
-        if (!state.audio_encoder->Encode(std::move(frame), encoded)) {
-            state.failed = true;
-            state.error = "failed to encode AAC audio frame";
-            return;
+        if (state.audio_encoder) {
+            std::vector<PacketPtr> encoded;
+            if (!state.audio_encoder->Encode(std::move(frame), encoded)) {
+                state.failed = true;
+                state.error = "failed to encode AAC audio frame";
+                return;
+            }
+            state.encoded_audio_packets += static_cast<int>(encoded.size());
         }
-        state.encoded_audio_packets += static_cast<int>(encoded.size());
     });
 
     if (!video_decoder.Open(video_stream_info)) {
@@ -417,6 +467,7 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
         return 1;
     }
 
+    bool reached_frame_limit = false;
     while (!state.failed && !state.closed) {
         if (state.render_session) {
             if (state.render_session->ShouldClose()) {
@@ -479,6 +530,18 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
                       << ", avsync_waits=" << stats.av_sync_video_waits
                       << ", avsync_wait_ms=" << stats.av_sync_video_wait_us / 1000
                       << ", clock=" << (stats.playback_clock_source == 1 ? "audio" : "system")
+                      << ", avsync_samples="
+                      << stats.video_audio_master_sync_samples
+                      << ", avsync_last_error_us="
+                      << stats.last_video_audio_master_error_us
+                      << ", avsync_error_range_us="
+                      << stats.min_video_audio_master_error_us << "/"
+                      << stats.max_video_audio_master_error_us
+                      << ", avsync_abs_avg_us="
+                      << (stats.video_audio_master_sync_samples > 0
+                              ? stats.total_abs_video_audio_master_error_us /
+                                    stats.video_audio_master_sync_samples
+                              : 0)
                       << ", normalized_video_pts=" << stats.normalized_video_pts_frames
                       << ", dropped_audio=" << stats.dropped_audio_frames
                       << ", audio_underruns=" << stats.audio_underruns
@@ -494,10 +557,27 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
 
         if (max_decoded_video_frames > 0 &&
             state.decoded_video_frames >= max_decoded_video_frames) {
-            // --camera-frames 用于自动化验证：跑够指定解码视频帧后主动收尾，
-            // 避免依赖人工关闭 GLFW 窗口，也避免命令超时导致 stdout 没有 flush。
-            state.closed = true;
+            // 自动化验收停止读取新包后不能立即 Stop：视频 PTS 调度和 WASAPI
+            // 仍可能持有少量已解码帧。记录帧数上限后由下方受控排空，避免把
+            // 正常在途帧误计为播放端丢失。
+            reached_frame_limit = true;
             break;
+        }
+    }
+
+    if (reached_frame_limit && state.render_session &&
+        drain_after_input_ms > 0) {
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(drain_after_input_ms);
+        while (std::chrono::steady_clock::now() < deadline &&
+               !state.render_session->ShouldClose() &&
+               state.render_session->IsRunning()) {
+            const auto stats = state.render_session->GetStats();
+            if (stats.video_queue_size == 0 && stats.audio_queue_size == 0 &&
+                stats.audio_renderer_queue_size == 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
 
@@ -529,6 +609,18 @@ int TestCameraAudioVideoDecodeEncodeRender(int max_decoded_video_frames = 0) {
               << ", avsync_waits=" << render_stats.av_sync_video_waits
               << ", avsync_wait_ms=" << render_stats.av_sync_video_wait_us / 1000
               << ", clock=" << (render_stats.playback_clock_source == 1 ? "audio" : "system")
+              << ", avsync_samples="
+              << render_stats.video_audio_master_sync_samples
+              << ", avsync_last_error_us="
+              << render_stats.last_video_audio_master_error_us
+              << ", avsync_error_range_us="
+              << render_stats.min_video_audio_master_error_us << "/"
+              << render_stats.max_video_audio_master_error_us
+              << ", avsync_abs_avg_us="
+              << (render_stats.video_audio_master_sync_samples > 0
+                      ? render_stats.total_abs_video_audio_master_error_us /
+                            render_stats.video_audio_master_sync_samples
+                      : 0)
               << ", normalized_video_pts=" << render_stats.normalized_video_pts_frames
               << ", dropped_audio=" << render_stats.dropped_audio_frames
               << ", audio_underruns=" << render_stats.audio_underruns
@@ -553,7 +645,79 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         // 该模式仍然走真实 camera decode/encode/render 链路，只是增加自动退出条件。
-        return TestCameraAudioVideoDecodeEncodeRender(std::stoi(argv[2]));
+        return TestCameraAudioVideoDecodeEncodeRender(
+            kDefaultRtspSourceUrl, std::stoi(argv[2]));
+    }
+
+    if (mode == "--rtsp-url") {
+        if (argc < 3) {
+            std::cerr << "Usage: test_opengl_video_renderer --rtsp-url <url> "
+                         "[--frames <count>] [--render-only]\n";
+            return 1;
+        }
+        const std::string source_url = argv[2];
+        if (source_url.empty()) {
+            std::cerr << "RTSP URL must not be empty\n";
+            return 1;
+        }
+        int max_frames = 0;
+        bool render_only = false;
+        bool av_sync_enabled = true;
+        std::size_t max_video_queue_frames = 6;
+        std::size_t max_audio_queue_frames = 50;
+        int drain_after_input_ms = 1500;
+        for (int index = 3; index < argc; ++index) {
+            const std::string option = argv[index];
+            if (option == "--frames" && index + 1 < argc) {
+                try {
+                    max_frames = std::max(0, std::stoi(argv[++index]));
+                } catch (...) {
+                    std::cerr << "Invalid --frames value\n";
+                    return 1;
+                }
+            } else if (option == "--render-only") {
+                render_only = true;
+            } else if (option == "--no-av-sync") {
+                // 保留默认同步策略；该开关只用于将真实播放瓶颈归因到
+                // PTS 调度或输入/渲染吞吐，而不是生产配置。
+                av_sync_enabled = false;
+            } else if (option == "--video-queue-frames" && index + 1 < argc) {
+                try {
+                    const int value = std::stoi(argv[++index]);
+                    if (value <= 0) {
+                        throw std::out_of_range("video queue frames");
+                    }
+                    max_video_queue_frames = static_cast<std::size_t>(value);
+                } catch (...) {
+                    std::cerr << "Invalid --video-queue-frames value\n";
+                    return 1;
+                }
+            } else if (option == "--audio-queue-frames" && index + 1 < argc) {
+                try {
+                    const int value = std::stoi(argv[++index]);
+                    if (value <= 0) {
+                        throw std::out_of_range("audio queue frames");
+                    }
+                    max_audio_queue_frames = static_cast<std::size_t>(value);
+                } catch (...) {
+                    std::cerr << "Invalid --audio-queue-frames value\n";
+                    return 1;
+                }
+            } else if (option == "--drain-ms" && index + 1 < argc) {
+                try {
+                    drain_after_input_ms = std::max(0, std::stoi(argv[++index]));
+                } catch (...) {
+                    std::cerr << "Invalid --drain-ms value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Invalid --rtsp-url option\n";
+                return 1;
+            }
+        }
+        return TestCameraAudioVideoDecodeEncodeRender(
+            source_url, max_frames, !render_only, av_sync_enabled,
+            max_video_queue_frames, max_audio_queue_frames, drain_after_input_ms);
     }
 
     if (mode == "--smoke") {
@@ -564,6 +728,10 @@ int main(int argc, char* argv[]) {
         return TestStaticRgbRenderLoop();
     }
 
-    std::cerr << "Usage: test_opengl_video_renderer [--camera|--camera-frames <count>|--smoke|--loop]\n";
+    std::cerr << "Usage: test_opengl_video_renderer "
+                 "[--camera|--camera-frames <count>|--rtsp-url <url> "
+                 "[--frames <count>] [--render-only] [--no-av-sync] "
+                 "[--video-queue-frames <count>] [--audio-queue-frames <count>] "
+                 "[--drain-ms <count>]|--smoke|--loop]\n";
     return 1;
 }

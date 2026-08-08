@@ -471,6 +471,27 @@ void TestQueueBudgetAccounting() {
     assert(span_queue.Send({1, 0, 10, 3}) == MailboxPushResult::Accepted);
 }
 
+void TestCompressedAudioBurstBudget() {
+    // 42 个 AAC 包按 23 ms 一帧计算，约覆盖 966 ms 的媒体时间。
+    // 该场景模拟 RTSP 接收端一次性提交约 1 秒压缩音频的网络突发。
+    const auto budget = QueueBudget::FromBitrate(
+        512, 384000, 1'000'000);
+    QueueTransport<MediaPacketMessage> audio_queue(
+        512, BackpressurePolicy::DropOldest, budget);
+
+    for (std::int64_t index = 0; index < 42; ++index) {
+        assert(audio_queue.Send(MakeCostedMediaMessage(
+                   MediaType::AUDIO, index * 23, 23, 100)) ==
+               MailboxPushResult::Accepted);
+    }
+
+    const auto snapshot = audio_queue.Metrics();
+    assert(snapshot.items == 42);
+    assert(snapshot.span_us == 966'000);
+    assert(snapshot.limit_span == 0);
+    assert(snapshot.bytes == 4'200);
+}
+
 void TestTrackBudgetIsolationAndControlRetention() {
     QueueBudget budget;
     budget.max_items = 2;
@@ -1400,6 +1421,7 @@ void TestGraphStartStopStart() {
 int main() {
     TestQueueBackpressure();
     TestQueueBudgetAccounting();
+    TestCompressedAudioBurstBudget();
     TestTrackBudgetIsolationAndControlRetention();
     TestQueueDiagnosticsAndBudgetFormula();
     TestCapacityRegressionScenarios();

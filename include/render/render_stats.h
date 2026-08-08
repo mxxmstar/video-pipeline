@@ -37,6 +37,17 @@ struct RenderStats {
     std::int64_t playback_pts_us{0};
     /// 当前播放时钟来源：0 表示 system fallback，1 表示 audio master。
     int playback_clock_source{0};
+    /// 使用音频 master 采样到的视频显示同步误差次数。
+    std::int64_t video_audio_master_sync_samples{0};
+    /// 最近一次同步误差，定义为视频显示 PTS - 音频已播放 PTS，单位微秒。
+    /// 正值表示视频领先，负值表示视频落后。
+    std::int64_t last_video_audio_master_error_us{0};
+    /// 已采样误差中的最小值，单位微秒。
+    std::int64_t min_video_audio_master_error_us{0};
+    /// 已采样误差中的最大值，单位微秒。
+    std::int64_t max_video_audio_master_error_us{0};
+    /// 已采样误差绝对值之和，调用方可除以样本数得到平均绝对误差。
+    std::int64_t total_abs_video_audio_master_error_us{0};
     /// 当前视频 session 队列长度。
     std::size_t video_queue_size{0};
     /// 当前音频 session 队列长度。

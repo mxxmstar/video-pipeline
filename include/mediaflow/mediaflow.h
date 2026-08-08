@@ -14,5 +14,6 @@
 #include "mediaflow/core/port.h"
 #include "mediaflow/core/transport.h"
 #include "mediaflow/core/types.h"
+#include "mediaflow/media_pipeline_config.h"
 #include "mediaflow/media_timing.h"
 #include "mediaflow/media_nodes.h"

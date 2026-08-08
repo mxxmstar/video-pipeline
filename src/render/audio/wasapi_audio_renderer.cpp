@@ -8,6 +8,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -178,7 +179,7 @@ void WasapiAudioRenderer::Shutdown() {
 
 int64_t WasapiAudioRenderer::PlayedPtsUs() const {
     if (!initialized_ || sample_rate_ <= 0) {
-        return 0;
+        return kNoTimestamp;
     }
 
     // WASAPI padding 表示已经提交但尚未播放的设备帧数。AudioPcmQueue 用
@@ -424,13 +425,20 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
             return false;
         }
         pcm_queue_.AddUnderrun();
-        pcm_queue_.AddPlayedFrames(fill_request.frames_to_request);
+        pcm_queue_.RecordDeviceSilenceFrames(fill_request.frames_to_request);
         WakeAudioThread();
         return true;
     }
 
+    struct DeviceWriteSegment {
+        std::uint32_t frames{0};
+        std::int64_t pts_us{kNoTimestamp};
+        bool has_media_pts{false};
+    };
+
     std::uint32_t written_frames = 0;
     bool wrote_silence = false;
+    std::vector<DeviceWriteSegment> device_segments;
     while (written_frames < fill_request.frames_to_request) {
         if (active_frame_offset >= active_chunk.nb_samples) {
             // 当前 chunk 已写完，尝试从策略队列取下一块 PCM。取不到时 active_chunk
@@ -446,6 +454,7 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
             const auto frames_from_chunk = std::min<std::uint32_t>(
                 fill_request.frames_to_request - written_frames,
                 active_chunk.nb_samples - active_frame_offset);
+            const auto source_offset = active_frame_offset;
             std::memcpy(
                 dst + static_cast<std::size_t>(written_frames) * bytes_per_frame_,
                 active_chunk.data.data() +
@@ -453,6 +462,13 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
                 static_cast<std::size_t>(frames_from_chunk) * bytes_per_frame_);
             active_frame_offset += frames_from_chunk;
             written_frames += frames_from_chunk;
+            const auto segment_pts = active_chunk.pts_us == kNoTimestamp
+                ? kNoTimestamp
+                : active_chunk.pts_us +
+                    static_cast<std::int64_t>(source_offset) * 1'000'000LL /
+                        sample_rate_;
+            device_segments.push_back(
+                {frames_from_chunk, segment_pts, segment_pts != kNoTimestamp});
             continue;
         }
 
@@ -465,6 +481,7 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
                     static_cast<std::size_t>(silence_frames) * bytes_per_frame_);
         written_frames += silence_frames;
         wrote_silence = true;
+        device_segments.push_back({silence_frames, kNoTimestamp, false});
         pcm_queue_.AddUnderrun();
     }
 
@@ -476,7 +493,15 @@ bool WasapiAudioRenderer::FillWasapiBuffer(PcmChunk& active_chunk,
         return false;
     }
 
-    pcm_queue_.AddPlayedFrames(fill_request.frames_to_request);
+    // 只有 ReleaseBuffer 成功后才记录设备时间线。若写设备失败，这批数据并未
+    // 进入硬件，绝不能让 PlayedPtsUs() 误以为媒体时钟已经向前推进。
+    for (const auto& segment : device_segments) {
+        if (segment.has_media_pts) {
+            pcm_queue_.RecordDeviceMediaFrames(segment.frames, segment.pts_us);
+        } else {
+            pcm_queue_.RecordDeviceSilenceFrames(segment.frames);
+        }
+    }
     if (wrote_silence) {
         WakeAudioThread();
     }

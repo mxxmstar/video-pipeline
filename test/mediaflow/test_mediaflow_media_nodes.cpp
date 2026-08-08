@@ -119,6 +119,34 @@ void TestMediaQueueItemCostTraits() {
     assert(QueueItemTraits<MediaFrameMessage>::IsControl(eos_frame));
 }
 
+void TestMediaFlowPipelineConfig() {
+    MediaFlowPipelineConfig config;
+
+    const auto audio_packet =
+        config.MakePacketEdgeOptions(QueueTrack::Audio);
+    assert(audio_packet.capacity == 512);
+    assert(audio_packet.budget.max_items == 512);
+    assert(audio_packet.budget.max_span_us == 1'000'000);
+    assert(audio_packet.budget.max_bytes == 96'000);
+    assert(audio_packet.backpressure == BackpressurePolicy::DropOldest);
+    assert(audio_packet.max_batch_size == 128);
+
+    // 覆盖设备级突发窗口后，字节上限必须随媒体时长重新计算，避免 items/span
+    // 已经放宽而 bytes 仍沿用旧配置，形成隐蔽的第二重丢包边界。
+    config.audio_packet.max_span_us = 2'000'000;
+    const auto expanded_audio_packet =
+        config.MakePacketEdgeOptions(QueueTrack::Audio);
+    assert(expanded_audio_packet.budget.max_span_us == 2'000'000);
+    assert(expanded_audio_packet.budget.max_bytes == 192'000);
+
+    const auto video_frame =
+        config.MakeFrameEdgeOptions(QueueTrack::Video);
+    assert(video_frame.capacity == 8);
+    assert(video_frame.budget.max_span_us == 250'000);
+    assert(video_frame.budget.max_bytes == 0);
+    assert(video_frame.backpressure == BackpressurePolicy::DropOldest);
+}
+
 class ScriptedPuller final : public IPuller {
 public:
     bool Open(const std::string&) override {
@@ -1327,6 +1355,7 @@ void TestPublisherInterleavesMultipleTracksByDts() {
 
 int main() {
     TestMediaQueueItemCostTraits();
+    TestMediaFlowPipelineConfig();
     TestSingleVideoChainAndReconnectGeneration();
     TestSourceTrackQueuesAreIndependent();
     TestDecoderRejectsIncompleteStreamInfo();

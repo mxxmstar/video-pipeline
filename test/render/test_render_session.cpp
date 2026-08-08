@@ -260,8 +260,8 @@ bool TestPauseResumeAndAudioDispatch() {
 
     session.Pause();
     const bool submitted =
-        session.SubmitFrame(MakeFrame(MediaType::AUDIO, 100)) &&
-        session.SubmitFrame(MakeFrame(MediaType::VIDEO, 120));
+        session.SubmitFrame(MakeFrame(MediaType::VIDEO, 120)) &&
+        session.SubmitFrame(MakeFrame(MediaType::AUDIO, 140));
     std::this_thread::sleep_for(30ms);
     const auto paused_stats = session.GetStats();
     if (!submitted ||
@@ -379,6 +379,105 @@ bool TestAudioDispatchDoesNotWaitForSlowVideo() {
            audio_state->rendered_pts.size() >= 5;
 }
 
+bool TestAudioMasterVideoSyncMetrics() {
+    auto video_state = std::make_shared<FakeVideoState>();
+    auto audio_state = std::make_shared<FakeAudioState>();
+    video_state->block_first_render = true;
+    render::RenderSession session(
+        std::make_unique<FakeVideoRenderer>(video_state),
+        std::make_unique<FakeAudioRenderer>(audio_state));
+
+    render::RenderSessionConfig config;
+    config.enable_video = true;
+    config.enable_audio = true;
+    config.av_sync.enabled = false;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "audio master metrics session start failed: "
+                  << session.LastError() << '\n';
+        return false;
+    }
+
+    // 直播会话以视频首帧作为起点。先阻塞视频 Render，再提交原始 PTS 晚
+    // 30 ms 的音频，确保音频 master 就绪后才让视频完成显示。
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 100'000))) {
+        session.Stop();
+        return false;
+    }
+    {
+        std::unique_lock<std::mutex> lock(video_state->mutex);
+        if (!video_state->cv.wait_for(
+                lock, 1s, [&] { return video_state->first_render_entered; })) {
+            session.Stop();
+            return false;
+        }
+    }
+    if (!session.SubmitFrame(MakeFrame(MediaType::AUDIO, 130'000)) ||
+        !WaitUntil([&] { return session.GetStats().rendered_audio_frames == 1; })) {
+        session.Stop();
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(video_state->mutex);
+        video_state->release_first_render = true;
+        video_state->cv.notify_all();
+    }
+    if (!WaitUntil([&] { return session.GetStats().rendered_video_frames == 1; })) {
+        session.Stop();
+        return false;
+    }
+
+    session.Stop();
+    const auto stats = session.GetStats();
+    return stats.video_audio_master_sync_samples == 1 &&
+           stats.last_video_audio_master_error_us == -30'000 &&
+           stats.min_video_audio_master_error_us == -30'000 &&
+           stats.max_video_audio_master_error_us == -30'000 &&
+           stats.total_abs_video_audio_master_error_us == 30'000;
+}
+
+bool TestAudioStartupWaitsForSharedTimeline() {
+    auto video_state = std::make_shared<FakeVideoState>();
+    auto audio_state = std::make_shared<FakeAudioState>();
+    render::RenderSession session(
+        std::make_unique<FakeVideoRenderer>(video_state),
+        std::make_unique<FakeAudioRenderer>(audio_state));
+
+    render::RenderSessionConfig config;
+    config.enable_video = true;
+    config.enable_audio = true;
+    config.av_sync.enabled = false;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "audio startup gate session start failed: "
+                  << session.LastError() << '\n';
+        return false;
+    }
+
+    // 模拟 RTSP 等待首个可解码视频关键帧的连接阶段。会话启动时的墙钟已经
+    // 前进，但首个视频帧确定共同原点后，音频 PTS=80 ms 仍必须等待约 80 ms，
+    // 不能把连接阶段的 120 ms 错当作已经播放的媒体时间。
+    std::this_thread::sleep_for(120ms);
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 1'000'000)) ||
+        !session.SubmitFrame(MakeFrame(MediaType::AUDIO, 1'080'000))) {
+        session.Stop();
+        return false;
+    }
+
+    std::this_thread::sleep_for(30ms);
+    if (session.GetStats().rendered_audio_frames != 0) {
+        session.Stop();
+        return false;
+    }
+
+    const bool audio_rendered = WaitUntil([&] {
+        return session.GetStats().rendered_audio_frames == 1;
+    }, 500ms);
+    session.Stop();
+
+    std::lock_guard<std::mutex> lock(audio_state->mutex);
+    return audio_rendered && audio_state->rendered_pts.size() == 1 &&
+           audio_state->rendered_pts.front() == 80'000;
+}
+
 } // namespace
 
 int main() {
@@ -392,6 +491,14 @@ int main() {
     }
     if (!TestAudioDispatchDoesNotWaitForSlowVideo()) {
         std::cerr << "TestAudioDispatchDoesNotWaitForSlowVideo failed\n";
+        return 1;
+    }
+    if (!TestAudioMasterVideoSyncMetrics()) {
+        std::cerr << "TestAudioMasterVideoSyncMetrics failed\n";
+        return 1;
+    }
+    if (!TestAudioStartupWaitsForSharedTimeline()) {
+        std::cerr << "TestAudioStartupWaitsForSharedTimeline failed\n";
         return 1;
     }
 

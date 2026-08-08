@@ -113,6 +113,12 @@ public:
         audio_available_ = false;
         last_error_.clear();
         mediaflow_clock_.Reset();
+        media_pts_origin_ready_ = false;
+        first_video_pts_seen_ = false;
+        first_audio_pts_seen_ = false;
+        first_video_pts_us_ = 0;
+        first_audio_pts_us_ = 0;
+        media_pts_origin_us_ = 0;
         video_pts_scheduler_.SetConfig(
             ToMediaFlowScheduleConfig(config_.av_sync));
         video_pts_normalizer_.SetConfig(config_.video_pts);
@@ -221,6 +227,7 @@ public:
             }
 
             ++stats_.submitted_video_frames;
+            NormalizeTrackPtsLocked(*frame);
             if (video_queue_.size() >= config_.max_video_queue_frames) {
                 if (!config_.drop_late_video_frames) {
                     ++stats_.dropped_video_frames;
@@ -241,6 +248,13 @@ public:
             if (!audio_available_) {
                 // fail_if_device_unavailable=false 表示音频设备缺失不应让视频 pipeline
                 // 失败。此时接受调用并把帧记为丢弃，便于上层从统计中发现降级。
+                ++stats_.dropped_audio_frames;
+                return true;
+            }
+            if (!NormalizeTrackPtsLocked(*frame)) {
+                // 原点已经由首个视频帧确定后仍迟到的旧音频包属于无画面
+                // preroll。不能把它重标定为负 PTS 后交给音频设备，否则
+                // first_pts 会把 audio master 拉回到视频起点之前。
                 ++stats_.dropped_audio_frames;
                 return true;
             }
@@ -283,6 +297,9 @@ public:
         startup_done_ = true;
         video_available_ = false;
         audio_available_ = false;
+        media_pts_origin_ready_ = false;
+        first_video_pts_seen_ = false;
+        first_audio_pts_seen_ = false;
         mediaflow_clock_.Reset(1, stats_.playback_pts_us);
         video_pts_normalizer_.Reset();
         system_clock_anchored_ = false;
@@ -343,6 +360,87 @@ public:
     }
 
 private:
+    void RebaseFramePtsLocked(MediaFrame& frame) {
+        const auto rebase = [this](std::int64_t& pts_us) {
+            if (pts_us != kNoTimestamp) {
+                pts_us -= media_pts_origin_us_;
+            }
+        };
+        rebase(frame.time.pts_us);
+        rebase(frame.time.dts_us);
+    }
+
+    void RebaseQueuedFramesLocked() {
+        for (auto& frame : video_queue_) {
+            if (frame) {
+                RebaseFramePtsLocked(*frame);
+            }
+        }
+        // RTSP 加入直播时，音频常会早于第一个可解码视频关键帧到达。共同原点
+        // 选定为视频起点后，这些音频都是无画面 preroll，必须直接丢弃而不是
+        // 重标定为负 PTS 后交给声卡播放。
+        while (!audio_queue_.empty() && audio_queue_.front() &&
+               audio_queue_.front()->time.pts_us != kNoTimestamp &&
+               audio_queue_.front()->time.pts_us < media_pts_origin_us_) {
+            audio_queue_.pop_front();
+            ++stats_.dropped_audio_frames;
+        }
+        for (auto& frame : audio_queue_) {
+            if (frame) {
+                RebaseFramePtsLocked(*frame);
+            }
+        }
+        stats_.audio_queue_size = audio_queue_.size();
+    }
+
+    bool NormalizeTrackPtsLocked(MediaFrame& frame) {
+        if (!config_.normalize_track_pts || frame.time.pts_us == kNoTimestamp) {
+            return true;
+        }
+
+        if (frame.type == MediaType::VIDEO && !first_video_pts_seen_) {
+            first_video_pts_seen_ = true;
+            first_video_pts_us_ = frame.time.pts_us;
+        } else if (frame.type == MediaType::AUDIO && !first_audio_pts_seen_) {
+            first_audio_pts_seen_ = true;
+            first_audio_pts_us_ = frame.time.pts_us;
+        }
+
+        if (!media_pts_origin_ready_) {
+            // 双轨实时预览以首个视频帧作为启动锚点。RTSP 服务器可能在等待
+            // 视频关键帧时持续输出音频，若以最早音频为原点会造成“先有声音、
+            // 后有画面”的固定启动偏移。纯音频会话则使用首个音频 PTS。
+            if (config_.enable_video && !first_video_pts_seen_) {
+                return true;
+            }
+
+            if (first_video_pts_seen_) {
+                media_pts_origin_us_ = first_video_pts_us_;
+            } else {
+                media_pts_origin_us_ = first_audio_pts_us_;
+            }
+            media_pts_origin_ready_ = true;
+            // 第一条轨道可能已经排队，原点确定后必须回写整个在途集合，
+            // 否则同一队列中会同时存在原始 PTS 和归一化 PTS。
+            RebaseQueuedFramesLocked();
+            // RenderSession 在首个可显示视频帧前已经启动，但 RTSP 等待关键帧
+            // 期间经过的墙钟时间不属于新的媒体时间轴。此处立即把 fallback
+            // clock 重置为归一化后的 0，保证音频启动闸门和视频 PTS 调度都从
+            // 同一时刻开始计时，而不是继承连接阶段的等待时长。
+            mediaflow_clock_.SetSystemPositionUs(0);
+            stats_.playback_pts_us = 0;
+            stats_.playback_clock_source = 0;
+            system_clock_anchored_ = true;
+        }
+
+        if (frame.type == MediaType::AUDIO &&
+            frame.time.pts_us < media_pts_origin_us_) {
+            return false;
+        }
+        RebaseFramePtsLocked(frame);
+        return true;
+    }
+
     void VideoRenderLoop() {
         // 视频 renderer 的完整生命周期固定在 video_worker_ 中：
         // Init 创建窗口和 OpenGL context，Render/PollEvents 使用 context，
@@ -375,7 +473,10 @@ private:
                 // 转换/上传变慢时把音频消费也锁在同一个循环节奏里。
                 queue_cv_.wait_for(lock, kIdlePollInterval, [this] {
                     return stop_requested_ ||
-                           (!paused_ && !video_queue_.empty());
+                           (!paused_ && !video_queue_.empty() &&
+                            (!config_.normalize_track_pts ||
+                             media_pts_origin_ready_ || !config_.enable_audio ||
+                             !audio_available_));
                 });
 
                 if (stop_requested_) {
@@ -410,6 +511,29 @@ private:
                     stats_.playback_pts_us = clock_snapshot.position_us;
                     stats_.playback_clock_source =
                         clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
+                    // 只有统一时钟已经切换到音频 master 时，误差才代表真实的
+                    // A/V 播放关系。system fallback 阶段不计入，避免把首帧锚点
+                    // 或音频设备尚未出声时的估计值混入验收数据。
+                    if (clock_snapshot.valid &&
+                        clock_snapshot.source == mediaflow::ClockSource::Audio &&
+                        video_frame->time.pts_us != kNoTimestamp) {
+                        const auto error_us =
+                            video_frame->time.pts_us - clock_snapshot.position_us;
+                        const auto abs_error_us =
+                            error_us < 0 ? -error_us : error_us;
+                        if (stats_.video_audio_master_sync_samples == 0) {
+                            stats_.min_video_audio_master_error_us = error_us;
+                            stats_.max_video_audio_master_error_us = error_us;
+                        } else {
+                            stats_.min_video_audio_master_error_us = std::min(
+                                stats_.min_video_audio_master_error_us, error_us);
+                            stats_.max_video_audio_master_error_us = std::max(
+                                stats_.max_video_audio_master_error_us, error_us);
+                        }
+                        ++stats_.video_audio_master_sync_samples;
+                        stats_.last_video_audio_master_error_us = error_us;
+                        stats_.total_abs_video_audio_master_error_us += abs_error_us;
+                    }
                 }
             }
 
@@ -463,7 +587,9 @@ private:
                 // 喂入 WASAPI PCM 队列，不再受视频渲染帧率影响。
                 queue_cv_.wait_for(lock, kIdlePollInterval, [this] {
                     return stop_requested_ ||
-                           (!paused_ && !audio_queue_.empty());
+                           (!paused_ && !audio_queue_.empty() &&
+                            (!config_.normalize_track_pts ||
+                             media_pts_origin_ready_ || !config_.enable_video));
                 });
 
                 if (stop_requested_) {
@@ -477,23 +603,39 @@ private:
                 }
             }
 
+            if (!audio_frame) {
+                // 音频输入短暂为空时，WASAPI 设备仍可能在播放此前已经提交的
+                // PCM。必须继续刷新 audio master，否则视频线程看到的时钟会
+                // 停在上一包提交时刻，排空阶段和网络抖动后的同步都会错误等待。
+                RefreshAudioClockPosition();
+                continue;
+            }
+
+            if (audio_frame) {
+                const auto sync_action = PrepareAudioFrameForRender(audio_frame);
+                if (sync_action == AudioFrameSyncAction::Stop) {
+                    break;
+                }
+                if (sync_action == AudioFrameSyncAction::Requeued ||
+                    sync_action == AudioFrameSyncAction::Drop) {
+                    continue;
+                }
+            }
+
             // 音频喂帧与视频渲染解耦：视频 CPU 转 RGBA 或 OpenGL 上传变慢时，
             // 音频仍能按输入节奏重采样并送入 WASAPI 内部 PCM 队列。
             if (audio_frame && !audio_renderer_->Render(*audio_frame)) {
                 FailAndRequestStop("音频帧渲染失败");
             } else if (audio_frame) {
-                std::lock_guard<std::mutex> lock(mutex_);
-                ++stats_.rendered_audio_frames;
-                UpdateAudioStatsLocked();
-                stats_.playback_pts_us = audio_renderer_->PlayedPtsUs();
-                // 音频 renderer 上报的是已经播放到的媒体 PTS。统一时钟以此
-                // 作为 master；0 是合法起始位置，不能按“未初始化”处理。
-                mediaflow_clock_.UpdateAudioPosition(1, stats_.playback_pts_us);
-                const auto clock_snapshot =
-                    mediaflow_clock_.Snapshot(audio_available_);
-                stats_.playback_pts_us = clock_snapshot.position_us;
-                stats_.playback_clock_source =
-                    clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    ++stats_.rendered_audio_frames;
+                    UpdateAudioStatsLocked();
+                }
+                // Render() 只表示 PCM 已进入 renderer 队列，并不等于声卡已经播放。
+                // 统一时钟由下面的实际 WASAPI 播放位置刷新，避免把输入消费速度
+                // 错当成 audio master 的前进速度。
+                RefreshAudioClockPosition();
             }
         }
 
@@ -541,6 +683,128 @@ private:
         /// 会话正在停止，视频线程应退出。
         Stop,
     };
+
+    enum class AudioFrameSyncAction {
+        /// 当前音频帧已经到达共享时间轴上的播放时刻。
+        Render,
+        /// Pause 发生在等待过程中，音频帧已放回队列头部。
+        Requeued,
+        /// 无效帧不进入 audio renderer。
+        Drop,
+        /// 会话正在停止，音频线程应退出。
+        Stop,
+    };
+
+    AudioFrameSyncAction PrepareAudioFrameForRender(
+        std::shared_ptr<MediaFrame>& audio_frame) {
+        if (!audio_frame) {
+            return AudioFrameSyncAction::Drop;
+        }
+        if (!config_.normalize_track_pts || !config_.enable_video ||
+            audio_frame->time.pts_us == kNoTimestamp) {
+            return AudioFrameSyncAction::Render;
+        }
+
+        // 第一块 PCM 不能因为“刚加入 RTSP 会话就拿到音频包”而抢跑。若它的
+        // PTS 晚于首个视频帧，先由 shared fallback clock 播放前段无声视频；
+        // 等 PTS 到达后再写入声卡，这样第一次 audio master 读数不会跳到未来。
+        // 后续 PCM 则只允许领先真实播放位置一个 WASAPI buffer，避免音频线程
+        // 把数秒数据迅速塞入软件队列，造成视频长期等待一个虚假的未来时钟。
+        while (audio_frame) {
+            RefreshAudioClockPosition();
+            mediaflow::ClockSnapshot clock_snapshot;
+            bool audio_master_ready = false;
+            std::int64_t allowed_lead_us = 0;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stop_requested_) {
+                    return AudioFrameSyncAction::Stop;
+                }
+                audio_master_ready = mediaflow_clock_.HasAudioPosition();
+                clock_snapshot = mediaflow_clock_.Snapshot(false);
+                if (audio_master_ready) {
+                    // 设备 buffer 只能覆盖硬件正在排队的 PCM；上层还需要预留
+                    // target_latency_ms 吸收解码回调与 WASAPI event 的相位差。
+                    // 两者相加仍以“真实已播放 PTS”为基准，不会把输入消费速度
+                    // 误当成音频时钟。
+                    allowed_lead_us = MillisecondsToUs(
+                        config_.audio.buffer_duration_ms) +
+                        MillisecondsToUs(config_.target_latency_ms);
+                }
+            }
+
+            const auto render_before_us =
+                clock_snapshot.position_us + allowed_lead_us;
+            if (!clock_snapshot.valid ||
+                audio_frame->time.pts_us <= render_before_us) {
+                return AudioFrameSyncAction::Render;
+            }
+
+            const auto remaining_us =
+                audio_frame->time.pts_us - render_before_us;
+            // 最长单次等待沿用视频调度的 20 ms 默认粒度，使 Stop/Pause 与
+            // 窗口关闭保持及时响应。首个音频帧的等待不受 av_sync.enabled
+            // 影响，因为它是在建立 audio master 前确保时间轴一致性；后续等待
+            // 则是对 audio renderer 软件队列的前瞻上限。
+            const auto max_wait_us = std::max<std::int64_t>(
+                1'000, MillisecondsToUs(config_.av_sync.max_wait_ms));
+            if (WaitForVideoSync(std::chrono::microseconds(
+                    std::min(remaining_us, max_wait_us)))) {
+                continue;
+            }
+
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stop_requested_) {
+                return AudioFrameSyncAction::Stop;
+            }
+            if (paused_) {
+                audio_queue_.push_front(std::move(audio_frame));
+                stats_.audio_queue_size = audio_queue_.size();
+                return AudioFrameSyncAction::Requeued;
+            }
+        }
+
+        return AudioFrameSyncAction::Drop;
+    }
+
+    void RefreshAudioClockPosition() {
+        if (!audio_renderer_) {
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // 未成功提交第一块 PCM 前，renderer 返回的 0 只是“尚无播放位置”，
+            // 不是合法的 audio master。必须继续使用视频锚定后的 system clock
+            // 等待首个音频 PTS，不能提前把该占位值写进 UnifiedClock。
+            if (!audio_available_ || stop_requested_ ||
+                stats_.rendered_audio_frames == 0) {
+                return;
+            }
+        }
+
+        // WasapiAudioRenderer::PlayedPtsUs() 已扣除设备 padding，返回的是实际
+        // 播放位置而非已提交 PCM 的末尾 PTS。等待音频窗口时也持续读取它，
+        // 否则 UnifiedClock 会停在上一包 Render 时的旧快照，两个轨道都无法
+        // 随声卡硬件持续向前推进。
+        const auto played_pts_us = audio_renderer_->PlayedPtsUs();
+        if (played_pts_us == kNoTimestamp) {
+            // 第一块 PCM 可能已经写入 renderer 软件队列，但尚未真正到达设备
+            // 播放位置；此时继续使用 fallback system clock，不能把 0 或旧 PTS
+            // 误标记为已经可用的 audio master。
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!audio_available_ || stop_requested_ ||
+            stats_.rendered_audio_frames == 0) {
+            return;
+        }
+        mediaflow_clock_.UpdateAudioPosition(1, played_pts_us);
+        const auto clock_snapshot = mediaflow_clock_.Snapshot(true);
+        stats_.playback_pts_us = clock_snapshot.position_us;
+        stats_.playback_clock_source =
+            clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
+    }
 
     VideoFrameSyncAction PrepareVideoFrameForRender(
         std::shared_ptr<MediaFrame>& video_frame) {
@@ -713,6 +977,12 @@ private:
     VideoPtsNormalizer video_pts_normalizer_;
     std::deque<std::shared_ptr<MediaFrame>> video_queue_;
     std::deque<std::shared_ptr<MediaFrame>> audio_queue_;
+    bool media_pts_origin_ready_{false};
+    bool first_video_pts_seen_{false};
+    bool first_audio_pts_seen_{false};
+    std::int64_t first_video_pts_us_{0};
+    std::int64_t first_audio_pts_us_{0};
+    std::int64_t media_pts_origin_us_{0};
     std::unique_ptr<IVideoRenderer> video_renderer_;
     std::unique_ptr<audio::IAudioRenderer> audio_renderer_;
 

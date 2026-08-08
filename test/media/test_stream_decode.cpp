@@ -100,23 +100,6 @@ void PrintGraphError(const Graph& graph, const std::string& operation) {
     std::cerr << operation << " failed: " << error.message << "\n";
 }
 
-EdgeOptions MakeRealtimeEdgeOptions(QueueTrack track,
-                                    std::size_t max_items,
-                                    std::uint64_t bitrate_bits_per_second,
-                                    std::int64_t max_span_us,
-                                    BackpressurePolicy backpressure,
-                                    std::size_t max_batch_size) {
-    EdgeOptions options;
-    options.transport = TransportKind::Queue;
-    options.capacity = max_items;
-    options.backpressure = backpressure;
-    options.max_batch_size = max_batch_size;
-    options.budget = QueueBudget::FromBitrate(
-        max_items, bitrate_bits_per_second, max_span_us);
-    options.track = track;
-    return options;
-}
-
 void PrintEdgeDiagnostics(const char* name, const EdgeMetricsSnapshot& metrics) {
     const auto& budget = metrics.budget;
     std::cout << "  " << name
@@ -203,6 +186,7 @@ int main(int argc, char* argv[]) {
         "rtsp://192.168.66.83/live/mainstream";
     int duration_ms = 0;
     std::string stream_url = kDefaultUrl;
+    std::string rtsp_transport = "tcp";
     // 默认地址保留为已长期验证的摄像头；--url 只改变本次测试输入，避免为
     // 每个设备手工修改源码后忘记还原。未知参数直接失败，防止拼写错误导致
     // 在错误配置下采集到不可比较的性能数据。
@@ -221,8 +205,15 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Invalid --url value\n";
                 return 1;
             }
+        } else if (option == "--rtsp-transport" && index + 1 < argc) {
+            rtsp_transport = argv[++index];
+            if (rtsp_transport != "tcp" && rtsp_transport != "udp") {
+                std::cerr << "Invalid --rtsp-transport value, expected tcp or udp\n";
+                return 1;
+            }
         } else {
-            std::cerr << "Usage: test_stream_decode [--duration-ms N] [--url URL]\n";
+            std::cerr << "Usage: test_stream_decode [--duration-ms N] [--url URL] "
+                         "[--rtsp-transport tcp|udp]\n";
             return 1;
         }
     }
@@ -230,12 +221,11 @@ int main(int argc, char* argv[]) {
     // 连接参数仍由测试程序集中设置，SourceNode 只负责把 Puller 的读取结果
     // 转换成 MediaPacketMessage，不在业务节点中重新实现 FFmpeg I/O。
     auto puller = std::make_unique<FFmpegPuller>();
-    // 当前 URL 按已有摄像头发布和渲染测试的成功配置运行：RTSP 控制与媒体
-    // 使用 TCP，开启低延迟模式，避免 MediaFlow 测试与已验证链路使用不同
-    // 的 FFmpeg 会话参数。
+    // 默认使用已有摄像头发布和渲染测试的 TCP 配置；UDP 验收通过命令行显式
+    // 选择，并关闭自动 TCP 回退，避免把 UDP 失败误判为 UDP/TCP 兼容通过。
     puller->SetConnectTimeoutMs(5000);
     puller->SetReadTimeoutMs(5000);
-    puller->SetRtspTransport("tcp");
+    puller->SetRtspTransport(rtsp_transport);
     puller->SetRtspAutoSwitchToTcp(false);
     puller->SetLowLatency(true);
 
@@ -249,18 +239,19 @@ int main(int argc, char* argv[]) {
         NodeExecutionMode::Serialized,
         4096};
     decode_node_options.prefer_video_keyframes = true;
-    const auto video_packet_edge_options = MakeRealtimeEdgeOptions(
-        QueueTrack::Video, 256, 16000000, 1000000,
-        BackpressurePolicy::PreferVideoKeyframes, 64);
-    const auto audio_packet_edge_options = MakeRealtimeEdgeOptions(
-        QueueTrack::Audio, 512, 384000, 500000,
-        BackpressurePolicy::DropOldest, 128);
+    // 队列预算属于 Pipeline 配置。设备适配层可在这里复制默认配置并覆盖轨道
+    // 参数，Graph 连接阶段只接收已经生成好的边配置。
+    const MediaFlowPipelineConfig pipeline_config;
+    const auto video_packet_edge_options =
+        pipeline_config.MakePacketEdgeOptions(QueueTrack::Video);
+    const auto audio_packet_edge_options =
+        pipeline_config.MakePacketEdgeOptions(QueueTrack::Audio);
     // 解码后的原始帧不适合根据压缩码率估算字节数。这里使用帧数和媒体时间
     // 窗口限流，待 PipelineBuilder 能获得像素格式和分辨率后再补充原始帧字节预算。
-    const auto video_frame_edge_options = MakeRealtimeEdgeOptions(
-        QueueTrack::Video, 8, 0, 250000, BackpressurePolicy::DropOldest, 8);
-    const auto audio_frame_edge_options = MakeRealtimeEdgeOptions(
-        QueueTrack::Audio, 64, 0, 500000, BackpressurePolicy::DropOldest, 32);
+    const auto video_frame_edge_options =
+        pipeline_config.MakeFrameEdgeOptions(QueueTrack::Video);
+    const auto audio_frame_edge_options =
+        pipeline_config.MakeFrameEdgeOptions(QueueTrack::Audio);
     Graph graph;
 
     // Graph 会先启动 Router、Decoder 和统计 Sink，最后才启动 Source 并打开

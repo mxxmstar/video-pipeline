@@ -2,6 +2,8 @@
 #include "render/audio/audio_pcm_queue.h"
 #include "render/audio/pcm_chunk.h"
 
+#include "media/media_packet.h"
+
 #include <cstdint>
 #include <iostream>
 #include <vector>
@@ -59,8 +61,36 @@ bool TestPlayedPtsUsesDevicePadding() {
         return false;
     }
 
-    queue.AddPlayedFrames(20);
+    queue.RecordDeviceMediaFrames(20, chunk.pts_us);
     return queue.PlayedPtsUs(1000, 5) == 1'015'000;
+}
+
+bool TestPlayedPtsPreservesMediaChunkBoundaries() {
+    render::audio::AudioPcmQueue queue;
+    queue.Reset(4);
+
+    // 分块时间线包含一段 underrun 补静音以及下一段源 PTS 跳变。播放位置不能
+    // 再用“首 PTS + 累计设备帧数”计算，否则静音会被错误计入源媒体时间。
+    queue.RecordDeviceMediaFrames(10, 1'000'000);
+    queue.RecordDeviceSilenceFrames(5);
+    queue.RecordDeviceMediaFrames(10, 1'020'000);
+
+    if (queue.PlayedPtsUs(1000, 16) != 1'009'000) {
+        return false;
+    }
+    // 当前位置进入静音段，时间保持在上一块真实 PCM 的末尾。
+    if (queue.PlayedPtsUs(1000, 14) != 1'009'000) {
+        return false;
+    }
+    // 当前位置进入第二块 PCM 后使用它自己的 PTS，而不是延续第一块的估算。
+    return queue.PlayedPtsUs(1000, 5) == 1'025'000;
+}
+
+bool TestNoMediaTimelineReturnsNoTimestamp() {
+    render::audio::AudioPcmQueue queue;
+    queue.Reset(2);
+    queue.RecordDeviceSilenceFrames(20);
+    return queue.PlayedPtsUs(1000, 0) == kNoTimestamp;
 }
 
 bool TestFillPolicyUsesOnlyAvailablePcm() {
@@ -121,6 +151,14 @@ int main() {
     }
     if (!TestPlayedPtsUsesDevicePadding()) {
         std::cerr << "TestPlayedPtsUsesDevicePadding failed\n";
+        return 1;
+    }
+    if (!TestPlayedPtsPreservesMediaChunkBoundaries()) {
+        std::cerr << "TestPlayedPtsPreservesMediaChunkBoundaries failed\n";
+        return 1;
+    }
+    if (!TestNoMediaTimelineReturnsNoTimestamp()) {
+        std::cerr << "TestNoMediaTimelineReturnsNoTimestamp failed\n";
         return 1;
     }
     if (!TestFillPolicyUsesOnlyAvailablePcm()) {
