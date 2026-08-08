@@ -19,6 +19,8 @@ struct RenderStats {
     std::int64_t rendered_audio_frames{0};
     /// 视频总丢帧数，包含队列满丢旧帧和 AV sync 丢晚帧。
     std::int64_t dropped_video_frames{0};
+    /// 视频队列容量触顶造成的丢帧数，不包含 AV sync 主动丢帧。
+    std::int64_t video_queue_dropped_frames{0};
     /// 音频 session 队列层丢帧数，不包含 WASAPI 内部 PCM 丢弃。
     std::int64_t dropped_audio_frames{0};
     /// PTS normalizer 修正过的视频帧数，用于观察上游时间戳是否稳定。
@@ -62,6 +64,30 @@ struct RenderStats {
     std::size_t audio_renderer_queue_size{0};
     /// 音频 renderer 内部 PCM 队列中尚未提交给设备的采样帧数。
     std::int64_t audio_renderer_queued_frames{0};
+    /// 是否已经记录到首个视频输入 PTS。
+    bool has_first_video_input_pts{false};
+    /// 首个视频输入帧的原始 PTS，单位微秒。
+    std::int64_t first_video_input_pts_us{0};
+    /// 是否已经记录到首个音频输入 PTS。
+    bool has_first_audio_input_pts{false};
+    /// 首个音频输入帧的原始 PTS，单位微秒。
+    std::int64_t first_audio_input_pts_us{0};
+    /// 是否已经确定共同媒体时间原点。
+    bool has_media_pts_origin{false};
+    /// 共同媒体时间原点的原始 PTS，单位微秒。
+    std::int64_t media_pts_origin_us{0};
+    /// 是否已经调用过视频 renderer 的首帧。
+    bool has_first_video_render_pts{false};
+    /// 首个实际交给视频 renderer 的归一化 PTS，单位微秒。
+    std::int64_t first_video_render_pts_us{0};
+    /// 是否已经向音频 renderer 成功提交首帧。
+    bool has_first_audio_render_pts{false};
+    /// 首个成功提交给音频 renderer 的归一化 PTS，单位微秒。
+    std::int64_t first_audio_render_pts_us{0};
+    /// 是否已经取得首个有效音频设备播放 PTS。
+    bool has_first_audio_device_pts{false};
+    /// 首个有效音频设备播放 PTS，单位微秒。
+    std::int64_t first_audio_device_pts_us{0};
 };
 
 } // namespace render

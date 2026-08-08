@@ -270,6 +270,64 @@ bool TestVideoQueueDropsOldestFrame() {
            video_state->shutdown && thread_affinity_ok;
 }
 
+bool TestLagCapKeepsLatestVideoFrame() {
+    auto video_state = std::make_shared<FakeVideoState>();
+    video_state->block_first_render = true;
+    render::RenderSession session(
+        std::make_unique<FakeVideoRenderer>(video_state), nullptr);
+
+    render::RenderSessionConfig config;
+    config.enable_video = true;
+    config.enable_audio = false;
+    config.max_video_queue_frames = 2;
+    config.drop_late_video_frames = false;
+    config.av_sync.enabled = false;
+    config.av_sync.max_video_lag_ms = 100;
+    if (!session.Init(config) || !session.Start()) {
+        std::cerr << "latest video queue test session start failed: "
+                  << session.LastError() << '\n';
+        return false;
+    }
+
+    if (!session.SubmitFrame(MakeFrame(MediaType::VIDEO, 0))) {
+        session.Stop();
+        return false;
+    }
+    {
+        std::unique_lock<std::mutex> lock(video_state->mutex);
+        if (!video_state->cv.wait_for(
+                lock, 1s, [&] { return video_state->first_render_entered; })) {
+            session.Stop();
+            return false;
+        }
+    }
+
+    // 队列满时即使普通晚帧丢弃关闭，最大滞后保护也必须丢旧帧并接收最新帧。
+    const bool submitted_second =
+        session.SubmitFrame(MakeFrame(MediaType::VIDEO, 20'000));
+    const bool submitted_third =
+        session.SubmitFrame(MakeFrame(MediaType::VIDEO, 40'000));
+    const bool submitted_latest =
+        session.SubmitFrame(MakeFrame(MediaType::VIDEO, 60'000));
+
+    {
+        std::lock_guard<std::mutex> lock(video_state->mutex);
+        video_state->release_first_render = true;
+        video_state->cv.notify_all();
+    }
+    const bool rendered = WaitUntil([&] {
+        return session.GetStats().rendered_video_frames == 3;
+    });
+    session.Stop();
+
+    const auto stats = session.GetStats();
+    std::lock_guard<std::mutex> lock(video_state->mutex);
+    return submitted_second && submitted_third && submitted_latest && rendered &&
+           stats.video_queue_dropped_frames == 1 &&
+           video_state->rendered_pts ==
+               std::vector<std::int64_t>{0, 40'000, 60'000};
+}
+
 bool TestPauseResumeAndAudioDispatch() {
     auto video_state = std::make_shared<FakeVideoState>();
     auto audio_state = std::make_shared<FakeAudioState>();
@@ -627,6 +685,10 @@ int main() {
     }
     if (!TestVideoQueueDropsOldestFrame()) {
         std::cerr << "TestVideoQueueDropsOldestFrame failed\n";
+        return 1;
+    }
+    if (!TestLagCapKeepsLatestVideoFrame()) {
+        std::cerr << "TestLagCapKeepsLatestVideoFrame failed\n";
         return 1;
     }
     if (!TestPauseResumeAndAudioDispatch()) {

@@ -2942,3 +2942,54 @@ MediaFlow 视频帧、音频帧队列还分别保持至少 250 ms、500 ms 的�
 - `build/playback_profile_stable_3000_startgate.err.log`
 - `build/playback_profile_low_3000_startgate.log`
 - `build/playback_profile_low_3000_startgate.err.log`
+
+#### 21.7.33 最大滞后保护下的视频队列保鲜与时间线诊断
+
+21.7.32 的时间线诊断确认首个视频、首个有效音频设备播放位置没有形成约 `400 ms`
+的固定源 PTS 偏移。真正的问题是稳定策略在视频队列满时拒绝新帧、保留旧帧，导致
+视频 worker 持续消费过期队列内容；最大滞后追赶只能在队列尾部被动丢帧，无法及时看到
+最新视频。
+
+##### 21.7.33.1 实施内容
+
+1. `RenderStats` 增加视频队列丢帧计数，以及首个视频/音频输入 PTS、共同原点、首个
+   视频渲染 PTS、首个音频 renderer PTS 和首个有效音频设备 PTS，日志可以区分“输入
+   队列保鲜丢帧”和“PTS 调度丢帧”。
+2. 当 `max_video_lag_ms > 0` 时，即使稳定策略关闭普通晚帧丢弃，视频队列满载也改为
+   丢弃最旧帧并接收最新帧；没有最大滞后保护的旧配置仍保持“拒绝新帧”的兼容语义。
+3. 增加确定性回归，验证稳定队列提交 `0/20/40/60 ms` 后实际保留并渲染
+   `0/40/60 ms`，避免把旧帧长期留在队列中。
+
+##### 21.7.33.2 长测结果
+
+使用本地 FFmpeg/ZLMediaKit 双轨 RTSP 源执行稳定策略 3000 视频帧长测：
+
+| 指标 | 修复后结果 |
+|---|---:|
+| 解码视频帧 | 3000 |
+| 渲染视频帧 | 351 |
+| 视频总丢帧 | 2641 |
+| 视频队列丢帧 | 2641 |
+| AV sync 丢帧 | 0 |
+| 追赶丢帧/事件 | 0 / 0 |
+| A/V 误差范围 | `-209814 / 9153 us` |
+| 平均绝对 A/V 误差 | `117566 us` |
+| 音频 PCM 丢弃 | 0 |
+| 音频 underrun | 64 |
+
+首轮时间线诊断样本为：首个视频输入 PTS `10000478 us`，共同原点同为
+`10000478 us`；首个有效音频 renderer PTS `20497 us`，首个有效音频设备 PTS
+`30497 us`。这组数据排除了音频设备先行约 `400 ms` 或双轨共同原点错误，说明队列
+保鲜修复确实解决了本阶段的主要固定滞后来源。
+
+本阶段结论为**通过固定滞后治理，吞吐仍有后续优化项**：A/V 误差已经从约 `424 ms`
+降至约 `118 ms`，稳定策略没有再触发 AV sync 或追赶丢帧；但当前 `1920x1242`
+Debug OpenGL 路径只能渲染约 `11.7%` 的输入帧，剩余工作应转向视频转换/纹理上传
+吞吐和 Release 性能基线，不应再通过扩大音频缓存解决。
+
+原始日志：
+
+- `build/playback_profile_stable_600_latest.log`
+- `build/playback_profile_stable_600_latest.err.log`
+- `build/playback_profile_stable_3000_latestqueue.log`
+- `build/playback_profile_stable_3000_latestqueue.err.log`

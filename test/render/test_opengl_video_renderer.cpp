@@ -568,6 +568,8 @@ int TestCameraAudioVideoDecodeEncodeRender(
                       << ", rendered_video=" << stats.rendered_video_frames
                       << ", rendered_audio=" << stats.rendered_audio_frames
                       << ", dropped_video=" << stats.dropped_video_frames
+                      << ", video_queue_dropped="
+                      << stats.video_queue_dropped_frames
                       << ", avsync_dropped_video=" << stats.av_sync_dropped_video_frames
                       << ", catch_up_dropped_video="
                       << stats.video_catch_up_dropped_frames
@@ -595,6 +597,30 @@ int TestCameraAudioVideoDecodeEncodeRender(
                       << ", audio_queue=" << stats.audio_queue_size
                       << ", audio_renderer_queue=" << stats.audio_renderer_queue_size
                       << ", audio_renderer_frames=" << stats.audio_renderer_queued_frames
+                      << ", first_video_input_pts_us="
+                      << (stats.has_first_video_input_pts
+                              ? stats.first_video_input_pts_us
+                              : -1)
+                      << ", first_audio_input_pts_us="
+                      << (stats.has_first_audio_input_pts
+                              ? stats.first_audio_input_pts_us
+                              : -1)
+                      << ", media_pts_origin_us="
+                      << (stats.has_media_pts_origin
+                              ? stats.media_pts_origin_us
+                              : -1)
+                      << ", first_video_render_pts_us="
+                      << (stats.has_first_video_render_pts
+                              ? stats.first_video_render_pts_us
+                              : -1)
+                      << ", first_audio_render_pts_us="
+                      << (stats.has_first_audio_render_pts
+                              ? stats.first_audio_render_pts_us
+                              : -1)
+                      << ", first_audio_device_pts_us="
+                      << (stats.has_first_audio_device_pts
+                              ? stats.first_audio_device_pts_us
+                              : -1)
                       << ", encoded_video_packets=" << state.encoded_video_packets
                       << ", encoded_audio_packets=" << state.encoded_audio_packets
                       << "\n" << std::flush;
@@ -650,6 +676,8 @@ int TestCameraAudioVideoDecodeEncodeRender(
               << render_stats.rendered_video_frames
               << ", rendered_audio=" << render_stats.rendered_audio_frames
               << ", dropped_video=" << render_stats.dropped_video_frames
+              << ", video_queue_dropped="
+              << render_stats.video_queue_dropped_frames
               << ", avsync_dropped_video=" << render_stats.av_sync_dropped_video_frames
               << ", catch_up_dropped_video="
               << render_stats.video_catch_up_dropped_frames
@@ -673,6 +701,30 @@ int TestCameraAudioVideoDecodeEncodeRender(
               << ", dropped_audio=" << render_stats.dropped_audio_frames
               << ", audio_underruns=" << render_stats.audio_underruns
               << ", audio_pcm_dropped=" << render_stats.audio_dropped_pcm_frames
+              << ", first_video_input_pts_us="
+              << (render_stats.has_first_video_input_pts
+                      ? render_stats.first_video_input_pts_us
+                      : -1)
+              << ", first_audio_input_pts_us="
+              << (render_stats.has_first_audio_input_pts
+                      ? render_stats.first_audio_input_pts_us
+                      : -1)
+              << ", media_pts_origin_us="
+              << (render_stats.has_media_pts_origin
+                      ? render_stats.media_pts_origin_us
+                      : -1)
+              << ", first_video_render_pts_us="
+              << (render_stats.has_first_video_render_pts
+                      ? render_stats.first_video_render_pts_us
+                      : -1)
+              << ", first_audio_render_pts_us="
+              << (render_stats.has_first_audio_render_pts
+                      ? render_stats.first_audio_render_pts_us
+                      : -1)
+              << ", first_audio_device_pts_us="
+              << (render_stats.has_first_audio_device_pts
+                      ? render_stats.first_audio_device_pts_us
+                      : -1)
               << ", encoded_video_packets=" << state.encoded_video_packets
               << ", encoded_audio_packets=" << state.encoded_audio_packets
               << "\n" << std::flush;

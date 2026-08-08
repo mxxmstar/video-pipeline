@@ -236,12 +236,20 @@ public:
             ++stats_.submitted_video_frames;
             NormalizeTrackPtsLocked(*frame);
             if (video_queue_.size() >= config_.max_video_queue_frames) {
-                if (!config_.drop_late_video_frames) {
+                // 稳定播放关闭普通晚帧丢弃，但一旦开启最大滞后保护，就必须
+                // 保留最新视频而不是继续保留已经过期的队列头。否则追赶线程
+                // 只能不断消费旧帧，输入端又拒绝新帧，视频会固定落后队列窗口。
+                const bool keep_latest_video =
+                    config_.drop_late_video_frames ||
+                    config_.av_sync.max_video_lag_ms > 0;
+                if (!keep_latest_video) {
                     ++stats_.dropped_video_frames;
+                    ++stats_.video_queue_dropped_frames;
                     return false;
                 }
                 video_queue_.pop_front();
                 ++stats_.dropped_video_frames;
+                ++stats_.video_queue_dropped_frames;
             }
             video_queue_.push_back(std::move(frame));
             stats_.video_queue_size = video_queue_.size();
@@ -409,9 +417,13 @@ private:
         if (frame.type == MediaType::VIDEO && !first_video_pts_seen_) {
             first_video_pts_seen_ = true;
             first_video_pts_us_ = frame.time.pts_us;
+            stats_.has_first_video_input_pts = true;
+            stats_.first_video_input_pts_us = frame.time.pts_us;
         } else if (frame.type == MediaType::AUDIO && !first_audio_pts_seen_) {
             first_audio_pts_seen_ = true;
             first_audio_pts_us_ = frame.time.pts_us;
+            stats_.has_first_audio_input_pts = true;
+            stats_.first_audio_input_pts_us = frame.time.pts_us;
         }
 
         if (!media_pts_origin_ready_) {
@@ -428,6 +440,8 @@ private:
                 media_pts_origin_us_ = first_audio_pts_us_;
             }
             media_pts_origin_ready_ = true;
+            stats_.has_media_pts_origin = true;
+            stats_.media_pts_origin_us = media_pts_origin_us_;
             // 第一条轨道可能已经排队，原点确定后必须回写整个在途集合，
             // 否则同一队列中会同时存在原始 PTS 和归一化 PTS。
             RebaseQueuedFramesLocked();
@@ -529,6 +543,11 @@ private:
                         FailAndRequestStop("视频帧渲染失败");
                     } else {
                         std::lock_guard<std::mutex> lock(mutex_);
+                        if (!stats_.has_first_video_render_pts) {
+                            stats_.has_first_video_render_pts = true;
+                            stats_.first_video_render_pts_us =
+                                video_frame->time.pts_us;
+                        }
                         ++stats_.rendered_video_frames;
                         const auto clock_snapshot =
                             mediaflow_clock_.Snapshot(audio_available_);
@@ -654,6 +673,11 @@ private:
             } else if (audio_frame) {
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    if (!stats_.has_first_audio_render_pts) {
+                        stats_.has_first_audio_render_pts = true;
+                        stats_.first_audio_render_pts_us =
+                            audio_frame->time.pts_us;
+                    }
                     ++stats_.rendered_audio_frames;
                     UpdateAudioStatsLocked();
                 }
@@ -850,6 +874,10 @@ private:
         }
         mediaflow_clock_.UpdateAudioPosition(1, played_pts_us);
         const auto clock_snapshot = mediaflow_clock_.Snapshot(true);
+        if (!stats_.has_first_audio_device_pts) {
+            stats_.has_first_audio_device_pts = true;
+            stats_.first_audio_device_pts_us = played_pts_us;
+        }
         stats_.playback_pts_us = clock_snapshot.position_us;
         stats_.playback_clock_source =
             clock_snapshot.source == mediaflow::ClockSource::Audio ? 1 : 0;
